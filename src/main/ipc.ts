@@ -1,8 +1,16 @@
-import { ipcMain, app, BrowserWindow } from 'electron'
+import { ipcMain, app, BrowserWindow, IpcMainEvent, IpcMainInvokeEvent } from 'electron'
 import log from 'electron-log/main'
 import { getSettings, setSetting } from './settings'
 import { updateHotkey } from './hotkey'
 import { startRecording, stopRecording, onStateChange } from './audio'
+import {
+  assertTrustedSender,
+  validateHotkey,
+  validateMicrophoneId,
+  validateLanguage,
+  validateToggleKey,
+  validateAuthToken,
+} from './security'
 
 interface SetupArgs {
   mainWindow: BrowserWindow
@@ -17,70 +25,127 @@ export function getAuthToken(): string | null {
   if (!cachedAuthToken) return null
   if (cachedTokenExpiresAt && Date.now() > cachedTokenExpiresAt) {
     cachedAuthToken = null
+    cachedTokenExpiresAt = 0
     return null
   }
   return cachedAuthToken
 }
 
+// Wrappers that gate every channel by sender identity + origin.
+function gatedOn<T>(channel: string, handler: (event: IpcMainEvent, payload: T) => void) {
+  ipcMain.removeAllListeners(channel)
+  ipcMain.on(channel, (event, payload) => {
+    if (!assertTrustedSender(event, channel)) return
+    handler(event, payload as T)
+  })
+}
+
+function gatedHandle<T, R>(
+  channel: string,
+  handler: (event: IpcMainInvokeEvent, payload: T) => R | Promise<R>,
+) {
+  ipcMain.removeHandler(channel)
+  ipcMain.handle(channel, async (event, payload) => {
+    if (!assertTrustedSender(event, channel)) {
+      throw new Error('untrusted-sender')
+    }
+    return await handler(event, payload as T)
+  })
+}
+
 export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange }: SetupArgs): void {
   // ── App info ──────────────────────────────────────────────────────────────
-  ipcMain.handle('app:version', () => app.getVersion())
+  gatedHandle('app:version', () => app.getVersion())
 
   // ── Window controls ───────────────────────────────────────────────────────
-  ipcMain.on('window:minimize', () => {
+  gatedOn('window:minimize', () => {
     if (!mainWindow.isDestroyed()) mainWindow.minimize()
   })
-  ipcMain.on('window:hide', () => {
+  gatedOn('window:hide', () => {
     if (!mainWindow.isDestroyed()) mainWindow.hide()
   })
 
   // ── Settings ──────────────────────────────────────────────────────────────
-  ipcMain.handle('settings:get', () => getSettings())
+  gatedHandle('settings:get', () => getSettings())
 
-  ipcMain.on('settings:update-hotkey', (_event, hotkey: string) => {
-    setSetting('hotkey', hotkey)
-    const ok = updateHotkey(hotkey)
-    log.info(`Hotkey updated to ${hotkey} (success=${ok})`)
-  })
+  gatedHandle<string, { ok: boolean; error?: string }>(
+    'settings:update-hotkey',
+    (_event, raw) => {
+      const v = validateHotkey(raw)
+      if (!v) return { ok: false, error: 'invalid-hotkey' }
+      setSetting('hotkey', v)
+      const ok = updateHotkey(v)
+      log.info(`Hotkey updated to ${v} (registered=${ok})`)
+      return { ok }
+    },
+  )
 
-  ipcMain.on('settings:update-microphone', (_event, deviceId: string) => {
-    setSetting('microphone', deviceId)
-  })
+  gatedHandle<string, { ok: boolean; error?: string }>(
+    'settings:update-microphone',
+    (_event, raw) => {
+      const v = validateMicrophoneId(raw)
+      if (!v) return { ok: false, error: 'invalid-microphone' }
+      setSetting('microphone', v)
+      return { ok: true }
+    },
+  )
 
-  ipcMain.on('settings:update-language', (_event, language: string) => {
-    setSetting('language', language)
-  })
+  gatedHandle<string, { ok: boolean; error?: string }>(
+    'settings:update-language',
+    (_event, raw) => {
+      const v = validateLanguage(raw)
+      if (!v) return { ok: false, error: 'invalid-language' }
+      setSetting('language', v)
+      return { ok: true }
+    },
+  )
 
-  ipcMain.on('settings:update-toggle', (_event, payload: { key: string; value: boolean }) => {
-    const allowed = ['showOverlay', 'dictationSounds', 'launchAtLogin'] as const
-    type Allowed = (typeof allowed)[number]
-    if (!allowed.includes(payload.key as Allowed)) return
-    setSetting(payload.key as Allowed, payload.value)
-    if (payload.key === 'launchAtLogin') {
-      try {
-        app.setLoginItemSettings({ openAtLogin: payload.value })
-      } catch (err) {
-        log.warn('Failed to update login item settings', err)
+  gatedHandle<{ key: unknown; value: unknown }, { ok: boolean; error?: string }>(
+    'settings:update-toggle',
+    (_event, raw) => {
+      if (!raw || typeof raw !== 'object') return { ok: false, error: 'invalid-payload' }
+      const key = validateToggleKey(raw.key)
+      const value = raw.value
+      if (!key) return { ok: false, error: 'invalid-key' }
+      if (typeof value !== 'boolean') return { ok: false, error: 'invalid-value' }
+      setSetting(key, value)
+      if (key === 'launchAtLogin') {
+        try {
+          app.setLoginItemSettings({ openAtLogin: value })
+        } catch (err) {
+          log.warn('Failed to update login item settings', err)
+        }
       }
-    }
-  })
+      return { ok: true }
+    },
+  )
 
   // ── Auth (Supabase JWT handoff for the Railway proxy) ────────────────────
-  ipcMain.on('auth:set-token', (_event, token: string) => {
-    cachedAuthToken = token
-    // JWTs typically last ~1h. Re-check every 50 minutes regardless.
-    cachedTokenExpiresAt = Date.now() + 50 * 60 * 1000
-  })
-  ipcMain.on('auth:clear-token', () => {
+  gatedHandle<string, { ok: boolean; error?: string; expiresAt?: number }>(
+    'auth:set-token',
+    (_event, raw) => {
+      const result = validateAuthToken(raw)
+      if (!result.ok) {
+        log.warn(`Auth token rejected: ${result.reason}`)
+        cachedAuthToken = null
+        cachedTokenExpiresAt = 0
+        return { ok: false, error: result.reason }
+      }
+      cachedAuthToken = (raw as string).trim()
+      cachedTokenExpiresAt = result.expiresAt ?? 0
+      return { ok: true, expiresAt: result.expiresAt ?? 0 }
+    },
+  )
+  gatedOn('auth:clear-token', () => {
     cachedAuthToken = null
     cachedTokenExpiresAt = 0
   })
 
   // ── Recording control from the dashboard UI ──────────────────────────────
-  ipcMain.on('recording:start', () => {
+  gatedOn('recording:start', () => {
     startRecording().catch((err) => log.error('startRecording IPC failed', err))
   })
-  ipcMain.on('recording:stop', () => {
+  gatedOn('recording:stop', () => {
     stopRecording().catch((err) => log.error('stopRecording IPC failed', err))
   })
 

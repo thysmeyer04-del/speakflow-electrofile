@@ -8,6 +8,9 @@ function on<T>(channel: string, handler: (payload: T) => void): Unsubscribe {
   return () => ipcRenderer.removeListener(channel, wrapped)
 }
 
+// Defence-in-depth: validate at the preload boundary too so obviously bad
+// inputs never even reach main. Main re-validates everything.
+
 const ALLOWED_LANGUAGES = new Set([
   'auto', 'en', 'af', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'pl', 'ru',
   'ja', 'ko', 'zh', 'ar', 'hi', 'tr', 'sv', 'da', 'no', 'fi',
@@ -23,6 +26,8 @@ function safeString(input: unknown, maxLength: number): string | null {
   return trimmed
 }
 
+type SettingsResult = { ok: boolean; error?: string }
+
 contextBridge.exposeInMainWorld('electronAPI', {
   // ── Recording state listeners (main → renderer) ────────────────────────────
   onRecordingStarted: (cb: () => void) => on<void>('recording-started', cb),
@@ -37,35 +42,35 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onUpdateAvailable: (cb: (version: string) => void) =>
     on<string>('update-available', cb),
 
-  // ── Settings (renderer → main, with validation at the boundary) ───────────
-  updateHotkey: (hotkey: string) => {
+  // ── Settings (invoke = main returns ok/error) ────────────────────────────
+  updateHotkey: async (hotkey: string): Promise<SettingsResult> => {
     const v = safeString(hotkey, 64)
-    if (!v || !HOTKEY_PATTERN.test(v)) return false
-    ipcRenderer.send('settings:update-hotkey', v)
-    return true
+    if (!v || !HOTKEY_PATTERN.test(v)) return { ok: false, error: 'invalid-hotkey' }
+    return ipcRenderer.invoke('settings:update-hotkey', v) as Promise<SettingsResult>
   },
-  updateMicrophone: (deviceId: string) => {
+  updateMicrophone: async (deviceId: string): Promise<SettingsResult> => {
     const v = safeString(deviceId, 256)
-    if (!v) return false
-    ipcRenderer.send('settings:update-microphone', v)
-    return true
+    if (!v) return { ok: false, error: 'invalid-microphone' }
+    return ipcRenderer.invoke('settings:update-microphone', v) as Promise<SettingsResult>
   },
-  updateLanguage: (language: string) => {
+  updateLanguage: async (language: string): Promise<SettingsResult> => {
     const v = safeString(language, 8)
-    if (!v || !ALLOWED_LANGUAGES.has(v.toLowerCase())) return false
-    ipcRenderer.send('settings:update-language', v.toLowerCase())
-    return true
+    if (!v || !ALLOWED_LANGUAGES.has(v.toLowerCase()))
+      return { ok: false, error: 'invalid-language' }
+    return ipcRenderer.invoke('settings:update-language', v.toLowerCase()) as Promise<SettingsResult>
   },
-  updateToggle: (key: 'showOverlay' | 'dictationSounds' | 'launchAtLogin', value: boolean) => {
+  updateToggle: async (
+    key: 'showOverlay' | 'dictationSounds' | 'launchAtLogin',
+    value: boolean,
+  ): Promise<SettingsResult> => {
     const allowed = new Set(['showOverlay', 'dictationSounds', 'launchAtLogin'])
-    if (!allowed.has(key)) return false
-    if (typeof value !== 'boolean') return false
-    ipcRenderer.send('settings:update-toggle', { key, value })
-    return true
+    if (!allowed.has(key)) return { ok: false, error: 'invalid-key' }
+    if (typeof value !== 'boolean') return { ok: false, error: 'invalid-value' }
+    return ipcRenderer.invoke('settings:update-toggle', { key, value }) as Promise<SettingsResult>
   },
   getSettings: () => ipcRenderer.invoke('settings:get'),
 
-  // ── App / system info (read-only) ─────────────────────────────────────────
+  // ── App / system info ─────────────────────────────────────────────────────
   getVersion: () => ipcRenderer.invoke('app:version'),
   getPlatform: () => process.platform as NodeJS.Platform,
 
@@ -73,17 +78,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   minimizeWindow: () => ipcRenderer.send('window:minimize'),
   hideWindow: () => ipcRenderer.send('window:hide'),
 
-  // ── Auth handoff: dashboard tells main process the current Supabase JWT ──
-  // (used only for calling the Railway proxy in prod)
-  setAuthToken: (token: string) => {
+  // ── Auth handoff (Supabase JWT for the Railway proxy) ────────────────────
+  setAuthToken: async (token: string): Promise<SettingsResult & { expiresAt?: number }> => {
     const v = safeString(token, 4096)
-    if (!v) return false
-    ipcRenderer.send('auth:set-token', v)
-    return true
+    if (!v) return { ok: false, error: 'invalid-token' }
+    return ipcRenderer.invoke('auth:set-token', v) as Promise<SettingsResult & { expiresAt?: number }>
   },
   clearAuthToken: () => ipcRenderer.send('auth:clear-token'),
 
-  // ── Recording control (manual trigger from dashboard) ────────────────────
+  // ── Recording control ─────────────────────────────────────────────────────
   startRecording: () => ipcRenderer.send('recording:start'),
   stopRecording: () => ipcRenderer.send('recording:stop'),
 })

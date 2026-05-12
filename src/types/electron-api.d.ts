@@ -13,13 +13,13 @@ declare global {
     onNavigateTo: (cb: (route: string) => void) => () => void
     onUpdateAvailable: (cb: (version: string) => void) => () => void
 
-    updateHotkey: (hotkey: string) => boolean
-    updateMicrophone: (deviceId: string) => boolean
-    updateLanguage: (language: string) => boolean
+    updateHotkey: (hotkey: string) => Promise<{ ok: boolean; error?: string }>
+    updateMicrophone: (deviceId: string) => Promise<{ ok: boolean; error?: string }>
+    updateLanguage: (language: string) => Promise<{ ok: boolean; error?: string }>
     updateToggle: (
       key: 'showOverlay' | 'dictationSounds' | 'launchAtLogin',
       value: boolean,
-    ) => boolean
+    ) => Promise<{ ok: boolean; error?: string }>
     getSettings: () => Promise<Record<string, unknown>>
 
     getVersion: () => Promise<string>
@@ -28,7 +28,7 @@ declare global {
     minimizeWindow: () => void
     hideWindow: () => void
 
-    setAuthToken: (token: string) => boolean
+    setAuthToken: (token: string) => Promise<{ ok: boolean; error?: string; expiresAt?: number }>
     clearAuthToken: () => void
 
     startRecording: () => void

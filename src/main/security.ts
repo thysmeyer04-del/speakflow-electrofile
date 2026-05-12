@@ -1,0 +1,181 @@
+// Shared security helpers for the main process.
+
+import { IpcMainEvent, IpcMainInvokeEvent } from 'electron'
+import log from 'electron-log/main'
+
+let allowedSenderId: number | null = null
+let allowedOrigin: string | null = null
+
+export function configureSecurity(opts: {
+  allowedSenderId: number
+  allowedOrigin: string
+}): void {
+  allowedSenderId = opts.allowedSenderId
+  try {
+    allowedOrigin = new URL(opts.allowedOrigin).origin
+  } catch {
+    allowedOrigin = opts.allowedOrigin
+  }
+}
+
+/** Hard gate for ipcMain.on / ipcMain.handle. */
+export function assertTrustedSender(
+  event: IpcMainEvent | IpcMainInvokeEvent,
+  channel: string,
+): boolean {
+  if (allowedSenderId === null) {
+    log.warn(`[security] IPC "${channel}" rejected — security not yet configured`)
+    return false
+  }
+  if (event.sender.id !== allowedSenderId) {
+    log.warn(
+      `[security] IPC "${channel}" from sender ${event.sender.id} rejected (expected ${allowedSenderId})`,
+    )
+    return false
+  }
+  const frameUrl = event.senderFrame?.url ?? ''
+  if (frameUrl) {
+    try {
+      const origin = new URL(frameUrl).origin
+      if (origin !== allowedOrigin) {
+        log.warn(
+          `[security] IPC "${channel}" from origin ${origin} rejected (expected ${allowedOrigin})`,
+        )
+        return false
+      }
+    } catch {
+      log.warn(`[security] IPC "${channel}" from unparseable url ${frameUrl}`)
+      return false
+    }
+  }
+  return true
+}
+
+export function isOriginTrusted(url: string): boolean {
+  if (!allowedOrigin) return false
+  try {
+    return new URL(url).origin === allowedOrigin
+  } catch {
+    return false
+  }
+}
+
+// ── External-link allowlist for shell.openExternal ─────────────────────────
+// Hard-coded list of public hosts the app is allowed to open in the OS browser.
+// Anything else is rejected.
+const EXTERNAL_HOST_ALLOWLIST = new Set<string>([
+  'speakflow.app',
+  'app.speakflow.app',
+  'www.speakflow.app',
+  'docs.speakflow.app',
+  'help.speakflow.app',
+  'github.com',
+  'stripe.com',
+  'billing.stripe.com',
+])
+
+export function isExternalUrlAllowed(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'https:') return false
+    const host = parsed.hostname.toLowerCase()
+    if (EXTERNAL_HOST_ALLOWLIST.has(host)) return true
+    // Allow subdomains of speakflow.app
+    if (host.endsWith('.speakflow.app')) return true
+    return false
+  } catch {
+    return false
+  }
+}
+
+// ── Renderer-supplied input validators (defence in depth — preload already
+//    enforces these, but main MUST not trust the preload). ─────────────────
+const HOTKEY_PATTERN =
+  /^((Control|Ctrl|Alt|Option|Shift|Cmd|Command|Meta|Super)\+){0,3}(F\d{1,2}|[A-Z0-9]|Space|Tab|Backspace|Delete|Return|Enter|Escape|Up|Down|Left|Right|Home|End|PageUp|PageDown)$/i
+
+const ALLOWED_LANGUAGES = new Set([
+  'auto', 'en', 'af', 'es', 'fr', 'de', 'it', 'pt', 'nl', 'pl', 'ru',
+  'ja', 'ko', 'zh', 'ar', 'hi', 'tr', 'sv', 'da', 'no', 'fi',
+])
+
+export function validateHotkey(input: unknown): string | null {
+  if (typeof input !== 'string') return null
+  const trimmed = input.trim()
+  if (trimmed.length === 0 || trimmed.length > 64) return null
+  if (!HOTKEY_PATTERN.test(trimmed)) return null
+  return trimmed
+}
+
+export function validateMicrophoneId(input: unknown): string | null {
+  if (typeof input !== 'string') return null
+  const trimmed = input.trim()
+  if (trimmed.length === 0 || trimmed.length > 256) return null
+  // deviceId from getUserMedia is a non-whitespace hex/base64-ish string
+  if (!/^[A-Za-z0-9+/=._-]+$/.test(trimmed) && trimmed !== 'default') return null
+  return trimmed
+}
+
+export function validateLanguage(input: unknown): string | null {
+  if (typeof input !== 'string') return null
+  const lower = input.trim().toLowerCase()
+  if (!ALLOWED_LANGUAGES.has(lower)) return null
+  return lower
+}
+
+export function validateToggleKey(
+  input: unknown,
+): 'showOverlay' | 'dictationSounds' | 'launchAtLogin' | null {
+  if (typeof input !== 'string') return null
+  const allowed = new Set(['showOverlay', 'dictationSounds', 'launchAtLogin'])
+  return allowed.has(input)
+    ? (input as 'showOverlay' | 'dictationSounds' | 'launchAtLogin')
+    : null
+}
+
+// ── JWT validation (decode-only — signature verification happens server-side) ──
+interface JwtPayload {
+  exp?: number
+  iat?: number
+  sub?: string
+  aud?: string | string[]
+  iss?: string
+}
+
+const MAX_JWT_LENGTH = 4096
+const CLOCK_SKEW_SECONDS = 30
+
+export interface JwtValidationResult {
+  ok: boolean
+  expiresAt: number | null
+  reason?: string
+}
+
+export function validateAuthToken(input: unknown): JwtValidationResult {
+  if (typeof input !== 'string') return { ok: false, expiresAt: null, reason: 'not-string' }
+  const token = input.trim()
+  if (token.length === 0 || token.length > MAX_JWT_LENGTH) {
+    return { ok: false, expiresAt: null, reason: 'length' }
+  }
+  const parts = token.split('.')
+  if (parts.length !== 3) return { ok: false, expiresAt: null, reason: 'not-jwt' }
+
+  let payload: JwtPayload
+  try {
+    const json = Buffer.from(
+      parts[1].replace(/-/g, '+').replace(/_/g, '/').padEnd(parts[1].length + ((4 - (parts[1].length % 4)) % 4), '='),
+      'base64',
+    ).toString('utf8')
+    payload = JSON.parse(json) as JwtPayload
+  } catch {
+    return { ok: false, expiresAt: null, reason: 'malformed-payload' }
+  }
+
+  if (typeof payload.exp !== 'number') {
+    return { ok: false, expiresAt: null, reason: 'no-exp' }
+  }
+  const expMs = payload.exp * 1000
+  if (Date.now() > expMs + CLOCK_SKEW_SECONDS * 1000) {
+    return { ok: false, expiresAt: expMs, reason: 'expired' }
+  }
+  return { ok: true, expiresAt: expMs }
+}

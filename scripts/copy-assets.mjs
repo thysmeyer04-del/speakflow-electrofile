@@ -16,6 +16,7 @@ const pairs = [
 
 await fs.mkdir(path.join(root, 'dist/recorder'), { recursive: true })
 await fs.mkdir(path.join(root, 'dist/overlay'), { recursive: true })
+await fs.mkdir(path.join(root, 'dist/preload'), { recursive: true })
 
 for (const { src, dst } of pairs) {
   const from = path.join(root, src)

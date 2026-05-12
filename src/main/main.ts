@@ -10,6 +10,7 @@ import { requestStartupPermissions } from './permissions'
 import { getSettings } from './settings'
 import { initRecorder, destroyRecorder } from './recorder'
 import { isQuitting, markQuitting } from './quit-state'
+import { configureSecurity, isExternalUrlAllowed, isOriginTrusted } from './security'
 
 dotenvConfig()
 
@@ -61,15 +62,23 @@ async function createMainWindow(): Promise<BrowserWindow> {
   })
 
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url).catch((err) => log.warn('Failed to open external URL', err))
+    if (isExternalUrlAllowed(url)) {
+      shell.openExternal(url).catch((err) => log.warn('openExternal failed', err))
+    } else {
+      log.warn('Blocked window.open to disallowed URL', url)
+    }
     return { action: 'deny' }
   })
 
   win.webContents.on('will-navigate', (event, url) => {
-    if (!isAllowedNavigation(url)) {
+    if (!isOriginTrusted(url)) {
       event.preventDefault()
       log.warn('Blocked navigation attempt', url)
     }
+  })
+
+  win.webContents.on('will-attach-webview', (event) => {
+    event.preventDefault()
   })
 
   await win.loadURL(DASHBOARD_URL)
@@ -111,7 +120,7 @@ function createOverlayWindow(): BrowserWindow {
     movable: false,
     show: false,
     webPreferences: {
-      preload: path.join(__dirname, '..', 'preload', 'preload.js'),
+      preload: path.join(__dirname, '..', 'overlay', 'overlay-preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -119,21 +128,19 @@ function createOverlayWindow(): BrowserWindow {
   })
 
   win.setIgnoreMouseEvents(true)
+
+  // The overlay is a local file; deny ALL navigation and any window.open attempt.
+  win.webContents.on('will-navigate', (event) => {
+    event.preventDefault()
+    log.warn('Blocked overlay navigation')
+  })
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+
   win.loadFile(path.join(__dirname, '..', 'overlay', 'overlay.html')).catch((err) => {
     log.error('Failed to load overlay window', err)
   })
 
   return win
-}
-
-function isAllowedNavigation(url: string): boolean {
-  try {
-    const parsed = new URL(url)
-    const dashboardOrigin = new URL(DASHBOARD_URL).origin
-    return parsed.origin === dashboardOrigin
-  } catch {
-    return false
-  }
 }
 
 function resolveIcon(): string | undefined {
@@ -153,9 +160,16 @@ function hardenSession() {
     callback({ responseHeaders })
   })
 
-  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-    const allowed = ['media', 'clipboard-read', 'clipboard-sanitized-write']
-    callback(allowed.includes(permission))
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    // Only the main dashboard window may request permissions, and only for
+    // 'media' (mic capture happens in the hidden recorder window which lives
+    // in the same session). Everything else is denied.
+    const senderId = webContents?.id
+    const senderUrl = details?.requestingUrl ?? webContents?.getURL() ?? ''
+    const isMain = senderId !== undefined && senderId === mainWindow?.webContents.id
+    const isRecorder = senderUrl.startsWith('file://') && senderUrl.endsWith('/recorder.html')
+    const allowList = isMain || isRecorder ? new Set(['media']) : new Set<string>()
+    callback(allowList.has(permission))
   })
 }
 
@@ -166,6 +180,11 @@ app.whenReady().then(async () => {
 
   mainWindow = await createMainWindow()
   overlayWindow = createOverlayWindow()
+
+  configureSecurity({
+    allowedSenderId: mainWindow.webContents.id,
+    allowedOrigin: DASHBOARD_URL,
+  })
 
   setupTray(mainWindow)
   setupIPC({
