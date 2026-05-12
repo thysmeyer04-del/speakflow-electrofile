@@ -202,43 +202,41 @@ export function validateAuthToken(input: unknown): JwtValidationResult {
   if (typeof payload.nbf === 'number' && nowSec + CLOCK_SKEW_SECONDS < payload.nbf) {
     return { ok: false, expiresAt: expMs, reason: 'not-yet-valid' }
   }
-  if (typeof payload.iat === 'number') {
-    if (payload.iat > nowSec + CLOCK_SKEW_SECONDS) {
-      return { ok: false, expiresAt: expMs, reason: 'iat-in-future' }
-    }
-    if (payload.exp - payload.iat > MAX_TOKEN_LIFETIME_SECONDS) {
-      return { ok: false, expiresAt: expMs, reason: 'lifetime-too-long' }
-    }
+  // Enforce max lifetime regardless of whether iat is present. Compare
+  // against "now" if iat is absent — caps far-future exp values.
+  const issuedAt = typeof payload.iat === 'number' ? payload.iat : nowSec
+  if (typeof payload.iat === 'number' && payload.iat > nowSec + CLOCK_SKEW_SECONDS) {
+    return { ok: false, expiresAt: expMs, reason: 'iat-in-future' }
   }
-  if (payload.iss && !SUPABASE_ISSUER_PATTERN.test(payload.iss)) {
+  if (payload.exp - issuedAt > MAX_TOKEN_LIFETIME_SECONDS) {
+    return { ok: false, expiresAt: expMs, reason: 'lifetime-too-long' }
+  }
+  // Supabase tokens always set iss + aud. Require both.
+  if (typeof payload.iss !== 'string' || !SUPABASE_ISSUER_PATTERN.test(payload.iss)) {
     return { ok: false, expiresAt: expMs, reason: 'bad-issuer' }
   }
-  // Supabase typically sets aud to "authenticated"; tolerate missing aud
-  // because some flows omit it.
-  if (payload.aud) {
-    const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud]
-    if (!auds.includes('authenticated')) {
-      return { ok: false, expiresAt: expMs, reason: 'bad-audience' }
-    }
+  const auds = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : []
+  if (!auds.includes('authenticated')) {
+    return { ok: false, expiresAt: expMs, reason: 'bad-audience' }
   }
 
   return { ok: true, expiresAt: expMs }
 }
 
+// Production proxy hosts — exact match, no wildcards. We deliberately do NOT
+// allow `*.up.railway.app` because anyone can spin up a Railway project on
+// that suffix and a misconfigured/leaked SPEAKFLOW_API_URL would forward
+// the user's JWT and audio to an attacker.
 const ALLOWED_PROXY_HOSTS = new Set<string>([
-  'speakflow.app',
   'api.speakflow.app',
+  'speakflow.app',
 ])
 
 export function isProxyUrlAllowed(url: string): boolean {
   try {
     const parsed = new URL(url)
     if (parsed.protocol !== 'https:') return false
-    const host = parsed.hostname.toLowerCase()
-    if (ALLOWED_PROXY_HOSTS.has(host)) return true
-    if (host.endsWith('.speakflow.app')) return true
-    if (host.endsWith('.up.railway.app')) return true
-    return false
+    return ALLOWED_PROXY_HOSTS.has(parsed.hostname.toLowerCase())
   } catch {
     return false
   }

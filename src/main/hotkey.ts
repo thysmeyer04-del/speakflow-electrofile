@@ -7,70 +7,80 @@ import { toggleRecording } from './recording-controller'
 const SAFE_FALLBACK = 'Control+Shift+Space'
 
 let currentAccelerator: string | null = null
-let lastRegistrationResult: { accelerator: string; ok: boolean; fellBackFrom: string | null } | null = null
+let lastRegistrationResult: {
+  accelerator: string
+  ok: boolean
+  fellBackFrom: string | null
+} | null = null
 
+/**
+ * Probe-before-swap: register the candidate FIRST, and only unregister the
+ * previously active accelerator after the new one is confirmed. If both
+ * preferred and fallback fail, the previously working hotkey is preserved.
+ */
 export function registerHotkey(preferred: string): boolean {
-  // Probe before swapping. Try the preferred accelerator; if it fails, try
-  // the safe fallback. Only unregister our previous binding once we have a
-  // working new one.
-  const tried: Array<{ acc: string; ok: boolean }> = []
+  const result = tryRegisterCandidate(preferred)
+    ?? (preferred !== SAFE_FALLBACK ? tryRegisterCandidate(SAFE_FALLBACK) : null)
 
-  const tryRegister = (acc: string): boolean => {
-    if (currentAccelerator === acc) return globalShortcut.isRegistered(acc)
-    let ok = false
-    try {
-      // Don't blow away other unrelated globalShortcut registrations elsewhere
-      // in the app: only unregister something if we registered it.
-      if (currentAccelerator) {
-        try {
-          globalShortcut.unregister(currentAccelerator)
-        } catch {
-          // ignore
-        }
-      }
-      ok = globalShortcut.register(acc, () => {
-        void toggleRecording()
-      })
-    } catch (err) {
-      log.error(`Hotkey "${acc}" threw on register:`, err)
-      ok = false
-    }
-    tried.push({ acc, ok })
-    if (ok) currentAccelerator = acc
-    return ok
-  }
-
-  if (tryRegister(preferred)) {
-    lastRegistrationResult = { accelerator: preferred, ok: true, fellBackFrom: null }
-    log.info(`Hotkey registered: ${preferred}`)
-    broadcastHotkeyState()
-    return true
-  }
-
-  // Preferred failed — try the safe fallback so the user is never left
-  // without any hotkey at all.
-  if (preferred !== SAFE_FALLBACK && tryRegister(SAFE_FALLBACK)) {
+  if (!result) {
+    log.error(`Could not register any hotkey. Keeping previous: ${currentAccelerator}`)
     lastRegistrationResult = {
-      accelerator: SAFE_FALLBACK,
-      ok: true,
-      fellBackFrom: preferred,
+      accelerator: preferred,
+      ok: false,
+      fellBackFrom: null,
     }
-    log.warn(
-      `Hotkey "${preferred}" unavailable — using fallback "${SAFE_FALLBACK}"`,
-    )
     broadcastHotkeyState()
-    return true
+    return false
   }
 
-  log.error(`Could not register any hotkey. Tried: ${tried.map((t) => t.acc).join(', ')}`)
-  lastRegistrationResult = {
-    accelerator: preferred,
-    ok: false,
-    fellBackFrom: null,
+  // New hotkey registered. Now safe to release the old one (if different).
+  const previous = currentAccelerator
+  if (previous && previous !== result) {
+    try {
+      globalShortcut.unregister(previous)
+    } catch (err) {
+      log.warn(`Failed to unregister previous hotkey ${previous}`, err)
+    }
   }
-  currentAccelerator = null
+
+  currentAccelerator = result
+  lastRegistrationResult = {
+    accelerator: result,
+    ok: true,
+    fellBackFrom: result !== preferred ? preferred : null,
+  }
+  log.info(`Hotkey registered: ${result}${result !== preferred ? ` (fell back from ${preferred})` : ''}`)
   broadcastHotkeyState()
-  return false
+  return true
+}
+
+/** Attempt to register a candidate without touching `currentAccelerator`. Returns the accelerator on success. */
+function tryRegisterCandidate(acc: string): string | null {
+  // isRegistered() itself throws on invalid accelerators (e.g. "Control+Meta"
+  // isn't accepted on Electron). Treat any throw as "candidate not viable".
+  let alreadyRegistered = false
+  try {
+    alreadyRegistered = globalShortcut.isRegistered(acc)
+  } catch (err) {
+    log.warn(`Hotkey "${acc}" not a valid accelerator:`, (err as Error).message)
+    return null
+  }
+
+  if (alreadyRegistered) {
+    if (acc === currentAccelerator) return acc // already ours
+    log.warn(`Hotkey "${acc}" already registered by another app`)
+    return null
+  }
+
+  try {
+    const ok = globalShortcut.register(acc, () => {
+      void toggleRecording()
+    })
+    return ok ? acc : null
+  } catch (err) {
+    log.error(`Hotkey "${acc}" threw on register:`, (err as Error).message)
+    return null
+  }
 }
 
 export function unregisterHotkey(): void {

@@ -15,10 +15,9 @@ import {
   stopRecorderSession,
   onRecorderCrash,
   onAutoStop,
-  isRecorderHealthy,
 } from './recorder'
 import { transcribeAudio } from './transcribe'
-import { injectText } from './inject'
+import { injectText, captureFocusTarget, WindowSnapshot } from './inject'
 import { getSettings } from './settings'
 import { playSound } from './sound'
 import fs from 'fs/promises'
@@ -35,6 +34,10 @@ export type RecordingState =
 let state: RecordingState = 'idle'
 let listeners: Array<(s: RecordingState) => void> = []
 let opChain: Promise<void> = Promise.resolve()
+// The window the user was in WHEN they pressed the hotkey. We inject
+// transcribed text back into this exact target — never whatever happens to
+// be focused after the transcription round-trip.
+let focusTarget: WindowSnapshot | null = null
 
 export function getRecordingState(): RecordingState {
   return state
@@ -140,12 +143,13 @@ async function doStart(): Promise<void> {
   setState('starting')
   const settings = getSettings()
 
-  if (!isRecorderHealthy()) {
-    broadcast('transcription-error', 'Recorder is not ready. Restart the app.')
-    setState('idle')
-    return
-  }
+  // Capture the focus target BEFORE we start the recorder window (which
+  // could itself momentarily affect z-order on some platforms). This is
+  // the window we'll paste into after transcription completes.
+  focusTarget = await captureFocusTarget()
 
+  // Note: startRecorderSession lazy-inits the recorder window if it isn't
+  // already up, so we don't reject on isRecorderHealthy() === false here.
   try {
     await startRecorderSession({ microphoneId: settings.microphone })
   } catch (err) {
@@ -204,7 +208,7 @@ async function processAudio(buffer: Buffer, language: string): Promise<void> {
       const trimmed = text.trim()
       let injectResult
       try {
-        injectResult = await injectText(trimmed)
+        injectResult = await injectText(trimmed, focusTarget)
       } catch (injectErr) {
         log.error('[recording] injection threw', injectErr)
         injectResult = { ok: false, method: 'clipboard' as const, error: 'inject-threw' }
@@ -244,8 +248,8 @@ function humanizeInjectError(reason: string): string {
   if (reason === 'no-keyboard-backend') {
     return 'Text copied to clipboard — paste manually (keyboard backend unavailable).'
   }
-  if (reason === 'focus-lost') {
-    return 'Lost focus before pasting. Click back into your editor and press Ctrl+V.'
+  if (reason === 'focus-lost' || reason === 'no-target-snapshot') {
+    return 'Text copied to clipboard — focus changed, click back into your editor and press Ctrl+V.'
   }
   if (reason === 'paste-failed') {
     return 'Paste failed. The text is on your clipboard — press Ctrl+V manually.'

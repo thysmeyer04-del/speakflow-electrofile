@@ -1,8 +1,7 @@
 import { clipboard } from 'electron'
 import log from 'electron-log/main'
 
-// Type aliases — nut-js is loaded lazily so its types aren't always available
-// at module init.
+// Type aliases — nut-js is loaded lazily.
 type NutKeyboard = typeof import('@nut-tree-fork/nut-js')['keyboard']
 type NutKey = typeof import('@nut-tree-fork/nut-js')['Key']
 type NutGetActiveWindow = typeof import('@nut-tree-fork/nut-js')['getActiveWindow']
@@ -31,7 +30,13 @@ const PASTE_SETTLE_MS = 260
 const KEYSTROKE_LIMIT = 100
 
 // Process-wide mutex — clipboard injection cannot interleave.
-let injectionInFlight: Promise<void> = Promise.resolve()
+let injectionInFlight: Promise<unknown> = Promise.resolve()
+
+export interface WindowSnapshot {
+  title: string
+  region: string // serialized region as a fingerprint
+  pid: number | null
+}
 
 export interface InjectionResult {
   ok: boolean
@@ -39,10 +44,43 @@ export interface InjectionResult {
   error?: string
 }
 
-export async function injectText(text: string): Promise<InjectionResult> {
+/**
+ * Capture the foreground window. Call this AT THE MOMENT the user expressed
+ * intent (hotkey press) — *before* any audio/transcription work — and pass
+ * the snapshot to injectText. Returns null if nut-js or getActiveWindow is
+ * unavailable.
+ */
+export async function captureFocusTarget(): Promise<WindowSnapshot | null> {
+  if (!loadNut() || !nutGetActiveWindow) return null
+  try {
+    const w = await nutGetActiveWindow()
+    const [title, region] = await Promise.all([w.title, w.region])
+    const fingerprint =
+      region && typeof region === 'object'
+        ? `${(region as { left?: number }).left ?? 0}x${(region as { top?: number }).top ?? 0}+${(region as { width?: number }).width ?? 0}+${(region as { height?: number }).height ?? 0}`
+        : 'unknown'
+    // nut-js doesn't expose pid on every platform — leave null and rely on
+    // title+region for identity.
+    return { title: title ?? '', region: fingerprint, pid: null }
+  } catch (err) {
+    log.warn('captureFocusTarget failed', err)
+    return null
+  }
+}
+
+function snapshotsMatch(a: WindowSnapshot | null, b: WindowSnapshot | null): boolean {
+  if (!a || !b) return false
+  // Reject empty/missing titles — too weak to verify identity.
+  if (!a.title || !b.title) return false
+  return a.title === b.title && a.region === b.region
+}
+
+export async function injectText(
+  text: string,
+  expectedTarget: WindowSnapshot | null,
+): Promise<InjectionResult> {
   if (!text) return { ok: true, method: 'keystroke' }
 
-  // Serialize: chain onto whatever is currently running.
   let resolveOuter!: (r: InjectionResult) => void
   let rejectOuter!: (e: Error) => void
   const outerPromise = new Promise<InjectionResult>((res, rej) => {
@@ -52,7 +90,7 @@ export async function injectText(text: string): Promise<InjectionResult> {
 
   injectionInFlight = injectionInFlight.then(async () => {
     try {
-      const r = await doInject(text)
+      const r = await doInject(text, expectedTarget)
       resolveOuter(r)
     } catch (err) {
       rejectOuter(err as Error)
@@ -62,26 +100,52 @@ export async function injectText(text: string): Promise<InjectionResult> {
   return outerPromise
 }
 
-async function doInject(text: string): Promise<InjectionResult> {
-  await sleep(FOCUS_RETURN_DELAY_MS)
+async function doInject(
+  text: string,
+  expectedTarget: WindowSnapshot | null,
+): Promise<InjectionResult> {
   const nutReady = loadNut()
-
   if (!nutReady) {
-    // No keystroke backend — leave the text on the clipboard so the user
-    // can paste manually. Surface this so callers can show an error.
     clipboard.writeText(text)
-    return {
-      ok: false,
-      method: 'clipboard-only',
-      error: 'no-keyboard-backend',
-    }
+    return { ok: false, method: 'clipboard-only', error: 'no-keyboard-backend' }
   }
 
-  // Capture the foreground window. We re-check immediately before paste to
-  // guard against focus-stealing during the typing delay.
-  const targetSnapshot = await snapshotActiveWindow()
+  // Fail-closed: if we cannot verify identity, do NOT paste — too risky.
+  if (!expectedTarget) {
+    clipboard.writeText(text)
+    return { ok: false, method: 'clipboard-only', error: 'no-target-snapshot' }
+  }
+
+  // Verify focus BEFORE the focus-return delay so we don't paste into a
+  // window that stole focus during the wait.
+  const beforeDelay = await captureFocusTarget()
+  if (!snapshotsMatch(beforeDelay, expectedTarget)) {
+    log.warn(
+      `Focus changed before paste (expected: ${expectedTarget.title}, actual: ${beforeDelay?.title ?? 'unknown'})`,
+    )
+    clipboard.writeText(text)
+    return { ok: false, method: 'clipboard-only', error: 'focus-lost' }
+  }
+
+  await sleep(FOCUS_RETURN_DELAY_MS)
+
+  // Re-check focus after the delay too.
+  const afterDelay = await captureFocusTarget()
+  if (!snapshotsMatch(afterDelay, expectedTarget)) {
+    log.warn(
+      `Focus changed during delay (expected: ${expectedTarget.title}, actual: ${afterDelay?.title ?? 'unknown'})`,
+    )
+    clipboard.writeText(text)
+    return { ok: false, method: 'clipboard-only', error: 'focus-lost' }
+  }
 
   if (text.length <= KEYSTROKE_LIMIT && isPureAscii(text)) {
+    // One last focus check immediately before typing.
+    const right = await captureFocusTarget()
+    if (!snapshotsMatch(right, expectedTarget)) {
+      clipboard.writeText(text)
+      return { ok: false, method: 'clipboard-only', error: 'focus-lost' }
+    }
     try {
       await nutKeyboard!.type(text)
       return { ok: true, method: 'keystroke' }
@@ -90,56 +154,34 @@ async function doInject(text: string): Promise<InjectionResult> {
     }
   }
 
-  return injectViaClipboard(text, targetSnapshot)
-}
-
-interface WindowSnapshot {
-  title: string | null
-}
-
-async function snapshotActiveWindow(): Promise<WindowSnapshot | null> {
-  if (!nutGetActiveWindow) return null
-  try {
-    const w = await nutGetActiveWindow()
-    const title = await w.title
-    return { title }
-  } catch {
-    return null
-  }
+  return injectViaClipboard(text, expectedTarget)
 }
 
 async function injectViaClipboard(
   text: string,
-  before: WindowSnapshot | null,
+  expectedTarget: WindowSnapshot,
 ): Promise<InjectionResult> {
   const previousText = clipboard.readText()
   const previousImage = clipboard.readImage()
   const previousHtml = clipboard.readHTML?.() ?? ''
-  const previousRtf = (clipboard as unknown as { readRTF?: () => string }).readRTF?.() ?? ''
+  const previousRtf =
+    (clipboard as unknown as { readRTF?: () => string }).readRTF?.() ?? ''
 
   clipboard.writeText(text)
   await sleep(50)
 
-  // Verify the foreground window is still the one we snapshotted. If focus
-  // got stolen, abort the paste — leave the text on the clipboard so the
-  // user can paste manually.
-  if (before) {
-    const after = await snapshotActiveWindow()
-    if (after && after.title !== before.title) {
-      log.warn(`Active window changed (${before.title} → ${after.title}); skipping paste`)
-      // Don't restore clipboard — let user paste manually.
-      return {
-        ok: false,
-        method: 'clipboard',
-        error: 'focus-lost',
-      }
-    }
+  // Final focus check immediately before sending paste.
+  const right = await captureFocusTarget()
+  if (!snapshotsMatch(right, expectedTarget)) {
+    log.warn(`Focus changed at paste moment (was: ${right?.title})`)
+    return { ok: false, method: 'clipboard', error: 'focus-lost' }
   }
 
   let pasteOk = false
   if (nutKeyboard && nutKey) {
     try {
-      const modifier = process.platform === 'darwin' ? nutKey.LeftSuper : nutKey.LeftControl
+      const modifier =
+        process.platform === 'darwin' ? nutKey.LeftSuper : nutKey.LeftControl
       await nutKeyboard.pressKey(modifier, nutKey.V)
       await sleep(30)
       await nutKeyboard.releaseKey(modifier, nutKey.V)
@@ -149,21 +191,19 @@ async function injectViaClipboard(
     }
   }
 
-  // Wait for the target app to consume the clipboard before we restore.
   await sleep(PASTE_SETTLE_MS)
 
-  // Restore as best we can. Order: HTML+text > image > text > nothing.
+  // Restore as best we can. Compose multi-format when applicable so RTF/HTML
+  // clipboards survive.
   try {
-    if (previousHtml) {
-      clipboard.write({
-        text: previousText,
-        html: previousHtml,
-        ...(previousRtf ? { rtf: previousRtf } : {}),
-      })
+    const compose: { text?: string; html?: string; rtf?: string } = {}
+    if (previousText) compose.text = previousText
+    if (previousHtml) compose.html = previousHtml
+    if (previousRtf) compose.rtf = previousRtf
+    if (Object.keys(compose).length > 0) {
+      clipboard.write(compose)
     } else if (!previousImage.isEmpty()) {
       clipboard.writeImage(previousImage)
-    } else if (previousText.length > 0) {
-      clipboard.writeText(previousText)
     }
   } catch (err) {
     log.warn('Clipboard restore failed', err)
@@ -176,7 +216,6 @@ async function injectViaClipboard(
 }
 
 function isPureAscii(text: string): boolean {
-  // Printable ASCII only — no newlines/tabs which the keystroke path mangles.
   return /^[\x20-\x7E]+$/.test(text)
 }
 

@@ -110,9 +110,13 @@ async function start(microphoneId: string): Promise<void> {
   }
   mediaRecorder.onerror = (e: Event) => {
     const err = (e as ErrorEvent).error ?? (e as unknown as { error?: Error }).error
-    window.recorderAPI.reportFailed(
-      `mediarecorder-error: ${err?.message ?? 'unknown'}`,
-    )
+    void cleanup().finally(() => {
+      localState = 'idle'
+      bufferedBlob = null
+      window.recorderAPI.reportFailed(
+        `mediarecorder-error: ${err?.message ?? 'unknown'}`,
+      )
+    })
   }
 
   setupVAD()
@@ -135,37 +139,44 @@ async function start(microphoneId: string): Promise<void> {
   window.recorderAPI.reportStarted()
 }
 
-// VAD / cap initiated: stop mediaRecorder, buffer the blob, then wait for main's stop.
+// VAD / cap initiated: stop mediaRecorder, buffer the blob, then wait for
+// main's stop. We DON'T auto-flush after a timeout — sending a blob without
+// a pendingStop on main side just drops the audio. Instead, re-notify
+// periodically so main has multiple chances to observe the auto-stop.
 async function autoStop(): Promise<void> {
   if (localState !== 'recording') return
   localState = 'stopping'
   await finalizeMediaRecorder()
   localState = 'awaiting-flush'
   window.recorderAPI.reportAutoStop()
-  // Safety: if main never asks for the blob within 8s, flush it anyway.
-  window.setTimeout(() => {
-    if (localState === 'awaiting-flush') void flushBuffered()
-  }, 8000)
+  // Re-notify every 2s for up to 10s if main hasn't asked for the blob yet.
+  let attempts = 0
+  const reNotify = window.setInterval(() => {
+    if (localState !== 'awaiting-flush' || attempts >= 5) {
+      clearInterval(reNotify)
+      return
+    }
+    attempts++
+    window.recorderAPI.reportAutoStop()
+  }, 2000)
 }
 
-// Main asked to stop. Either we are still recording (user pressed hotkey) or
-// we already auto-stopped and just need to send the buffered blob.
+// Main asked to stop. Always reply with a blob (even empty) so main's
+// pendingStop resolves — never silently return, that would hang main for
+// 10 s until the stop timeout.
 async function handleMainStop(): Promise<void> {
   if (localState === 'awaiting-flush') {
     await flushBuffered()
     return
   }
-  if (localState === 'idle' || localState === 'flushed') {
-    // Send an empty blob so main's pendingStop resolves.
-    await sendBlobSafe(new ArrayBuffer(0), 'audio/webm')
+  if (localState === 'recording') {
+    localState = 'stopping'
+    await finalizeMediaRecorder()
+    await flushBuffered()
     return
   }
-  if (localState !== 'recording') {
-    return
-  }
-  localState = 'stopping'
-  await finalizeMediaRecorder()
-  await flushBuffered()
+  // idle, starting, stopping, or flushed: nothing to send. Reply empty.
+  await sendBlobSafe(new ArrayBuffer(0), 'audio/webm')
 }
 
 async function finalizeMediaRecorder(): Promise<void> {

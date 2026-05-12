@@ -1,16 +1,4 @@
 // Lifecycle owner for the hidden recorder BrowserWindow.
-//
-// Exposes a tiny, ACK-driven API to recording-controller.ts:
-//   - startRecorderSession({ microphoneId }) -> Promise<void> when renderer
-//     confirms it is recording (rejects on permission / init / timeout).
-//   - stopRecorderSession() -> Promise<Buffer> when renderer ships its audio
-//     blob (rejects on timeout or crash).
-//   - onRecorderCrash(cb)
-//   - isRecorderHealthy()
-//
-// The renderer is the single owner of MediaRecorder + VAD. VAD-initiated
-// auto-stops still flow through stopRecorderSession's pending promise so the
-// state machine reconciles correctly.
 
 import { BrowserWindow, ipcMain, IpcMainInvokeEvent } from 'electron'
 import path from 'path'
@@ -25,7 +13,10 @@ interface BlobPayload { buffer: ArrayBuffer; mimeType: string }
 
 let recorderWindow: BrowserWindow | null = null
 let readyPromise: Promise<void> | null = null
+let readyResolved = false
+let expectingClose = false
 let crashHandlers: Array<(reason: string) => void> = []
+let autoStopHandlers: Array<() => void> = []
 
 interface PendingStart {
   resolve: () => void
@@ -45,6 +36,8 @@ let pendingStop: PendingStop | null = null
 export function initRecorder(): void {
   if (recorderWindow && !recorderWindow.isDestroyed()) return
 
+  expectingClose = false
+  readyResolved = false
   recorderWindow = new BrowserWindow({
     width: 1,
     height: 1,
@@ -69,18 +62,26 @@ export function initRecorder(): void {
     log.warn('[recorder] window unresponsive')
   })
   win.on('closed', () => {
+    const wasExpected = expectingClose
     if (recorderWindow === win) recorderWindow = null
-    handleCrash('window-closed')
+    if (!wasExpected) handleCrash('window-closed')
   })
 
   readyPromise = new Promise<void>((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('ready-timeout')), READY_TIMEOUT_MS)
+    const t = setTimeout(() => {
+      // Sticky-reject avoidance: clear the cached promise so the next start
+      // attempt forces a fresh recorder init.
+      readyPromise = null
+      reject(new Error('ready-timeout'))
+    }, READY_TIMEOUT_MS)
     win.webContents.once('did-finish-load', () => {
       clearTimeout(t)
+      readyResolved = true
       resolve()
     })
     win.webContents.once('did-fail-load', (_e, _code, desc) => {
       clearTimeout(t)
+      readyPromise = null
       reject(new Error(`recorder-load-failed: ${desc}`))
     })
   })
@@ -93,12 +94,14 @@ export function initRecorder(): void {
 }
 
 export function destroyRecorder(): void {
+  expectingClose = true
   rejectPending('shutdown')
   if (recorderWindow && !recorderWindow.isDestroyed()) {
     recorderWindow.destroy()
   }
   recorderWindow = null
   readyPromise = null
+  readyResolved = false
 }
 
 export function isRecorderHealthy(): boolean {
@@ -112,12 +115,24 @@ export function onRecorderCrash(cb: (reason: string) => void): () => void {
   }
 }
 
+export function onAutoStop(cb: () => void): () => void {
+  autoStopHandlers.push(cb)
+  return () => {
+    autoStopHandlers = autoStopHandlers.filter((h) => h !== cb)
+  }
+}
+
 export async function startRecorderSession(opts: StartPayload): Promise<void> {
-  if (!recorderWindow) initRecorder()
+  // Lazy (re-)init: if the window doesn't exist (first start, crashed, or
+  // destroyed), spin it up fresh.
+  if (!recorderWindow || recorderWindow.isDestroyed()) {
+    initRecorder()
+  }
   if (!recorderWindow) throw new Error('recorder-init')
 
-  // Wait for the renderer to be ready (with a hard timeout)
-  if (readyPromise) {
+  // Wait for renderer ready. If the existing promise has been cleared (e.g.
+  // a previous timeout), the lazy init above gave us a fresh one.
+  if (readyPromise && !readyResolved) {
     await readyPromise
   }
 
@@ -126,7 +141,7 @@ export async function startRecorderSession(opts: StartPayload): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingStart = null
-      reject(new Error('ready-timeout'))
+      reject(new Error('start-timeout'))
     }, START_TIMEOUT_MS)
     pendingStart = { resolve, reject, timer }
     try {
@@ -178,7 +193,6 @@ function registerHandlers() {
     const sanitized = typeof message === 'string' ? message.slice(0, 200) : 'unknown'
     log.warn('[recorder] failed:', sanitized)
 
-    // A failure can apply to start (preferred) or stop, depending on state.
     if (pendingStart) {
       clearTimeout(pendingStart.timer)
       pendingStart.reject(new Error(sanitized))
@@ -217,23 +231,12 @@ function registerHandlers() {
     },
   )
 
-  // Renderer can request an auto-stop (VAD or 60s cap). Treat it as if the
-  // user pressed the hotkey — but only if we are currently recording.
   ipcMain.on('recorder:auto-stop', (event) => {
     if (!isFromRecorder(event)) return
-    // recording-controller will see the audio blob via 'recorder:audio-blob'
-    // — but we still need to ensure main treats this as a stop. Forward to
-    // the controller via an event.
-    autoStopHandlers.forEach((h) => h())
+    autoStopHandlers.forEach((h) => {
+      try { h() } catch (err) { log.warn('autoStop handler threw', err) }
+    })
   })
-}
-
-let autoStopHandlers: Array<() => void> = []
-export function onAutoStop(cb: () => void): () => void {
-  autoStopHandlers.push(cb)
-  return () => {
-    autoStopHandlers = autoStopHandlers.filter((h) => h !== cb)
-  }
 }
 
 function isFromRecorder(event: { sender: { id: number } }): boolean {
