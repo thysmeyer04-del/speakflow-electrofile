@@ -34,7 +34,8 @@ let injectionInFlight: Promise<unknown> = Promise.resolve()
 
 export interface WindowSnapshot {
   title: string
-  region: string // serialized region as a fingerprint
+  region: string | null // serialized region as a fingerprint; null when unavailable
+  processName: string | null
   pid: number | null
 }
 
@@ -47,21 +48,51 @@ export interface InjectionResult {
 /**
  * Capture the foreground window. Call this AT THE MOMENT the user expressed
  * intent (hotkey press) — *before* any audio/transcription work — and pass
- * the snapshot to injectText. Returns null if nut-js or getActiveWindow is
- * unavailable.
+ * the snapshot to injectText. Returns null if nut-js cannot give us strong
+ * enough identity to verify safely.
  */
 export async function captureFocusTarget(): Promise<WindowSnapshot | null> {
   if (!loadNut() || !nutGetActiveWindow) return null
   try {
-    const w = await nutGetActiveWindow()
-    const [title, region] = await Promise.all([w.title, w.region])
-    const fingerprint =
-      region && typeof region === 'object'
-        ? `${(region as { left?: number }).left ?? 0}x${(region as { top?: number }).top ?? 0}+${(region as { width?: number }).width ?? 0}+${(region as { height?: number }).height ?? 0}`
-        : 'unknown'
-    // nut-js doesn't expose pid on every platform — leave null and rely on
-    // title+region for identity.
-    return { title: title ?? '', region: fingerprint, pid: null }
+    const w = (await nutGetActiveWindow()) as unknown as {
+      title: Promise<string> | string
+      region: Promise<unknown> | unknown
+      processName?: Promise<string> | string
+      pid?: Promise<number> | number
+    }
+    const [title, region, processName, pid] = await Promise.all([
+      Promise.resolve(w.title),
+      Promise.resolve(w.region),
+      w.processName ? Promise.resolve(w.processName) : Promise.resolve<string | null>(null),
+      w.pid ? Promise.resolve(w.pid) : Promise.resolve<number | null>(null),
+    ])
+    let fingerprint: string | null = null
+    if (region && typeof region === 'object') {
+      const r = region as { left?: number; top?: number; width?: number; height?: number }
+      if (
+        typeof r.left === 'number' &&
+        typeof r.top === 'number' &&
+        typeof r.width === 'number' &&
+        typeof r.height === 'number'
+      ) {
+        fingerprint = `${r.left}x${r.top}+${r.width}+${r.height}`
+      }
+    }
+
+    const t = (title ?? '').toString()
+    // Fail-closed: a window we can't strongly identify is rejected. We need
+    // at least pid, or processName, or (title AND region) — any weaker than
+    // that and snapshotsMatch would happily compare two empty/unknown values.
+    const hasStrongId = typeof pid === 'number' || !!processName
+    const hasTitleRegion = !!t && !!fingerprint
+    if (!hasStrongId && !hasTitleRegion) return null
+
+    return {
+      title: t,
+      region: fingerprint,
+      processName: processName ? String(processName) : null,
+      pid: typeof pid === 'number' ? pid : null,
+    }
   } catch (err) {
     log.warn('captureFocusTarget failed', err)
     return null
@@ -70,16 +101,41 @@ export async function captureFocusTarget(): Promise<WindowSnapshot | null> {
 
 function snapshotsMatch(a: WindowSnapshot | null, b: WindowSnapshot | null): boolean {
   if (!a || !b) return false
-  // Reject empty/missing titles — too weak to verify identity.
-  if (!a.title || !b.title) return false
-  return a.title === b.title && a.region === b.region
+
+  // Identity strength asymmetry is suspicious — if one snapshot has pid/
+  // processName but the other doesn't, the active window changed underneath.
+  if ((a.pid === null) !== (b.pid === null)) return false
+  if ((a.processName === null) !== (b.processName === null)) return false
+
+  // Helper: a secondary match requires non-empty, equal values — null/empty
+  // never counts.
+  const titlesMatch = !!a.title && a.title === b.title
+  const regionsMatch = !!a.region && a.region === b.region
+
+  // pid + a window discriminator (multiple windows can share a pid).
+  if (a.pid !== null && b.pid !== null) {
+    if (a.pid !== b.pid) return false
+    return titlesMatch || regionsMatch
+  }
+
+  // processName + (title OR region).
+  if (a.processName && b.processName) {
+    if (a.processName !== b.processName) return false
+    return titlesMatch || regionsMatch
+  }
+
+  // Title+region only — both must be non-empty AND BOTH must match.
+  // This is the weakest path (no pid/processName from nut-js on this platform).
+  return titlesMatch && regionsMatch
 }
 
 export async function injectText(
   text: string,
   expectedTarget: WindowSnapshot | null,
 ): Promise<InjectionResult> {
-  if (!text) return { ok: true, method: 'keystroke' }
+  // Callers should never pass empty text — this is a defensive guard. Return
+  // a non-success result so the caller can't misread it as a successful paste.
+  if (!text) return { ok: false, method: 'keystroke', error: 'empty-input' }
 
   let resolveOuter!: (r: InjectionResult) => void
   let rejectOuter!: (e: Error) => void

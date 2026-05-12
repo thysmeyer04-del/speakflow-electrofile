@@ -202,13 +202,15 @@ export function validateAuthToken(input: unknown): JwtValidationResult {
   if (typeof payload.nbf === 'number' && nowSec + CLOCK_SKEW_SECONDS < payload.nbf) {
     return { ok: false, expiresAt: expMs, reason: 'not-yet-valid' }
   }
-  // Enforce max lifetime regardless of whether iat is present. Compare
-  // against "now" if iat is absent — caps far-future exp values.
-  const issuedAt = typeof payload.iat === 'number' ? payload.iat : nowSec
-  if (typeof payload.iat === 'number' && payload.iat > nowSec + CLOCK_SKEW_SECONDS) {
+  // Supabase tokens always include iat — require it so we can verify
+  // both not-too-future-issued AND max lifetime against the real issue time.
+  if (typeof payload.iat !== 'number') {
+    return { ok: false, expiresAt: expMs, reason: 'no-iat' }
+  }
+  if (payload.iat > nowSec + CLOCK_SKEW_SECONDS) {
     return { ok: false, expiresAt: expMs, reason: 'iat-in-future' }
   }
-  if (payload.exp - issuedAt > MAX_TOKEN_LIFETIME_SECONDS) {
+  if (payload.exp - payload.iat > MAX_TOKEN_LIFETIME_SECONDS) {
     return { ok: false, expiresAt: expMs, reason: 'lifetime-too-long' }
   }
   // Supabase tokens always set iss + aud. Require both.

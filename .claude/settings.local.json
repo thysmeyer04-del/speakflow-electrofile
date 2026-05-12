@@ -4,7 +4,8 @@
       "Skill(codex:setup)",
       "Skill(codex:setup:*)",
       "Bash(gemini --version)",
-      "Bash(git --version)"
+      "Bash(git --version)",
+      "Bash(codex exec --skip-git-repo-check 'Re-audit of inject + transcribe + JWT after consolidated fix. Previous audit found: *)"
     ]
   }
 }

@@ -36,10 +36,27 @@ export function registerHotkey(preferred: string): boolean {
   // New hotkey registered. Now safe to release the old one (if different).
   const previous = currentAccelerator
   if (previous && previous !== result) {
+    let previousReleased = false
     try {
       globalShortcut.unregister(previous)
+      // Verify it actually went away. If not, we'd have a duplicate active
+      // hotkey — roll back to leave the user on a known-good state.
+      previousReleased = !safeIsRegistered(previous)
     } catch (err) {
       log.warn(`Failed to unregister previous hotkey ${previous}`, err)
+    }
+    if (!previousReleased) {
+      log.error(
+        `Rolling back registration of ${result} — could not release ${previous}`,
+      )
+      try {
+        globalShortcut.unregister(result)
+      } catch {
+        // ignore — best effort
+      }
+      lastRegistrationResult = { accelerator: preferred, ok: false, fellBackFrom: null }
+      broadcastHotkeyState()
+      return false
     }
   }
 
@@ -52,6 +69,14 @@ export function registerHotkey(preferred: string): boolean {
   log.info(`Hotkey registered: ${result}${result !== preferred ? ` (fell back from ${preferred})` : ''}`)
   broadcastHotkeyState()
   return true
+}
+
+function safeIsRegistered(acc: string): boolean {
+  try {
+    return globalShortcut.isRegistered(acc)
+  } catch {
+    return false
+  }
 }
 
 /** Attempt to register a candidate without touching `currentAccelerator`. Returns the accelerator on success. */
