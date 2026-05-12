@@ -81,7 +81,22 @@ async function createMainWindow(): Promise<BrowserWindow> {
     event.preventDefault()
   })
 
-  await win.loadURL(DASHBOARD_URL)
+  try {
+    await win.loadURL(DASHBOARD_URL)
+  } catch (err) {
+    log.warn(`Failed to load dashboard at ${DASHBOARD_URL}`, err)
+    const fallback = encodeURIComponent(`
+      <!doctype html><html><head><meta charset="utf-8"><title>Speakflow</title>
+      <style>body{font-family:system-ui,sans-serif;background:#FAF9F7;color:#1a1917;
+        display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
+        padding:32px;text-align:center}h1{font-size:20px}code{background:#eee;padding:2px 6px;border-radius:4px}</style>
+      </head><body><div><h1>Couldn't reach the Speakflow Dashboard</h1>
+      <p>Expected at <code>${DASHBOARD_URL}</code>.</p>
+      <p>If you're developing, run <code>npm run dev</code> in the dashboard project first.</p>
+      </div></body></html>
+    `)
+    await win.loadURL(`data:text/html;charset=utf-8,${fallback}`)
+  }
 
   win.once('ready-to-show', () => {
     win.show()

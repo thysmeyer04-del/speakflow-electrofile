@@ -1,7 +1,5 @@
-import fs from 'fs'
+import fs from 'fs/promises'
 import path from 'path'
-import FormData from 'form-data'
-import fetch from 'node-fetch'
 import log from 'electron-log/main'
 import { getAuthToken } from './ipc'
 
@@ -17,7 +15,7 @@ export async function transcribeAudio(
   audioFilePath: string,
   opts: TranscribeOptions = {},
 ): Promise<string> {
-  const stat = await fs.promises.stat(audioFilePath)
+  const stat = await fs.stat(audioFilePath)
   if (stat.size === 0) return ''
   if (stat.size > MAX_BYTES) {
     throw new Error('Recording exceeds the 25 MB Groq limit. Try a shorter clip.')
@@ -31,6 +29,14 @@ export async function transcribeAudio(
   return transcribeViaGroq(audioFilePath, opts)
 }
 
+async function buildAudioForm(audioFilePath: string): Promise<FormData> {
+  const buffer = await fs.readFile(audioFilePath)
+  const blob = new Blob([new Uint8Array(buffer)], { type: 'audio/webm' })
+  const form = new FormData()
+  form.append('file', blob, path.basename(audioFilePath))
+  return form
+}
+
 async function transcribeViaGroq(
   audioFilePath: string,
   opts: TranscribeOptions,
@@ -42,11 +48,7 @@ async function transcribeViaGroq(
     )
   }
 
-  const form = new FormData()
-  form.append('file', fs.createReadStream(audioFilePath), {
-    filename: path.basename(audioFilePath),
-    contentType: 'audio/webm',
-  })
+  const form = await buildAudioForm(audioFilePath)
   form.append('model', WHISPER_MODEL)
   form.append('response_format', 'json')
   form.append('temperature', '0')
@@ -54,25 +56,19 @@ async function transcribeViaGroq(
 
   const response = await fetch(GROQ_TRANSCRIPTIONS_URL, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      ...form.getHeaders(),
-    },
+    headers: { Authorization: `Bearer ${apiKey}` },
     body: form,
   })
 
   if (!response.ok) {
     const body = await response.text()
     log.error(`Groq error ${response.status}: ${body}`)
-    if (response.status === 401) {
+    if (response.status === 401)
       throw new Error('Groq rejected the API key (401). Check GROQ_API_KEY.')
-    }
-    if (response.status === 413) {
+    if (response.status === 413)
       throw new Error('Audio too large for Groq (413). Record a shorter clip.')
-    }
-    if (response.status === 429) {
+    if (response.status === 429)
       throw new Error('Groq rate limit hit (429). Try again in a moment.')
-    }
     throw new Error(`Groq error ${response.status}: ${body.slice(0, 200)}`)
   }
 
@@ -90,20 +86,13 @@ async function transcribeViaProxy(
     throw new Error('Sign in via the dashboard to use Speakflow.')
   }
 
-  const form = new FormData()
-  form.append('file', fs.createReadStream(audioFilePath), {
-    filename: path.basename(audioFilePath),
-    contentType: 'audio/webm',
-  })
+  const form = await buildAudioForm(audioFilePath)
   if (opts.language) form.append('language', opts.language)
 
   const url = baseUrl.replace(/\/+$/, '') + '/transcribe'
   const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      ...form.getHeaders(),
-    },
+    headers: { Authorization: `Bearer ${token}` },
     body: form,
   })
 
