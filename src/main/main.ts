@@ -2,13 +2,14 @@ import { app, BrowserWindow, screen, session, shell } from 'electron'
 import path from 'path'
 import { config as dotenvConfig } from 'dotenv'
 import log from 'electron-log/main'
-import { setupTray, setTrayRecording } from './tray'
+import { setupTray, setTrayRecording, selfCheckTrayAssets } from './tray'
 import { registerHotkey, unregisterHotkey } from './hotkey'
 import { setupIPC } from './ipc'
 import { setupAutoUpdater } from './updater'
 import { requestStartupPermissions } from './permissions'
 import { getSettings } from './settings'
 import { initRecorder, destroyRecorder } from './recorder'
+import { shutdownRecording } from './recording-controller'
 import { isQuitting, markQuitting } from './quit-state'
 import { configureSecurity, isExternalUrlAllowed, isOriginTrusted } from './security'
 
@@ -201,6 +202,7 @@ app.whenReady().then(async () => {
     allowedOrigin: DASHBOARD_URL,
   })
 
+  selfCheckTrayAssets()
   setupTray(mainWindow)
   setupIPC({
     mainWindow,
@@ -226,8 +228,17 @@ app.on('window-all-closed', () => {
   // Stay alive in the tray on all platforms. Quit happens via tray menu.
 })
 
-app.on('before-quit', () => {
+let shuttingDown = false
+app.on('before-quit', (event) => {
+  if (shuttingDown) return
+  shuttingDown = true
   markQuitting()
   unregisterHotkey()
-  destroyRecorder()
+  event.preventDefault()
+  shutdownRecording()
+    .catch((err) => log.warn('Shutdown recording failed', err))
+    .finally(() => {
+      destroyRecorder()
+      app.exit(0)
+    })
 })

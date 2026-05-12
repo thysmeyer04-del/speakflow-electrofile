@@ -1,20 +1,45 @@
 // Hidden renderer window that owns getUserMedia + MediaRecorder.
-// Talks to main only via the recorder-preload contextBridge (window.recorderAPI).
+//
+// Protocol with main:
+//   main → 'recorder:start' { microphoneId }
+//   renderer → 'recorder:started' (ACK once MediaRecorder.start() is OK)
+//   renderer → 'recorder:failed' <reason> (any failure during start)
+//
+//   VAD or 60s cap (auto-stop): renderer stops mediaRecorder, buffers blob,
+//     sends 'recorder:auto-stop'. It WAITS for main's 'recorder:stop' before
+//     sending the blob, so main has time to set up its pendingStop and there
+//     is no race where the blob arrives before main is ready.
+//
+//   User stop:
+//   main → 'recorder:stop'
+//   renderer → 'recorder:audio-blob' (or empty buffer if too short)
 
 declare global {
   interface Window {
     recorderAPI: {
       onStart: (cb: (payload: { microphoneId: string }) => void) => () => void
       onStop: (cb: () => void) => () => void
+      reportStarted: () => void
+      reportFailed: (message: string) => void
+      reportAutoStop: () => void
       sendBlob: (payload: { buffer: ArrayBuffer; mimeType: string }) => Promise<{ ok: boolean }>
-      reportError: (message: string) => void
     }
   }
 }
 
+type LocalState =
+  | 'idle'
+  | 'starting'
+  | 'recording'
+  | 'stopping'           // mediaRecorder.stop() is running
+  | 'awaiting-flush'     // auto-stopped, blob buffered, waiting for main 'recorder:stop'
+  | 'flushed'
+
+let localState: LocalState = 'idle'
 let mediaRecorder: MediaRecorder | null = null
 let mediaStream: MediaStream | null = null
 let chunks: Blob[] = []
+let bufferedBlob: { buffer: ArrayBuffer; mimeType: string } | null = null
 let audioContext: AudioContext | null = null
 let analyser: AnalyserNode | null = null
 let vadTimer: number | null = null
@@ -32,12 +57,18 @@ window.recorderAPI.onStart(async (payload) => {
 })
 
 window.recorderAPI.onStop(async () => {
-  await stop()
+  await handleMainStop()
 })
 
 async function start(microphoneId: string): Promise<void> {
+  if (localState !== 'idle') {
+    window.recorderAPI.reportFailed(`overlapping-start (state=${localState})`)
+    return
+  }
+  localState = 'starting'
   await cleanup()
   chunks = []
+  bufferedBlob = null
 
   const constraints: MediaStreamConstraints = {
     audio: {
@@ -56,7 +87,8 @@ async function start(microphoneId: string): Promise<void> {
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia(constraints)
   } catch (err) {
-    window.recorderAPI.reportError(`mic-permission: ${(err as Error).message}`)
+    localState = 'idle'
+    window.recorderAPI.reportFailed(`mic-permission: ${(err as Error).message}`)
     return
   }
 
@@ -67,8 +99,9 @@ async function start(microphoneId: string): Promise<void> {
       mimeType ? { mimeType } : undefined,
     )
   } catch (err) {
-    window.recorderAPI.reportError(`recorder-init: ${(err as Error).message}`)
     await cleanup()
+    localState = 'idle'
+    window.recorderAPI.reportFailed(`recorder-init: ${(err as Error).message}`)
     return
   }
 
@@ -77,21 +110,65 @@ async function start(microphoneId: string): Promise<void> {
   }
   mediaRecorder.onerror = (e: Event) => {
     const err = (e as ErrorEvent).error ?? (e as unknown as { error?: Error }).error
-    window.recorderAPI.reportError(
+    window.recorderAPI.reportFailed(
       `mediarecorder-error: ${err?.message ?? 'unknown'}`,
     )
   }
 
   setupVAD()
   recordingStartedAt = Date.now()
-  mediaRecorder.start(250)
+  try {
+    mediaRecorder.start(250)
+  } catch (err) {
+    await cleanup()
+    localState = 'idle'
+    window.recorderAPI.reportFailed(`recorder-start: ${(err as Error).message}`)
+    return
+  }
+
+  localState = 'recording'
 
   maxDurationTimer = window.setTimeout(() => {
-    void stop()
+    void autoStop()
   }, MAX_DURATION_MS)
+
+  window.recorderAPI.reportStarted()
 }
 
-async function stop(): Promise<void> {
+// VAD / cap initiated: stop mediaRecorder, buffer the blob, then wait for main's stop.
+async function autoStop(): Promise<void> {
+  if (localState !== 'recording') return
+  localState = 'stopping'
+  await finalizeMediaRecorder()
+  localState = 'awaiting-flush'
+  window.recorderAPI.reportAutoStop()
+  // Safety: if main never asks for the blob within 8s, flush it anyway.
+  window.setTimeout(() => {
+    if (localState === 'awaiting-flush') void flushBuffered()
+  }, 8000)
+}
+
+// Main asked to stop. Either we are still recording (user pressed hotkey) or
+// we already auto-stopped and just need to send the buffered blob.
+async function handleMainStop(): Promise<void> {
+  if (localState === 'awaiting-flush') {
+    await flushBuffered()
+    return
+  }
+  if (localState === 'idle' || localState === 'flushed') {
+    // Send an empty blob so main's pendingStop resolves.
+    await sendBlobSafe(new ArrayBuffer(0), 'audio/webm')
+    return
+  }
+  if (localState !== 'recording') {
+    return
+  }
+  localState = 'stopping'
+  await finalizeMediaRecorder()
+  await flushBuffered()
+}
+
+async function finalizeMediaRecorder(): Promise<void> {
   if (maxDurationTimer) {
     clearTimeout(maxDurationTimer)
     maxDurationTimer = null
@@ -103,8 +180,7 @@ async function stop(): Promise<void> {
   silenceStartedAt = null
 
   if (!mediaRecorder) {
-    await cleanup()
-    await sendEmpty()
+    bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm' }
     return
   }
 
@@ -121,30 +197,39 @@ async function stop(): Promise<void> {
   const blob = new Blob(chunks, { type: chunks[0]?.type || 'audio/webm' })
   await cleanup()
 
-  if (
-    Date.now() - recordingStartedAt < MIN_RECORDING_MS ||
-    blob.size === 0
-  ) {
-    await sendEmpty()
+  const tooShort = Date.now() - recordingStartedAt < MIN_RECORDING_MS
+  if (tooShort || blob.size === 0) {
+    bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm' }
     return
   }
 
   try {
-    const buffer = await blob.arrayBuffer()
-    await window.recorderAPI.sendBlob({ buffer, mimeType: blob.type })
+    bufferedBlob = {
+      buffer: await blob.arrayBuffer(),
+      mimeType: blob.type || 'audio/webm',
+    }
   } catch (err) {
-    window.recorderAPI.reportError(`send-failed: ${(err as Error).message}`)
+    window.recorderAPI.reportFailed(`buffer-failed: ${(err as Error).message}`)
+    bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm' }
   }
 }
 
-async function sendEmpty(): Promise<void> {
+async function flushBuffered(): Promise<void> {
+  if (!bufferedBlob) {
+    bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm' }
+  }
+  const { buffer, mimeType } = bufferedBlob
+  bufferedBlob = null
+  localState = 'flushed'
+  await sendBlobSafe(buffer, mimeType)
+  localState = 'idle'
+}
+
+async function sendBlobSafe(buffer: ArrayBuffer, mimeType: string): Promise<void> {
   try {
-    await window.recorderAPI.sendBlob({
-      buffer: new ArrayBuffer(0),
-      mimeType: 'audio/webm',
-    })
-  } catch {
-    // ignore
+    await window.recorderAPI.sendBlob({ buffer, mimeType })
+  } catch (err) {
+    window.recorderAPI.reportFailed(`send-failed: ${(err as Error).message}`)
   }
 }
 
@@ -186,7 +271,7 @@ function setupVAD(): void {
         now - silenceStartedAt > SILENCE_DURATION_MS &&
         elapsed > MIN_RECORDING_MS
       ) {
-        void stop()
+        void autoStop()
       }
     } else {
       silenceStartedAt = null
@@ -222,4 +307,4 @@ async function cleanup(): Promise<void> {
   }
 }
 
-export {} // ensure module scope
+export {}

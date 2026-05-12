@@ -1,6 +1,3 @@
-// Internal preload for the hidden recorder window. Exposes a tightly-scoped
-// IPC bridge so we keep contextIsolation on even for our own renderer.
-
 import { contextBridge, ipcRenderer } from 'electron'
 
 type Unsub = () => void
@@ -16,7 +13,9 @@ contextBridge.exposeInMainWorld('recorderAPI', {
     ipcRenderer.on('recorder:stop', wrapped)
     return () => ipcRenderer.removeListener('recorder:stop', wrapped)
   },
+  reportStarted: () => ipcRenderer.send('recorder:started'),
+  reportFailed: (message: string) => ipcRenderer.send('recorder:failed', message),
+  reportAutoStop: () => ipcRenderer.send('recorder:auto-stop'),
   sendBlob: (payload: { buffer: ArrayBuffer; mimeType: string }) =>
     ipcRenderer.invoke('recorder:audio-blob', payload),
-  reportError: (message: string) => ipcRenderer.send('recorder:error', message),
 })

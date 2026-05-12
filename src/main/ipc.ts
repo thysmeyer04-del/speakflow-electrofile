@@ -1,8 +1,12 @@
 import { ipcMain, app, BrowserWindow, IpcMainEvent, IpcMainInvokeEvent } from 'electron'
 import log from 'electron-log/main'
 import { getSettings, setSetting } from './settings'
-import { updateHotkey } from './hotkey'
-import { startRecording, stopRecording, onStateChange } from './audio'
+import { updateHotkey, getLastRegistrationResult } from './hotkey'
+import {
+  startRecording,
+  stopRecording,
+  onRecordingStateChange,
+} from './recording-controller'
 import {
   assertTrustedSender,
   validateHotkey,
@@ -31,7 +35,11 @@ export function getAuthToken(): string | null {
   return cachedAuthToken
 }
 
-// Wrappers that gate every channel by sender identity + origin.
+export function clearAuthTokenCache(): void {
+  cachedAuthToken = null
+  cachedTokenExpiresAt = 0
+}
+
 function gatedOn<T>(channel: string, handler: (event: IpcMainEvent, payload: T) => void) {
   ipcMain.removeAllListeners(channel)
   ipcMain.on(channel, (event, payload) => {
@@ -53,11 +61,10 @@ function gatedHandle<T, R>(
   })
 }
 
-export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange }: SetupArgs): void {
-  // ── App info ──────────────────────────────────────────────────────────────
+export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: trayCallback }: SetupArgs): void {
   gatedHandle('app:version', () => app.getVersion())
+  gatedHandle('hotkey:get-status', () => getLastRegistrationResult())
 
-  // ── Window controls ───────────────────────────────────────────────────────
   gatedOn('window:minimize', () => {
     if (!mainWindow.isDestroyed()) mainWindow.minimize()
   })
@@ -65,18 +72,18 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange }: 
     if (!mainWindow.isDestroyed()) mainWindow.hide()
   })
 
-  // ── Settings ──────────────────────────────────────────────────────────────
   gatedHandle('settings:get', () => getSettings())
 
-  gatedHandle<string, { ok: boolean; error?: string }>(
+  gatedHandle<string, { ok: boolean; error?: string; activeHotkey?: string }>(
     'settings:update-hotkey',
     (_event, raw) => {
       const v = validateHotkey(raw)
       if (!v) return { ok: false, error: 'invalid-hotkey' }
       setSetting('hotkey', v)
       const ok = updateHotkey(v)
-      log.info(`Hotkey updated to ${v} (registered=${ok})`)
-      return { ok }
+      const result = getLastRegistrationResult()
+      log.info(`Hotkey requested ${v} → active=${result?.accelerator}`)
+      return { ok, activeHotkey: result?.accelerator }
     },
   )
 
@@ -120,15 +127,13 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange }: 
     },
   )
 
-  // ── Auth (Supabase JWT handoff for the Railway proxy) ────────────────────
   gatedHandle<string, { ok: boolean; error?: string; expiresAt?: number }>(
     'auth:set-token',
     (_event, raw) => {
       const result = validateAuthToken(raw)
       if (!result.ok) {
         log.warn(`Auth token rejected: ${result.reason}`)
-        cachedAuthToken = null
-        cachedTokenExpiresAt = 0
+        clearAuthTokenCache()
         return { ok: false, error: result.reason }
       }
       cachedAuthToken = (raw as string).trim()
@@ -136,12 +141,8 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange }: 
       return { ok: true, expiresAt: result.expiresAt ?? 0 }
     },
   )
-  gatedOn('auth:clear-token', () => {
-    cachedAuthToken = null
-    cachedTokenExpiresAt = 0
-  })
+  gatedOn('auth:clear-token', () => clearAuthTokenCache())
 
-  // ── Recording control from the dashboard UI ──────────────────────────────
   gatedOn('recording:start', () => {
     startRecording().catch((err) => log.error('startRecording IPC failed', err))
   })
@@ -149,16 +150,15 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange }: 
     stopRecording().catch((err) => log.error('stopRecording IPC failed', err))
   })
 
-  // ── Overlay visibility follows the audio state machine ───────────────────
-  onStateChange((s) => {
+  onRecordingStateChange((s) => {
     const settings = getSettings()
     if (!overlayWindow.isDestroyed()) {
-      if (settings.showOverlay && (s === 'recording' || s === 'processing')) {
+      if (settings.showOverlay && (s === 'starting' || s === 'recording' || s === 'stopping' || s === 'processing')) {
         overlayWindow.showInactive()
       } else {
         overlayWindow.hide()
       }
     }
-    onRecordingStateChange?.(s === 'recording')
+    trayCallback?.(s === 'recording')
   })
 }

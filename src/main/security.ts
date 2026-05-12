@@ -133,9 +133,14 @@ export function validateToggleKey(
 }
 
 // ── JWT validation (decode-only — signature verification happens server-side) ──
+interface JwtHeader {
+  alg?: string
+  typ?: string
+}
 interface JwtPayload {
   exp?: number
   iat?: number
+  nbf?: number
   sub?: string
   aud?: string | string[]
   iss?: string
@@ -143,11 +148,23 @@ interface JwtPayload {
 
 const MAX_JWT_LENGTH = 4096
 const CLOCK_SKEW_SECONDS = 30
+const MAX_TOKEN_LIFETIME_SECONDS = 24 * 3600
+
+// Supabase JWTs always have issuer https://<project-ref>.supabase.co/auth/v1
+const SUPABASE_ISSUER_PATTERN = /^https:\/\/[a-z0-9-]+\.supabase\.(co|in)\/auth\/v1$/
 
 export interface JwtValidationResult {
   ok: boolean
   expiresAt: number | null
   reason?: string
+}
+
+function base64urlDecode(input: string): string {
+  const padded = input.replace(/-/g, '+').replace(/_/g, '/').padEnd(
+    input.length + ((4 - (input.length % 4)) % 4),
+    '=',
+  )
+  return Buffer.from(padded, 'base64').toString('utf8')
 }
 
 export function validateAuthToken(input: unknown): JwtValidationResult {
@@ -159,23 +176,70 @@ export function validateAuthToken(input: unknown): JwtValidationResult {
   const parts = token.split('.')
   if (parts.length !== 3) return { ok: false, expiresAt: null, reason: 'not-jwt' }
 
+  let header: JwtHeader
   let payload: JwtPayload
   try {
-    const json = Buffer.from(
-      parts[1].replace(/-/g, '+').replace(/_/g, '/').padEnd(parts[1].length + ((4 - (parts[1].length % 4)) % 4), '='),
-      'base64',
-    ).toString('utf8')
-    payload = JSON.parse(json) as JwtPayload
+    header = JSON.parse(base64urlDecode(parts[0])) as JwtHeader
+    payload = JSON.parse(base64urlDecode(parts[1])) as JwtPayload
   } catch {
     return { ok: false, expiresAt: null, reason: 'malformed-payload' }
+  }
+
+  // Supabase uses HS256 (legacy) or ES256/RS256. Reject "none" outright.
+  if (!header.alg || header.alg.toLowerCase() === 'none') {
+    return { ok: false, expiresAt: null, reason: 'bad-alg' }
   }
 
   if (typeof payload.exp !== 'number') {
     return { ok: false, expiresAt: null, reason: 'no-exp' }
   }
+  const nowSec = Math.floor(Date.now() / 1000)
   const expMs = payload.exp * 1000
-  if (Date.now() > expMs + CLOCK_SKEW_SECONDS * 1000) {
+
+  if (nowSec > payload.exp + CLOCK_SKEW_SECONDS) {
     return { ok: false, expiresAt: expMs, reason: 'expired' }
   }
+  if (typeof payload.nbf === 'number' && nowSec + CLOCK_SKEW_SECONDS < payload.nbf) {
+    return { ok: false, expiresAt: expMs, reason: 'not-yet-valid' }
+  }
+  if (typeof payload.iat === 'number') {
+    if (payload.iat > nowSec + CLOCK_SKEW_SECONDS) {
+      return { ok: false, expiresAt: expMs, reason: 'iat-in-future' }
+    }
+    if (payload.exp - payload.iat > MAX_TOKEN_LIFETIME_SECONDS) {
+      return { ok: false, expiresAt: expMs, reason: 'lifetime-too-long' }
+    }
+  }
+  if (payload.iss && !SUPABASE_ISSUER_PATTERN.test(payload.iss)) {
+    return { ok: false, expiresAt: expMs, reason: 'bad-issuer' }
+  }
+  // Supabase typically sets aud to "authenticated"; tolerate missing aud
+  // because some flows omit it.
+  if (payload.aud) {
+    const auds = Array.isArray(payload.aud) ? payload.aud : [payload.aud]
+    if (!auds.includes('authenticated')) {
+      return { ok: false, expiresAt: expMs, reason: 'bad-audience' }
+    }
+  }
+
   return { ok: true, expiresAt: expMs }
+}
+
+const ALLOWED_PROXY_HOSTS = new Set<string>([
+  'speakflow.app',
+  'api.speakflow.app',
+])
+
+export function isProxyUrlAllowed(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'https:') return false
+    const host = parsed.hostname.toLowerCase()
+    if (ALLOWED_PROXY_HOSTS.has(host)) return true
+    if (host.endsWith('.speakflow.app')) return true
+    if (host.endsWith('.up.railway.app')) return true
+    return false
+  } catch {
+    return false
+  }
 }
