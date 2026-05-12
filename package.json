@@ -1,0 +1,46 @@
+{
+  "name": "speakflow-desktop",
+  "version": "0.1.0",
+  "description": "Speakflow — voice-to-text desktop app powered by Groq Whisper",
+  "main": "dist/main/main.js",
+  "author": {
+    "name": "Speakflow",
+    "email": "thysmeyer04@gmail.com"
+  },
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "clean": "rimraf dist dist-electron",
+    "build:ts": "tsc -p tsconfig.json",
+    "build:assets": "node scripts/copy-assets.mjs",
+    "build": "npm run clean && npm run build:ts && npm run build:assets",
+    "dev:ts": "tsc -p tsconfig.json -w --preserveWatchOutput",
+    "dev:electron": "wait-on dist/main/main.js && cross-env NODE_ENV=development electron .",
+    "dev": "npm run clean && npm run build:assets && concurrently -k -n tsc,electron -c blue,green \"npm:dev:ts\" \"npm:dev:electron\"",
+    "start": "electron .",
+    "pack": "npm run build && electron-builder --dir",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:linux": "npm run build && electron-builder --linux",
+    "dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.0",
+    "dotenv": "^16.4.7",
+    "electron-log": "^5.2.0",
+    "electron-store": "^8.2.0",
+    "electron-updater": "^6.3.9",
+    "form-data": "^4.0.1",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "concurrently": "^9.1.0",
+    "cross-env": "^7.0.3",
+    "electron": "^32.2.0",
+    "electron-builder": "^25.1.8",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.6.3",
+    "wait-on": "^8.0.1"
+  }
+}

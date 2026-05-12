@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(codex:setup)",
+      "Skill(codex:setup:*)",
+      "Bash(gemini --version)",
+      "Bash(git --version)"
+    ]
+  }
+}

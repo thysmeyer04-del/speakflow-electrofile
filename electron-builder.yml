@@ -1,0 +1,60 @@
+appId: app.speakflow.desktop
+productName: Speakflow
+copyright: Copyright (c) 2026 Speakflow
+
+directories:
+  output: dist-electron
+  buildResources: build
+
+files:
+  - dist/**/*
+  - assets/**/*
+  - package.json
+  - "!**/*.ts"
+  - "!**/*.map"
+
+asarUnpack:
+  - "node_modules/@nut-tree-fork/**"
+
+extraResources:
+  - from: assets/sounds
+    to: sounds
+
+mac:
+  icon: assets/icon.icns
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  notarize: false
+
+win:
+  icon: assets/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+  signAndEditExecutable: true
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Speakflow
+
+linux:
+  icon: assets/icon.png
+  target:
+    - AppImage
+  category: Utility
+
+publish:
+  provider: github
+  releaseType: release
