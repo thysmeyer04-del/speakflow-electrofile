@@ -1,19 +1,32 @@
+// MUST be first import — side-effect-loads .env BEFORE any other module
+// reads process.env at module-evaluation time. Without this, supabase.ts /
+// transcribe.ts / migrate-wispr.ts capture empty strings into their
+// module-level constants and silently no-op forever after.
+import 'dotenv/config'
+
 import { app, BrowserWindow, screen, session, shell } from 'electron'
+
+app.disableHardwareAcceleration()
+app.commandLine.appendSwitch('disable-gpu')
+app.commandLine.appendSwitch('no-sandbox')
 import path from 'path'
-import { config as dotenvConfig } from 'dotenv'
 import log from 'electron-log/main'
 import { setupTray, setTrayRecording, selfCheckTrayAssets } from './tray'
 import { registerHotkey, unregisterHotkey } from './hotkey'
+import { initCommandsStore, getCommands } from './commands-store'
+import {
+  registerCommandHotkeys,
+  unregisterAllCommandHotkeys,
+} from './commands-hotkey'
 import { setupIPC } from './ipc'
 import { setupAutoUpdater } from './updater'
 import { requestStartupPermissions } from './permissions'
 import { getSettings } from './settings'
-import { initRecorder, destroyRecorder } from './recorder'
+import { initRecorder, destroyRecorder, setLevelTargetWindow, warmupRecorderMic } from './recorder'
 import { shutdownRecording } from './recording-controller'
 import { isQuitting, markQuitting } from './quit-state'
 import { configureSecurity, isExternalUrlAllowed, isOriginTrusted } from './security'
-
-dotenvConfig()
+import { warmupInject, registerOwnWindowPid, unregisterOwnWindowPid } from './inject'
 
 log.initialize()
 log.transports.file.level = 'info'
@@ -23,7 +36,7 @@ const DASHBOARD_URL =
   process.env.DASHBOARD_URL ||
   (process.env.NODE_ENV === 'development'
     ? 'http://localhost:5173'
-    : 'https://app.speakflow.app')
+    : 'https://flow-speak.vercel.app')
 
 let mainWindow: BrowserWindow | null = null
 let overlayWindow: BrowserWindow | null = null
@@ -62,6 +75,15 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
 
+  // Forward dashboard renderer console to main log (dev only) so failures
+  // in IPC / Supabase writes are visible without opening DevTools.
+  if (process.env.NODE_ENV === 'development') {
+    win.webContents.on('console-message', (_e, level, message, line, src) => {
+      const lvl = ['debug', 'info', 'warn', 'error'][level] ?? 'info'
+      log.info(`[dashboard:${lvl}] ${message} (${src}:${line})`)
+    })
+  }
+
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (isExternalUrlAllowed(url)) {
       shell.openExternal(url).catch((err) => log.warn('openExternal failed', err))
@@ -72,6 +94,17 @@ async function createMainWindow(): Promise<BrowserWindow> {
   })
 
   win.webContents.on('will-navigate', (event, url) => {
+    try {
+      const { hostname } = new URL(url)
+      // Allow OAuth providers and Supabase auth endpoints through
+      const oauthHosts = [
+        'accounts.google.com',
+        'fyheufsexrfsatyhsmhe.supabase.co',
+        'flow-speak.vercel.app',
+      ]
+      if (oauthHosts.includes(hostname)) return
+    } catch { /* unparseable url — fall through to block */ }
+
     if (!isOriginTrusted(url)) {
       event.preventDefault()
       log.warn('Blocked navigation attempt', url)
@@ -80,6 +113,43 @@ async function createMainWindow(): Promise<BrowserWindow> {
 
   win.webContents.on('will-attach-webview', (event) => {
     event.preventDefault()
+  })
+
+  // Track our PIDs so inject.ts can refuse to type into Speakflow itself.
+  // We register BOTH the main process and the renderer process — nut-js
+  // may report either as the active window owner depending on platform.
+  //
+  // process.pid is registered ONCE at startup and intentionally never
+  // unregistered while the app is alive — it identifies us for the entire
+  // process lifetime. before-quit doesn't bother either; we're exiting.
+  //
+  // Renderer PID can change on reload/crash-recovery; we re-register on
+  // every did-finish-load and unregister on window close.
+  registerOwnWindowPid(process.pid)
+  const previousRendererPids = new Set<number>()
+  const refreshRendererPid = () => {
+    try {
+      const pid = win.webContents.getOSProcessId()
+      if (pid > 0 && !previousRendererPids.has(pid)) {
+        registerOwnWindowPid(pid)
+        previousRendererPids.add(pid)
+      }
+    } catch (err) {
+      log.warn('Could not register renderer PID for self-paste guard', err)
+    }
+  }
+  win.webContents.on('did-finish-load', refreshRendererPid)
+  win.webContents.on('render-process-gone', refreshRendererPid)
+  win.once('closed', () => {
+    for (const pid of previousRendererPids) unregisterOwnWindowPid(pid)
+    previousRendererPids.clear()
+    // Note: process.pid is NOT unregistered here — see comment above.
+  })
+
+  // Configure security before loadURL so will-navigate isn't blocked on first load.
+  configureSecurity({
+    allowedSenderId: win.webContents.id,
+    allowedOrigin: DASHBOARD_URL,
   })
 
   try {
@@ -122,10 +192,10 @@ function createOverlayWindow(): BrowserWindow {
   const { width, height } = primaryDisplay.workAreaSize
 
   const win = new BrowserWindow({
-    width: 320,
-    height: 64,
-    x: Math.floor(width / 2 - 160),
-    y: height - 96,
+    width: 200,
+    height: 52,
+    x: Math.floor(width / 2 - 100),
+    y: height - 72,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -140,10 +210,22 @@ function createOverlayWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Critical: without this, Chromium throttles the overlay to 1fps when
+      // it isn't focused, so IPC handlers can take up to a second to fire.
+      // We need the overlay responsive at all times even though it can never
+      // receive focus.
+      backgroundThrottling: false,
     },
   })
 
   win.setIgnoreMouseEvents(true)
+
+  if (process.env.NODE_ENV === 'development') {
+    win.webContents.on('console-message', (_e, level, message, line, src) => {
+      const lvl = ['debug', 'info', 'warn', 'error'][level] ?? 'info'
+      log.info(`[overlay:${lvl}] ${message} (${src}:${line})`)
+    })
+  }
 
   // The overlay is a local file; deny ALL navigation and any window.open attempt.
   win.webContents.on('will-navigate', (event) => {
@@ -197,10 +279,12 @@ app.whenReady().then(async () => {
   mainWindow = await createMainWindow()
   overlayWindow = createOverlayWindow()
 
-  configureSecurity({
-    allowedSenderId: mainWindow.webContents.id,
-    allowedOrigin: DASHBOARD_URL,
-  })
+  // Show the overlay window immediately at startup so its first paint cost
+  // is paid before the user ever presses the hotkey. The .visible CSS class
+  // (controlled by recording-starting / processing-complete events) decides
+  // whether anything is actually rendered.
+  overlayWindow.showInactive()
+
 
   selfCheckTrayAssets()
   setupTray(mainWindow)
@@ -210,8 +294,19 @@ app.whenReady().then(async () => {
     onRecordingStateChange: (recording) => setTrayRecording(recording),
   })
   initRecorder()
+  setLevelTargetWindow(overlayWindow)
+  // Warm up the mic stream ~2 s after launch so the recorder window is ready.
+  // First F11 press then skips getUserMedia entirely — near-zero start latency.
+  setTimeout(() => warmupRecorderMic(getSettings().microphone ?? 'default'), 2000)
   registerHotkey(getSettings().hotkey)
+  initCommandsStore()
+  registerCommandHotkeys(getCommands())
   setupAutoUpdater(mainWindow)
+
+  // Pre-warm nut-js so the first F11 doesn't pay a 3-second cold-init
+  // penalty. Fire-and-forget; if it fails the first capture just falls
+  // through normally.
+  warmupInject().catch((err) => log.warn('warmupInject failed', err))
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -234,6 +329,7 @@ app.on('before-quit', (event) => {
   shuttingDown = true
   markQuitting()
   unregisterHotkey()
+  unregisterAllCommandHotkeys()
   event.preventDefault()
   shutdownRecording()
     .catch((err) => log.warn('Shutdown recording failed', err))

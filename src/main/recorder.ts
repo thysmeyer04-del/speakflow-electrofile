@@ -17,6 +17,8 @@ let readyResolved = false
 let expectingClose = false
 let crashHandlers: Array<(reason: string) => void> = []
 let autoStopHandlers: Array<() => void> = []
+// Where to forward live audio levels. Set once at startup by main.ts.
+let levelTargetWindow: BrowserWindow | null = null
 
 interface PendingStart {
   resolve: () => void
@@ -38,9 +40,11 @@ export function initRecorder(): void {
 
   expectingClose = false
   readyResolved = false
+  const isDev = process.env.NODE_ENV === 'development'
   recorderWindow = new BrowserWindow({
-    width: 1,
-    height: 1,
+    // Tiny in prod (hidden); slightly bigger in dev so devtools is usable.
+    width: isDev ? 600 : 1,
+    height: isDev ? 400 : 1,
     show: false,
     skipTaskbar: true,
     focusable: false,
@@ -54,6 +58,13 @@ export function initRecorder(): void {
   })
 
   const win = recorderWindow
+
+  // Forward renderer console output to main's log so failures in the hidden
+  // window aren't invisible.
+  win.webContents.on('console-message', (_e, level, message, line, src) => {
+    const lvl = ['debug', 'info', 'warn', 'error'][level] ?? 'info'
+    log.info(`[recorder-renderer:${lvl}] ${message} (${src}:${line})`)
+  })
 
   win.webContents.on('render-process-gone', (_e, details) => {
     handleCrash(`render-process-gone: ${details.reason}`)
@@ -119,6 +130,21 @@ export function onAutoStop(cb: () => void): () => void {
   autoStopHandlers.push(cb)
   return () => {
     autoStopHandlers = autoStopHandlers.filter((h) => h !== cb)
+  }
+}
+
+/** Where to forward live audio levels — typically the overlay window. */
+export function setLevelTargetWindow(win: BrowserWindow | null): void {
+  levelTargetWindow = win
+}
+
+/** Fire-and-forget: pre-acquires the mic stream so first F11 skips getUserMedia. */
+export function warmupRecorderMic(microphoneId: string): void {
+  if (!recorderWindow || recorderWindow.isDestroyed()) return
+  try {
+    recorderWindow.webContents.send('recorder:warmup', { microphoneId })
+  } catch {
+    // best-effort, never crash over warmup
   }
 }
 
@@ -236,6 +262,25 @@ function registerHandlers() {
     autoStopHandlers.forEach((h) => {
       try { h() } catch (err) { log.warn('autoStop handler threw', err) }
     })
+  })
+
+  // Live audio levels: forwarded straight to the overlay window. Validate the
+  // payload aggressively — this fires ~30Hz so we don't want to spend cycles,
+  // but malformed values (NaN, out-of-range) would corrupt the bar heights.
+  ipcMain.on('recorder:levels', (event, payload: unknown) => {
+    if (!isFromRecorder(event)) return
+    if (!Array.isArray(payload)) return
+    if (payload.length === 0 || payload.length > 64) return
+    const target = levelTargetWindow
+    if (!target || target.isDestroyed()) return
+    const clean = new Array<number>(payload.length)
+    for (let i = 0; i < payload.length; i++) {
+      const v = payload[i]
+      clean[i] = typeof v === 'number' && Number.isFinite(v)
+        ? (v < 0 ? 0 : v > 1 ? 1 : v)
+        : 0
+    }
+    target.webContents.send('audio-levels', clean)
   })
 }
 

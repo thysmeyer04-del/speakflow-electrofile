@@ -6,8 +6,9 @@
     <title>Speakflow Overlay</title>
     <style>
       :root {
-        color-scheme: dark;
-        font-family: 'DM Sans', -apple-system, 'Segoe UI', system-ui, sans-serif;
+        --accent-cyan: #6ad6ff;
+        --accent-blue: #3a83ff;
+        --accent-violet: #8a5bff;
       }
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body {
@@ -21,89 +22,106 @@
 
       .overlay {
         position: absolute;
-        inset: auto 8px 8px 8px;
+        inset: 6px;
         display: flex;
         align-items: center;
-        gap: 12px;
-        height: 48px;
-        padding: 0 18px 0 16px;
-        background: rgba(20, 19, 18, 0.86);
-        backdrop-filter: blur(14px) saturate(160%);
-        -webkit-backdrop-filter: blur(14px) saturate(160%);
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        justify-content: center;
         border-radius: 999px;
-        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
-        color: #fff;
+        background: linear-gradient(
+          180deg,
+          rgba(12, 18, 36, 0.82) 0%,
+          rgba(6, 10, 22, 0.90) 100%
+        );
+        backdrop-filter: blur(16px) saturate(160%);
+        -webkit-backdrop-filter: blur(16px) saturate(160%);
+        box-shadow:
+          0 0 0 1px rgba(106, 214, 255, 0.18),
+          0 0 18px rgba(58, 131, 255, 0.30),
+          0 4px 20px rgba(0, 0, 0, 0.55);
         opacity: 0;
-        transform: translateY(12px);
-        transition: opacity 200ms cubic-bezier(0.4, 0, 0.2, 1),
-                    transform 200ms cubic-bezier(0.4, 0, 0.2, 1);
+        transition: opacity 150ms ease;
+        will-change: opacity;
       }
-      .overlay.visible { opacity: 1; transform: translateY(0); }
+      .overlay.visible { opacity: 1; }
 
-      .pulse {
-        width: 8px; height: 8px;
-        background: #ef4444;
-        border-radius: 50%;
-        animation: pulse 1.2s infinite ease-in-out;
-        flex-shrink: 0;
+      /* Gradient border stroke */
+      .overlay::before {
+        content: '';
+        position: absolute;
+        inset: -1.5px;
+        border-radius: 999px;
+        padding: 1.5px;
+        background: linear-gradient(
+          90deg,
+          var(--accent-cyan) 0%,
+          var(--accent-blue) 50%,
+          var(--accent-violet) 100%
+        );
+        -webkit-mask:
+          linear-gradient(#fff 0 0) content-box,
+          linear-gradient(#fff 0 0);
+        mask:
+          linear-gradient(#fff 0 0) content-box,
+          linear-gradient(#fff 0 0);
+        -webkit-mask-composite: xor;
+                mask-composite: exclude;
+        pointer-events: none;
       }
-      .pulse.processing { background: #f59e0b; animation-duration: 0.6s; }
-      .pulse.error { background: #ef4444; animation: none; }
 
-      .wave {
+      /* Wave bars: fixed height, scaled from center so they expand up & down */
+      .bars {
         display: flex;
         align-items: center;
-        gap: 3px;
-        height: 22px;
+        justify-content: center;
+        gap: 4px;
+        padding: 0 16px;
+        height: 100%;
       }
-      .wave span {
+      .bars span {
         display: block;
         width: 3px;
-        background: #2D9B78;
+        height: 28px;
         border-radius: 3px;
-        animation: wave 0.85s ease-in-out infinite;
-      }
-      .wave span:nth-child(1) { animation-delay: 0s; }
-      .wave span:nth-child(2) { animation-delay: 0.08s; }
-      .wave span:nth-child(3) { animation-delay: 0.16s; }
-      .wave span:nth-child(4) { animation-delay: 0.24s; }
-      .wave span:nth-child(5) { animation-delay: 0.16s; }
-      .wave span:nth-child(6) { animation-delay: 0.08s; }
-      .wave span:nth-child(7) { animation-delay: 0s; }
-
-      .label {
-        font-size: 13px;
-        font-weight: 500;
-        letter-spacing: 0.01em;
-        color: rgba(255, 255, 255, 0.94);
-        white-space: nowrap;
+        background: linear-gradient(
+          180deg,
+          var(--accent-cyan) 0%,
+          var(--accent-blue) 100%
+        );
+        box-shadow: 0 0 5px rgba(106, 214, 255, 0.5);
+        transform: scaleY(calc(0.07 + var(--h, 0) * 0.93));
+        transform-origin: center;
+        transition: transform 65ms ease-out;
       }
 
-      .label .sub {
-        color: rgba(255, 255, 255, 0.5);
-        margin-left: 6px;
-        font-size: 12px;
-        font-weight: 400;
+      /* Traveling sine-wave pulse while processing */
+      .overlay[data-mode='idle-anim'] .bars span {
+        animation: wavePulse 1.4s ease-in-out infinite;
+      }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(1)  { animation-delay: 0.00s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(2)  { animation-delay: 0.08s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(3)  { animation-delay: 0.16s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(4)  { animation-delay: 0.24s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(5)  { animation-delay: 0.32s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(6)  { animation-delay: 0.40s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(7)  { animation-delay: 0.48s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(8)  { animation-delay: 0.40s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(9)  { animation-delay: 0.32s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(10) { animation-delay: 0.24s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(11) { animation-delay: 0.16s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(12) { animation-delay: 0.08s; }
+      .overlay[data-mode='idle-anim'] .bars span:nth-child(13) { animation-delay: 0.00s; }
+
+      @keyframes wavePulse {
+        0%, 100% { transform: scaleY(0.07); }
+        50%       { transform: scaleY(0.50); }
       }
 
-      @keyframes pulse {
-        0%, 100% { opacity: 1; transform: scale(1); }
-        50%      { opacity: 0.45; transform: scale(0.78); }
-      }
-      @keyframes wave {
-        0%, 100% { height: 4px; }
-        50%      { height: 22px; }
-      }
+      .overlay[data-mode='error'] .bars { opacity: 0.3; }
     </style>
   </head>
   <body>
     <div class="overlay" id="overlay">
-      <span class="pulse" id="pulse"></span>
-      <div class="wave" id="wave">
-        <span></span><span></span><span></span><span></span><span></span><span></span><span></span>
-      </div>
-      <span class="label" id="label">Listening<span class="sub">— release to stop</span></span>
+      <div class="bars" id="bars"></div>
     </div>
     <script src="overlay.js"></script>
   </body>
