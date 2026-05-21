@@ -122,14 +122,23 @@ export function validateLanguage(input: unknown): string | null {
   return lower
 }
 
-export function validateToggleKey(
-  input: unknown,
-): 'showOverlay' | 'dictationSounds' | 'launchAtLogin' | null {
+export type ToggleKey =
+  | 'showOverlay'
+  | 'dictationSounds'
+  | 'launchAtLogin'
+  | 'enableSmartFormatting'
+  | 'stripDisfluencies'
+
+export function validateToggleKey(input: unknown): ToggleKey | null {
   if (typeof input !== 'string') return null
-  const allowed = new Set(['showOverlay', 'dictationSounds', 'launchAtLogin'])
-  return allowed.has(input)
-    ? (input as 'showOverlay' | 'dictationSounds' | 'launchAtLogin')
-    : null
+  const allowed = new Set<ToggleKey>([
+    'showOverlay',
+    'dictationSounds',
+    'launchAtLogin',
+    'enableSmartFormatting',
+    'stripDisfluencies',
+  ])
+  return (allowed as Set<string>).has(input) ? (input as ToggleKey) : null
 }
 
 // ── JWT validation (decode-only — signature verification happens server-side) ──
@@ -232,6 +241,7 @@ export function validateAuthToken(input: unknown): JwtValidationResult {
 const ALLOWED_PROXY_HOSTS = new Set<string>([
   'api.speakflow.app',
   'speakflow.app',
+  'speakflow-marketing.vercel.app',
 ])
 
 export function isProxyUrlAllowed(url: string): boolean {

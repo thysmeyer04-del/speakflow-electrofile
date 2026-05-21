@@ -1,53 +1,39 @@
-import fs from 'fs/promises'
-import path from 'path'
 import log from 'electron-log/main'
 import { getAuthToken } from './ipc'
 import { isProxyUrlAllowed } from './security'
 
 const GROQ_TRANSCRIPTIONS_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
-const WHISPER_MODEL = 'whisper-large-v3'
+// Turbo is ~3x faster than whisper-large-v3 with marginal accuracy tradeoff.
+// Override via SPEAKFLOW_WHISPER_MODEL if you want the full model.
+const WHISPER_MODEL = process.env.SPEAKFLOW_WHISPER_MODEL || 'whisper-large-v3-turbo'
 const MAX_BYTES = 25 * 1024 * 1024 // Groq hard limit
 const REQUEST_TIMEOUT_MS = 60_000
+const AUDIO_FILENAME = 'audio.webm'
 
 interface TranscribeOptions {
   language?: string
 }
 
 export async function transcribeAudio(
-  audioFilePath: string,
+  audio: Buffer,
   opts: TranscribeOptions = {},
 ): Promise<string> {
-  const buffer = await readAudioCapped(audioFilePath)
-  if (buffer.byteLength === 0) return ''
+  if (audio.byteLength === 0) return ''
+  if (audio.byteLength > MAX_BYTES) {
+    throw new Error('Recording exceeds the 25 MB Groq limit. Try a shorter clip.')
+  }
 
-  const proxyUrl = process.env.SPEAKFLOW_API_URL
-  if (proxyUrl && process.env.NODE_ENV === 'production') {
+  const PRODUCTION_PROXY = 'https://speakflow-marketing.vercel.app/api'
+  const proxyUrl = process.env.SPEAKFLOW_API_URL ||
+    (process.env.NODE_ENV === 'production' ? PRODUCTION_PROXY : undefined)
+  if (proxyUrl) {
     if (!isProxyUrlAllowed(proxyUrl)) {
       throw new Error('Speakflow API URL is not allowed.')
     }
-    return transcribeViaProxy(buffer, proxyUrl, opts)
+    return transcribeViaProxy(audio, proxyUrl, opts)
   }
 
-  return transcribeViaGroq(buffer, opts, audioFilePath)
-}
-
-/**
- * Read the file with a hard cap. Validates size AFTER read to avoid TOCTOU
- * between fs.stat() and fs.readFile().
- */
-async function readAudioCapped(audioFilePath: string): Promise<Buffer> {
-  // Pre-check via stat for fast failure on huge files.
-  const stat = await fs.stat(audioFilePath)
-  if (stat.size > MAX_BYTES) {
-    throw new Error('Recording exceeds the 25 MB Groq limit. Try a shorter clip.')
-  }
-  if (stat.size === 0) return Buffer.alloc(0)
-
-  const buf = await fs.readFile(audioFilePath)
-  if (buf.byteLength > MAX_BYTES) {
-    throw new Error('Recording exceeds the 25 MB Groq limit. Try a shorter clip.')
-  }
-  return buf
+  return transcribeViaGroq(audio, opts)
 }
 
 function buildAudioForm(buffer: Buffer, filename: string): FormData {
@@ -70,14 +56,13 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 async function transcribeViaGroq(
   buffer: Buffer,
   opts: TranscribeOptions,
-  audioFilePath: string,
 ): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY
   if (!apiKey) {
     throw new Error('GROQ_API_KEY is not set. Add it to .env for local development.')
   }
 
-  const form = buildAudioForm(buffer, path.basename(audioFilePath))
+  const form = buildAudioForm(buffer, AUDIO_FILENAME)
   form.append('model', WHISPER_MODEL)
   form.append('response_format', 'json')
   form.append('temperature', '0')
