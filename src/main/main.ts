@@ -4,7 +4,7 @@
 // module-level constants and silently no-op forever after.
 import 'dotenv/config'
 
-import { app, BrowserWindow, screen, session, shell } from 'electron'
+import { app, BrowserWindow, powerMonitor, screen, session, shell } from 'electron'
 
 app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('disable-gpu')
@@ -32,11 +32,11 @@ log.initialize()
 log.transports.file.level = 'info'
 log.transports.console.level = 'debug'
 
-const DASHBOARD_URL =
-  process.env.DASHBOARD_URL ||
-  (process.env.NODE_ENV === 'development'
-    ? 'http://localhost:5173'
-    : 'https://flow-speak.vercel.app')
+const PRODUCTION_DASHBOARD = 'https://flow-speak.vercel.app'
+
+// Always load the production dashboard by default. Set DASHBOARD_URL in .env
+// only when actively developing the dashboard UI locally (e.g. localhost:5173).
+const DASHBOARD_URL = process.env.DASHBOARD_URL || PRODUCTION_DASHBOARD
 
 let mainWindow: BrowserWindow | null = null
 let overlayWindow: BrowserWindow | null = null
@@ -152,22 +152,91 @@ async function createMainWindow(): Promise<BrowserWindow> {
     allowedOrigin: DASHBOARD_URL,
   })
 
-  try {
-    await win.loadURL(DASHBOARD_URL)
-  } catch (err) {
-    log.warn(`Failed to load dashboard at ${DASHBOARD_URL}`, err)
-    const fallback = encodeURIComponent(`
-      <!doctype html><html><head><meta charset="utf-8"><title>Speakflow</title>
-      <style>body{font-family:system-ui,sans-serif;background:#FAF9F7;color:#1a1917;
-        display:flex;align-items:center;justify-content:center;height:100vh;margin:0;
-        padding:32px;text-align:center}h1{font-size:20px}code{background:#eee;padding:2px 6px;border-radius:4px}</style>
-      </head><body><div><h1>Couldn't reach the Speakflow Dashboard</h1>
-      <p>Expected at <code>${DASHBOARD_URL}</code>.</p>
-      <p>If you're developing, run <code>npm run dev</code> in the dashboard project first.</p>
-      </div></body></html>
-    `)
-    await win.loadURL(`data:text/html;charset=utf-8,${fallback}`)
+  // First load attempt. On failure, keep retrying every 4 s until the
+  // network comes back — handles brief internet blips at startup.
+  const loadDashboard = async (target: string): Promise<void> => {
+    try {
+      await win.loadURL(target)
+    } catch (err) {
+      log.warn(`Failed to load dashboard at ${target} — will retry`, err)
+      // Show a lightweight reconnecting page so the window isn't just blank.
+      const reconnecting = encodeURIComponent(
+        `<!doctype html><html><head><meta charset="utf-8"><title>Speakflow</title>
+        <style>body{font-family:system-ui,sans-serif;background:#FAF9F7;color:#1a1917;
+          display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+          p{opacity:.6;font-size:15px}</style>
+        </head><body><p>Connecting to Speakflow…</p></body></html>`
+      )
+      await win.loadURL(`data:text/html;charset=utf-8,${reconnecting}`).catch(() => undefined)
+
+      // Retry loop — give up after 10 attempts (~40 s) and show a final error.
+      let attempts = 0
+      const retry = (): void => {
+        if (win.isDestroyed()) return
+        attempts++
+        if (attempts > 10) {
+          const fatal = encodeURIComponent(
+            `<!doctype html><html><head><meta charset="utf-8"><title>Speakflow</title>
+            <style>body{font-family:system-ui,sans-serif;background:#FAF9F7;color:#1a1917;
+              display:flex;flex-direction:column;align-items:center;justify-content:center;
+              height:100vh;margin:0;gap:12px}h1{font-size:18px;margin:0}
+              button{padding:8px 20px;border-radius:6px;border:1px solid #ccc;cursor:pointer;font-size:14px}</style>
+            </head><body><h1>Couldn't reach Speakflow</h1>
+            <p style="opacity:.6;font-size:14px;margin:0">Check your internet connection.</p>
+            <button onclick="location.href='${PRODUCTION_DASHBOARD}'">Try again</button>
+            </body></html>`
+          )
+          win.loadURL(`data:text/html;charset=utf-8,${fatal}`).catch(() => undefined)
+          return
+        }
+        win.loadURL(PRODUCTION_DASHBOARD).catch(() => {
+          setTimeout(retry, 4000)
+        })
+      }
+      setTimeout(retry, 4000)
+    }
   }
+
+  // Clear Electron's HTTP cache and any Vercel auth cookies before loading so
+  // a cached "Authentication Required" page or a stale _vercel_jwt cookie
+  // can't block the dashboard after protection is turned off in Vercel settings.
+  await session.defaultSession.clearCache()
+  await session.defaultSession.clearStorageData({
+    origin: 'https://flow-speak.vercel.app',
+    storages: ['cookies'],
+  })
+
+  // On first load: check if the stored Supabase session is expired and clear
+  // it before the React app initialises. An expired token causes Supabase to
+  // attempt a silent refresh that hangs indefinitely, keeping the app on its
+  // loading screen. Clearing it forces a clean login instead.
+  let tokenCheckDone = false
+  win.webContents.on('did-finish-load', () => {
+    if (tokenCheckDone || win.isDestroyed()) return
+    tokenCheckDone = true
+    win.webContents.executeJavaScript(`
+      (() => {
+        const key = 'sb-fyheufsexrfsatyhsmhe-auth-token'
+        const raw = localStorage.getItem(key)
+        if (!raw) return false
+        try {
+          const { expires_at } = JSON.parse(raw)
+          if (typeof expires_at === 'number' && expires_at < Math.floor(Date.now() / 1000) + 60) {
+            localStorage.removeItem(key)
+            return true
+          }
+        } catch (_) { return false }
+        return false
+      })()
+    `).then((cleared) => {
+      if (cleared && !win.isDestroyed()) {
+        log.info('[auth] Cleared expired Supabase token — reloading dashboard')
+        win.webContents.reload()
+      }
+    }).catch(() => undefined)
+  })
+
+  await loadDashboard(DASHBOARD_URL)
 
   win.once('ready-to-show', () => {
     win.show()
@@ -238,7 +307,31 @@ function createOverlayWindow(): BrowserWindow {
     log.error('Failed to load overlay window', err)
   })
 
+  // If the renderer crashes (GPU eviction, memory pressure, sleep/wake), reload
+  // it automatically so the next hotkey press gets a live IPC listener.
+  win.webContents.on('render-process-gone', (_event, details) => {
+    log.warn('[overlay] renderer gone:', details.reason, '— reloading')
+    if (!win.isDestroyed()) {
+      win.webContents.reload()
+    }
+  })
+
+  // After a reload (crash recovery or did-fail-load retry), re-show the window
+  // so it is present at the OS compositor level before the next hotkey press.
+  win.webContents.on('did-finish-load', () => {
+    if (!win.isDestroyed() && !win.isVisible()) {
+      win.showInactive()
+    }
+  })
+
   return win
+}
+
+function repositionOverlay(): void {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return
+  const primaryDisplay = screen.getPrimaryDisplay()
+  const { width, height } = primaryDisplay.workAreaSize
+  overlayWindow.setPosition(Math.floor(width / 2 - 100), height - 72)
 }
 
 function resolveIcon(): string | undefined {
@@ -285,6 +378,19 @@ app.whenReady().then(async () => {
   // whether anything is actually rendered.
   overlayWindow.showInactive()
 
+  // Reposition the overlay if the display layout changes (resolution, DPI,
+  // monitor added/removed) so it never ends up off-screen.
+  screen.on('display-metrics-changed', repositionOverlay)
+  screen.on('display-added', repositionOverlay)
+  screen.on('display-removed', repositionOverlay)
+
+  // Re-show after system resume — Windows can hide always-on-top transparent
+  // windows during sleep and not always restore them automatically.
+  powerMonitor.on('resume', () => {
+    if (overlayWindow && !overlayWindow.isDestroyed() && !overlayWindow.isVisible()) {
+      overlayWindow.showInactive()
+    }
+  })
 
   selfCheckTrayAssets()
   setupTray(mainWindow)
