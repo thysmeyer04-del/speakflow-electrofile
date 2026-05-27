@@ -251,6 +251,30 @@ async function doStop(): Promise<void> {
   await processAudio(audioBuffer, settings.language, mySession)
 }
 
+// Collapse Whisper hallucination loops — e.g. "word word word word" or
+// "the cat sat the cat sat the cat sat". Scans for any word-sequence of
+// length 1–8 that repeats consecutively and keeps only one copy.
+function collapseRepetitions(text: string): string {
+  const words = text.split(/\s+/).filter(Boolean)
+  for (let span = 1; span <= Math.min(8, Math.floor(words.length / 2)); span++) {
+    for (let i = 0; i < words.length - span; ) {
+      const window = words.slice(i, i + span).join(' ').toLowerCase()
+      let j = i + span
+      while (
+        j + span <= words.length &&
+        words.slice(j, j + span).join(' ').toLowerCase() === window
+      ) {
+        j += span
+      }
+      if (j > i + span) {
+        words.splice(i + span, j - (i + span))
+      }
+      i++
+    }
+  }
+  return words.join(' ')
+}
+
 async function processAudio(buffer: Buffer, language: string, mySession: number): Promise<void> {
   try {
     // Pass buffer directly — no disk round-trip. Previously we wrote a temp
@@ -264,7 +288,7 @@ async function processAudio(buffer: Buffer, language: string, mySession: number)
     }
 
     if (text && text.trim()) {
-      const rawTrimmed = text.trim()
+      const rawTrimmed = collapseRepetitions(text.trim())
       let trimmed = rawTrimmed
 
       // Smart-formatting pass: a second LLM call structures the flat Whisper
