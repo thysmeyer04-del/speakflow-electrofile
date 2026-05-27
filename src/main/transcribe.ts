@@ -5,7 +5,7 @@ import { isProxyUrlAllowed } from './security'
 const GROQ_TRANSCRIPTIONS_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
 // Turbo is ~3x faster than whisper-large-v3 with marginal accuracy tradeoff.
 // Override via SPEAKFLOW_WHISPER_MODEL if you want the full model.
-const WHISPER_MODEL = process.env.SPEAKFLOW_WHISPER_MODEL || 'whisper-large-v3-turbo'
+const WHISPER_MODEL = process.env.SPEAKFLOW_WHISPER_MODEL || 'whisper-large-v3'
 const MAX_BYTES = 25 * 1024 * 1024 // Groq hard limit
 const REQUEST_TIMEOUT_MS = 60_000
 const AUDIO_FILENAME = 'audio.webm'
