@@ -34,6 +34,13 @@ let mediaStream: MediaStream | null = null
 // The mic indicator stays on while the app is running — acceptable for a
 // dictation tool where instant start is the primary goal.
 let warmStream: MediaStream | null = null
+// Tracks which deviceId warmStream was opened for so we can detect a mic
+// change in settings and avoid recording from the wrong device.
+let warmMicrophoneId: string | null = null
+// GainNode pipeline that gives a fixed 1.4x boost on top of AGC so quiet
+// mics still deliver enough energy for reliable Whisper transcription.
+let gainAudioCtx: AudioContext | null = null
+let gainDestStream: MediaStream | null = null
 let chunks: Blob[] = []
 let levelAudioCtx: AudioContext | null = null
 let levelAnalyser: AnalyserNode | null = null
@@ -98,7 +105,12 @@ if (!window.recorderAPI) {
 
 async function warmupMicStream(microphoneId: string): Promise<void> {
   try {
-    if (warmStream && warmStream.getAudioTracks().every(t => t.readyState === 'live')) return
+    const requestedId = microphoneId || 'default'
+    if (
+      warmStream &&
+      warmStream.getAudioTracks().every(t => t.readyState === 'live') &&
+      warmMicrophoneId === requestedId
+    ) return
     warmStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: microphoneId && microphoneId !== 'default' ? { exact: microphoneId } : undefined,
@@ -109,6 +121,7 @@ async function warmupMicStream(microphoneId: string): Promise<void> {
         autoGainControl: true,
       },
     })
+    warmMicrophoneId = requestedId
     console.log('[recorder.ts] mic stream warmed up')
   } catch (err) {
     warmStream = null
@@ -168,16 +181,22 @@ async function start(microphoneId: string): Promise<void> {
     },
   }
 
-  const hasWarmTracks = warmStream && warmStream.getAudioTracks().every(t => t.readyState === 'live')
+  const requestedMicId = microphoneId || 'default'
+  const hasWarmTracks =
+    warmStream &&
+    warmStream.getAudioTracks().every(t => t.readyState === 'live') &&
+    warmMicrophoneId === requestedMicId
   if (hasWarmTracks) {
     mediaStream = warmStream!
     console.log('[recorder.ts] reusing warm mic stream — skipped getUserMedia')
   } else {
     warmStream = null
+    warmMicrophoneId = null
     console.log('[recorder.ts] requesting getUserMedia', constraints)
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia(constraints)
       warmStream = mediaStream // cache for next recording
+      warmMicrophoneId = requestedMicId
       console.log('[recorder.ts] getUserMedia resolved — got stream', mediaStream.getAudioTracks().length, 'tracks')
     } catch (err) {
       console.error('[recorder.ts] getUserMedia rejected:', (err as Error).message)
@@ -187,10 +206,35 @@ async function start(microphoneId: string): Promise<void> {
     }
   }
 
+  // Route mediaStream through a 1.4x GainNode so quiet mics still deliver
+  // enough energy for reliable Whisper transcription. Falls back to the raw
+  // stream if the Web Audio API is unavailable.
+  let recorderStream: MediaStream = mediaStream
+  try {
+    const AudioCtor =
+      (window as unknown as { AudioContext?: typeof AudioContext }).AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+    if (AudioCtor) {
+      gainAudioCtx = new AudioCtor()
+      const src = gainAudioCtx.createMediaStreamSource(mediaStream)
+      const gain = gainAudioCtx.createGain()
+      gain.gain.value = 1.4
+      const dest = gainAudioCtx.createMediaStreamDestination()
+      src.connect(gain)
+      gain.connect(dest)
+      gainDestStream = dest.stream
+      recorderStream = gainDestStream
+    }
+  } catch {
+    // Non-fatal — record without boost rather than failing the session.
+    gainAudioCtx = null
+    gainDestStream = null
+  }
+
   const mimeType = pickMimeType()
   try {
     mediaRecorder = new MediaRecorder(
-      mediaStream,
+      recorderStream,
       mimeType ? { mimeType } : undefined,
     )
   } catch (err) {
@@ -429,6 +473,11 @@ async function cleanup(): Promise<void> {
     }
     mediaRecorder = null
   }
+  if (gainAudioCtx) {
+    gainAudioCtx.close().catch(() => undefined)
+    gainAudioCtx = null
+  }
+  gainDestStream = null
   if (mediaStream) {
     // Don't stop warm stream tracks — they persist for the next recording to
     // skip getUserMedia. Only stop tracks on a non-warm (one-off) stream.

@@ -1,46 +1,64 @@
-// Tiny renderer for the floating overlay. Types come from src/types/electron-api.d.ts.
+// Overlay renderer: CSS bar-based waveform (canvas avoided — GPU disabled in this app).
+// Five vertical bars animate with audio levels; a thin handle collapses when not hovered.
 
-const overlay = document.getElementById('overlay') as HTMLDivElement
-const barsContainer = document.getElementById('bars') as HTMLDivElement
+const SAMPLE_COUNT = 5
+const BAR_MAX_H = 20  // px — fits within the 24px bar container
 
-const BAR_COUNT = 13
-// Per-bar smoothed height (0..1). Quick attack, slow decay — standard VU pattern.
-const displayed = new Array<number>(BAR_COUNT).fill(0)
-const barEls: HTMLSpanElement[] = []
-for (let i = 0; i < BAR_COUNT; i++) {
-  const el = document.createElement('span')
-  el.style.setProperty('--h', '0')
-  barsContainer.appendChild(el)
-  barEls.push(el)
-}
+const barsEl   = document.getElementById('bars')    as HTMLElement
+const bars      = Array.from(barsEl.querySelectorAll('span')) as HTMLElement[]
+const displayed = new Array<number>(SAMPLE_COUNT).fill(0)
 
-// Render loop. Even when no fresh level packet arrives, the loop applies decay
-// so the bars settle to baseline instead of freezing mid-frame.
-function paintBars(): void {
-  for (let i = 0; i < BAR_COUNT; i++) {
-    barEls[i].style.setProperty('--h', displayed[i].toFixed(3))
-  }
-}
-
+// ── Audio level state ─────────────────────────────────────────────────────────
 function applyLevels(levels: number[]): void {
-  const n = Math.min(BAR_COUNT, levels.length)
-  for (let i = 0; i < n; i++) {
-    const raw = levels[i]
-    const v = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0
-    // Quick attack, slow decay (15% per frame at 30fps), with the live input
-    // as a floor so the bar never visually dips below the actual signal.
-    displayed[i] = Math.max(v, displayed[i] * 0.85)
+  for (let i = 0; i < SAMPLE_COUNT; i++) {
+    const src = Math.round(i * (levels.length - 1) / (SAMPLE_COUNT - 1))
+    const raw = levels[src] ?? 0
+    const v   = Number.isFinite(raw) ? Math.max(0, Math.min(1, raw)) : 0
+    displayed[i] = Math.max(v, displayed[i] * 0.82)  // quick attack, slow decay
   }
-  paintBars()
 }
 
-// Setup state-driven idle decay: when no levels arrive (idle / processing /
-// error), drift bars toward zero so they don't appear frozen.
+function renderBars(): void {
+  bars.forEach((bar, i) => {
+    bar.style.height = `${Math.max(4, Math.round(displayed[i] * BAR_MAX_H))}px`
+  })
+}
+
+// ── Idle animation: slow breathing sine, bell-curve base (centre tallest) ────
+const IDLE_BASES = [0.28, 0.52, 0.70, 0.52, 0.28]
+let idleRaf: number | null = null
+
+function idleTick(): void {
+  const t = Date.now()
+  for (let i = 0; i < SAMPLE_COUNT; i++) {
+    displayed[i] = IDLE_BASES[i] + 0.18 * Math.sin(i * 1.1 + t * 0.002)
+  }
+  renderBars()
+  idleRaf = requestAnimationFrame(idleTick)
+}
+
+function startIdleAnim(): void {
+  if (idleRaf !== null) return
+  idleRaf = requestAnimationFrame(idleTick)
+}
+
+function stopIdleAnim(): void {
+  if (idleRaf !== null) {
+    cancelAnimationFrame(idleRaf)
+    idleRaf = null
+  }
+}
+
+// ── Decay interval — settles bars toward zero when not recording ──────────────
 setInterval(() => {
-  if (overlay.dataset.mode === 'recording') return
+  const mode = document.body.dataset.mode
+  if (mode === 'recording') return
+  if (mode === 'idle-anim') { startIdleAnim(); return }
+
+  stopIdleAnim()
   let any = false
-  for (let i = 0; i < BAR_COUNT; i++) {
-    if (displayed[i] > 0.005) {
+  for (let i = 0; i < SAMPLE_COUNT; i++) {
+    if (displayed[i] > 0.01) {
       displayed[i] *= 0.78
       any = true
     } else if (displayed[i] !== 0) {
@@ -48,71 +66,84 @@ setInterval(() => {
       any = true
     }
   }
-  if (any) paintBars()
+  if (any) renderBars()
 }, 50)
 
-// Compositor heartbeat. Windows DWM suspends the GPU surface of a transparent
-// + alwaysOnTop window after ~5 s of idle; the next `.visible` toggle then
-// pays a 100-500 ms cold-paint penalty. A 500 ms data-attribute tick keeps the
-// surface scheduled. Negligible CPU; massively improves cold-press latency.
+// ── DWM heartbeat — keeps GPU surface scheduled on Windows ───────────────────
 let heartbeatToggle = false
 setInterval(() => {
   heartbeatToggle = !heartbeatToggle
-  overlay.dataset.tick = heartbeatToggle ? '1' : '0'
+  document.body.dataset.tick = heartbeatToggle ? '1' : '0'
 }, 500)
 
-function setMode(mode: 'starting' | 'recording' | 'processing' | 'transforming' | 'error'): void {
-  overlay.dataset.mode = mode
-}
-
+// ── IPC bindings ──────────────────────────────────────────────────────────────
 const api = window.electronAPI
 if (api) {
   api.onRecordingStarting?.(() => {
-    overlay.classList.add('visible')
-    setMode('starting')
+    document.body.dataset.mode = 'starting'
+    document.body.setAttribute('data-recording', '')
+    stopIdleAnim()
   })
 
   api.onRecordingStarted(() => {
-    overlay.classList.add('visible')
-    setMode('recording')
+    document.body.dataset.mode = 'recording'
+    document.body.setAttribute('data-recording', '')
+    stopIdleAnim()
   })
 
   api.onRecordingStopped(() => {
-    setMode('processing')
+    document.body.dataset.mode = 'processing'
     setTimeout(() => {
-      if (overlay.dataset.mode === 'processing') {
-        overlay.dataset.mode = 'idle-anim'
+      if (document.body.dataset.mode === 'processing') {
+        document.body.dataset.mode = 'idle-anim'
+        startIdleAnim()
       }
     }, 400)
   })
 
   api.onTransformStarting?.(() => {
-    overlay.classList.add('visible')
-    setMode('transforming')
+    document.body.dataset.mode = 'transforming'
+    document.body.setAttribute('data-recording', '')
     setTimeout(() => {
-      if (overlay.dataset.mode === 'transforming') {
-        overlay.dataset.mode = 'idle-anim'
+      if (document.body.dataset.mode === 'transforming') {
+        document.body.dataset.mode = 'idle-anim'
+        startIdleAnim()
       }
     }, 400)
   })
 
   api.onProcessingComplete(() => {
-    overlay.classList.remove('visible')
-    delete overlay.dataset.mode
+    stopIdleAnim()
+    document.body.removeAttribute('data-recording')
+    delete document.body.dataset.mode
+    displayed.fill(0)
+    renderBars()
   })
 
   api.onTranscriptionError((_msg: string) => {
-    setMode('error')
+    document.body.dataset.mode = 'error'
     setTimeout(() => {
-      overlay.classList.remove('visible')
-      delete overlay.dataset.mode
+      stopIdleAnim()
+      document.body.removeAttribute('data-recording')
+      delete document.body.dataset.mode
+      displayed.fill(0)
+      renderBars()
     }, 2400)
   })
 
   api.onAudioLevels?.((levels: number[]) => {
-    // Levels only matter while we're actively recording. After stop the bars
-    // continue to decay via the idle-decay interval above.
-    if (overlay.dataset.mode !== 'recording') return
+    if (document.body.dataset.mode !== 'recording') return
     applyLevels(levels)
+    renderBars()
+  })
+
+  // Hover: expand/collapse pill
+  api.onOverlayHover?.((hovering: boolean) => {
+    document.body.toggleAttribute('data-hovering', hovering)
+  })
+
+  // Settings: hide/show the collapsed handle
+  api.onOverlayHandleHidden?.((hidden: boolean) => {
+    document.body.toggleAttribute('data-handle-hidden', hidden)
   })
 }

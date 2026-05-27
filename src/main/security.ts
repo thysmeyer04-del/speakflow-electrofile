@@ -124,6 +124,7 @@ export function validateLanguage(input: unknown): string | null {
 
 export type ToggleKey =
   | 'showOverlay'
+  | 'overlayHandleVisible'
   | 'dictationSounds'
   | 'launchAtLogin'
   | 'enableSmartFormatting'
@@ -133,6 +134,7 @@ export function validateToggleKey(input: unknown): ToggleKey | null {
   if (typeof input !== 'string') return null
   const allowed = new Set<ToggleKey>([
     'showOverlay',
+    'overlayHandleVisible',
     'dictationSounds',
     'launchAtLogin',
     'enableSmartFormatting',

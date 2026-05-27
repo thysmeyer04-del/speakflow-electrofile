@@ -6,9 +6,8 @@
     <title>Speakflow Overlay</title>
     <style>
       :root {
-        --accent-cyan: #6ad6ff;
-        --accent-blue: #3a83ff;
-        --accent-violet: #8a5bff;
+        --accent-cyan: #22D3EE;
+        --accent-blue: #2563EB;
       }
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body {
@@ -18,111 +17,138 @@
         height: 100%;
         user-select: none;
         -webkit-app-region: no-drag;
-      }
-
-      .overlay {
-        position: absolute;
-        inset: 6px;
         display: flex;
         align-items: center;
         justify-content: center;
+      }
+
+      /* ── Collapsed handle (thin line, visible when idle) ───────────────── */
+      .handle {
+        position: absolute;
+        width: 56px;
+        height: 4px;
+        border-radius: 4px;
+        background: rgba(255, 255, 255, 0.50);
+        transition: opacity 200ms ease;
+        pointer-events: none;
+      }
+      body[data-handle-hidden] .handle {
+        opacity: 0;
+      }
+      body[data-hovering] .handle,
+      body[data-recording] .handle {
+        opacity: 0;
+      }
+
+      /* ── Expanded pill ─────────────────────────────────────────────────── */
+      .overlay {
+        position: absolute;
+        inset: 4px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 0 12px;
         border-radius: 999px;
         background: linear-gradient(
           180deg,
-          rgba(12, 18, 36, 0.82) 0%,
-          rgba(6, 10, 22, 0.90) 100%
+          rgba(11, 18, 32, 0.90) 0%,
+          rgba(5, 10, 22, 0.94) 100%
         );
-        backdrop-filter: blur(16px) saturate(160%);
-        -webkit-backdrop-filter: blur(16px) saturate(160%);
-        box-shadow:
-          0 0 0 1px rgba(106, 214, 255, 0.18),
-          0 0 18px rgba(58, 131, 255, 0.30),
-          0 4px 20px rgba(0, 0, 0, 0.55);
+        backdrop-filter: blur(12px) saturate(140%);
+        -webkit-backdrop-filter: blur(12px) saturate(140%);
+        /* No external box-shadow — removes the dark glow outside the pill */
+        /* Hidden by default — shown on hover or while recording */
         opacity: 0;
-        transition: opacity 150ms ease;
+        pointer-events: none;
+        transition: opacity 180ms ease;
         will-change: opacity;
       }
-      .overlay.visible { opacity: 1; }
 
-      /* Gradient border stroke */
-      .overlay::before {
-        content: '';
-        position: absolute;
-        inset: -1.5px;
-        border-radius: 999px;
-        padding: 1.5px;
-        background: linear-gradient(
-          90deg,
-          var(--accent-cyan) 0%,
-          var(--accent-blue) 50%,
-          var(--accent-violet) 100%
-        );
-        -webkit-mask:
-          linear-gradient(#fff 0 0) content-box,
-          linear-gradient(#fff 0 0);
-        mask:
-          linear-gradient(#fff 0 0) content-box,
-          linear-gradient(#fff 0 0);
-        -webkit-mask-composite: xor;
-                mask-composite: exclude;
-        pointer-events: none;
+      /* Show pill on hover or while recording */
+      body[data-hovering] .overlay,
+      body[data-recording] .overlay {
+        opacity: 1;
       }
 
-      /* Wave bars: fixed height, scaled from center so they expand up & down */
+      /* Solid border — renders crisp without GPU acceleration */
+      .overlay {
+        border: 1.5px solid rgba(37, 99, 235, 0.75);
+      }
+
+      /* ── Speakflow waveform icon (left) ────────────────────────────────── */
+      .icon-mark {
+        width: 16px;
+        height: 16px;
+        flex-shrink: 0;
+        opacity: 0.90;
+      }
+
+      /* ── Animated bars (centre) ────────────────────────────────────────── */
       .bars {
         display: flex;
         align-items: center;
-        justify-content: center;
-        gap: 4px;
-        padding: 0 16px;
-        height: 100%;
+        gap: 2.5px;
+        height: 24px;
       }
       .bars span {
         display: block;
         width: 3px;
-        height: 28px;
-        border-radius: 3px;
-        background: linear-gradient(
-          180deg,
-          var(--accent-cyan) 0%,
-          var(--accent-blue) 100%
-        );
-        box-shadow: 0 0 5px rgba(106, 214, 255, 0.5);
-        transform: scaleY(calc(0.07 + var(--h, 0) * 0.93));
-        transform-origin: center;
-        transition: transform 65ms ease-out;
+        border-radius: 2px;
+        background: linear-gradient(180deg, #22D3EE 0%, #2563EB 100%);
+        box-shadow: 0 0 4px rgba(34, 211, 238, 0.50);
+        transition: height 75ms ease-out;
+        min-height: 3px;
+        height: 3px;
       }
 
-      /* Traveling sine-wave pulse while processing */
-      .overlay[data-mode='idle-anim'] .bars span {
-        animation: wavePulse 1.4s ease-in-out infinite;
+      /* ── Hotkey label (right, hidden while recording) ──────────────────── */
+      .hotkey-label {
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.50);
+        white-space: nowrap;
+        letter-spacing: 0.02em;
+        flex-shrink: 0;
       }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(1)  { animation-delay: 0.00s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(2)  { animation-delay: 0.08s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(3)  { animation-delay: 0.16s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(4)  { animation-delay: 0.24s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(5)  { animation-delay: 0.32s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(6)  { animation-delay: 0.40s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(7)  { animation-delay: 0.48s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(8)  { animation-delay: 0.40s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(9)  { animation-delay: 0.32s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(10) { animation-delay: 0.24s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(11) { animation-delay: 0.16s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(12) { animation-delay: 0.08s; }
-      .overlay[data-mode='idle-anim'] .bars span:nth-child(13) { animation-delay: 0.00s; }
-
-      @keyframes wavePulse {
-        0%, 100% { transform: scaleY(0.07); }
-        50%       { transform: scaleY(0.50); }
+      body[data-recording] .hotkey-label {
+        display: none;
       }
 
-      .overlay[data-mode='error'] .bars { opacity: 0.3; }
+      /* Error state: dim the bars */
+      body[data-mode='error'] .bars span {
+        opacity: 0.3;
+      }
     </style>
   </head>
   <body>
+    <!-- Collapsed handle: thin translucent line when idle -->
+    <div class="handle" id="handle"></div>
+
+    <!-- Expanded pill: icon + bars + label -->
     <div class="overlay" id="overlay">
-      <div class="bars" id="bars"></div>
+      <!-- Speakflow waveform mark -->
+      <svg class="icon-mark" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
+        <rect x="1"  y="5"  width="2" height="6"  rx="1" fill="#22D3EE"/>
+        <rect x="4"  y="2"  width="2" height="12" rx="1" fill="#3B82F6"/>
+        <rect x="7"  y="4"  width="2" height="8"  rx="1" fill="#2563EB"/>
+        <rect x="10" y="2"  width="2" height="12" rx="1" fill="#3B82F6"/>
+        <rect x="13" y="5"  width="2" height="6"  rx="1" fill="#22D3EE"/>
+      </svg>
+
+      <!-- 5 animated bars -->
+      <div class="bars" id="bars">
+        <span></span>
+        <span></span>
+        <span></span>
+        <span></span>
+        <span></span>
+      </div>
+
+      <!-- Hotkey hint -->
+      <span class="hotkey-label" id="hotkey-label">F11 to dictate</span>
     </div>
+
     <script src="overlay.js"></script>
   </body>
 </html>

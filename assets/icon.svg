@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Dark navy background with rounded corners -->
+  <rect width="512" height="512" rx="96" ry="96" fill="#0B1220"/>
+
+  <!-- Waveform mark centered in the icon -->
+  <!-- Scaled up from the 100x60 viewBox to ~280x168 centered at 256,256 -->
+  <g transform="translate(116, 172)">
+    <defs>
+      <linearGradient id="waveGrad" x1="0" y1="84" x2="280" y2="84" gradientUnits="userSpaceOnUse">
+        <stop stopColor="#2563EB"/>
+        <stop offset="1" stopColor="#22D3EE"/>
+      </linearGradient>
+    </defs>
+
+    <!-- Flowing sine waveform (scaled 2.8x from 100x60 original) -->
+    <path
+      d="M14 84 L28 84 M42 84 C42 70, 56 70, 56 84 C56 112, 70 112, 70 84 C70 42, 84 42, 84 84 C84 140, 98 140, 98 84 C98 28, 112 28, 112 84 C112 126, 126 126, 126 84 C126 56, 140 56, 140 84 L168 84"
+      stroke="url(#waveGrad)"
+      strokeWidth="16"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      fill="none"
+    />
+
+    <!-- Three horizontal text bars -->
+    <line x1="182" y1="56" x2="238" y2="56" stroke="#22D3EE" strokeWidth="14" strokeLinecap="round"/>
+    <line x1="182" y1="84" x2="266" y2="84" stroke="#22D3EE" strokeWidth="14" strokeLinecap="round"/>
+    <line x1="182" y1="112" x2="224" y2="112" stroke="#22D3EE" strokeWidth="14" strokeLinecap="round"/>
+  </g>
+</svg>

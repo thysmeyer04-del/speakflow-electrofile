@@ -6,18 +6,24 @@ export interface AppSettings {
   language: string
   launchAtLogin: boolean
   showOverlay: boolean
+  overlayHandleVisible: boolean
   dictationSounds: boolean
   muteMusicWhenDictating: boolean
+  enableSmartFormatting: boolean
+  stripDisfluencies: boolean
 }
 
 const defaults: AppSettings = {
-  hotkey: 'Control+Meta',
+  hotkey: 'F11',
   microphone: 'default',
-  language: 'auto',
+  language: 'en',
   launchAtLogin: true,
   showOverlay: true,
+  overlayHandleVisible: true,
   dictationSounds: true,
   muteMusicWhenDictating: false,
+  enableSmartFormatting: true,
+  stripDisfluencies: true,
 }
 
 const store = new Store<AppSettings>({
@@ -25,6 +31,15 @@ const store = new Store<AppSettings>({
   defaults,
   clearInvalidConfig: true,
 })
+
+// Migration: 'Control+Meta' (initial broken default) and 'F12' (often
+// already held on Windows) are upgraded to F11 so the hotkey registers
+// cleanly on first launch.
+const LEGACY_HOTKEYS = new Set(['Control+Meta', 'F12'])
+const persistedHotkey = store.get('hotkey')
+if (typeof persistedHotkey === 'string' && LEGACY_HOTKEYS.has(persistedHotkey)) {
+  store.set('hotkey', 'F11')
+}
 
 export function getSettings(): AppSettings {
   return { ...defaults, ...(store.store as Partial<AppSettings>) }

@@ -66,6 +66,9 @@ async function transcribeViaGroq(
   form.append('model', WHISPER_MODEL)
   form.append('response_format', 'json')
   form.append('temperature', '0')
+  // A non-empty prompt suppresses Whisper's "Thank you." / "Thanks for watching."
+  // hallucinations that occur when it receives silent or low-energy audio.
+  form.append('prompt', ' ')
   if (opts.language) form.append('language', opts.language)
 
   let response: Response

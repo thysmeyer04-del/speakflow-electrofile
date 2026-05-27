@@ -99,8 +99,12 @@ function tryRegisterCandidate(acc: string): string | null {
 
   try {
     const ok = globalShortcut.register(acc, () => {
+      log.info(`[timing] hotkey fired at ${Date.now()}`)
       void toggleRecording()
     })
+    if (!ok) {
+      log.warn(`globalShortcut.register("${acc}") returned false — OS or another app likely holds this key`)
+    }
     return ok ? acc : null
   } catch (err) {
     log.error(`Hotkey "${acc}" threw on register:`, (err as Error).message)

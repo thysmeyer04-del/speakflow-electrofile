@@ -8,7 +8,7 @@
 import log from 'electron-log/main'
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const DEFAULT_MODEL = 'llama-3.3-70b-versatile'
+const DEFAULT_MODEL = 'llama-3.1-8b-instant'
 const REQUEST_TIMEOUT_MS = 30_000
 
 export async function transformText(

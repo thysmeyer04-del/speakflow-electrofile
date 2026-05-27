@@ -8,7 +8,7 @@
 import log from 'electron-log/main'
 import { transformText } from './transform-llm'
 
-const FORMAT_MODEL = 'llama-3.3-70b-versatile'
+const FORMAT_MODEL = 'llama-3.1-8b-instant'
 
 let currentFormatAbort: AbortController | null = null
 
@@ -46,7 +46,21 @@ export function sanityCheck(raw: string, formatted: string): boolean {
     .replace(/[^a-z]/g, '')
   if (normRaw.length === 0) return true
   const ratio = normFmt.length / normRaw.length
-  return ratio >= 0.8 && ratio <= 1.2
+  if (ratio < 0.8 || ratio > 1.2) return false
+
+  // Word-overlap guard: if the LLM answered the text instead of reformatting
+  // it, the response will contain words the user never said. Require that at
+  // least 75% of content words (3+ letters) in the formatted output also
+  // appear in the raw input. A genuine reformat only rearranges whitespace and
+  // punctuation — it introduces very few new words.
+  const rawWords = new Set(raw.toLowerCase().match(/\b[a-z]{3,}\b/g) ?? [])
+  const fmtWords = formatted.toLowerCase().match(/\b[a-z]{3,}\b/g) ?? []
+  if (fmtWords.length > 0) {
+    const overlap = fmtWords.filter((w) => rawWords.has(w)).length / fmtWords.length
+    if (overlap < 0.75) return false
+  }
+
+  return true
 }
 
 function buildSystemPrompt(stripDisfluencies: boolean): string {
@@ -54,15 +68,17 @@ function buildSystemPrompt(stripDisfluencies: boolean): string {
 
 RULES — follow all of them strictly:
 1. Preserve every word exactly as spoken. Do NOT paraphrase, correct grammar, answer questions, or change vocabulary. Same words, same order${stripDisfluencies ? ' (except filler words covered by rule 8)' : ''}.
-2. Add a paragraph break (blank line) ONLY when the speaker explicitly says "new paragraph" or "new line", OR when there is a completely obvious topic change (e.g. switching from describing a problem to listing solutions — not just a new sentence or a slight shift). When in doubt, keep it as one paragraph. Err strongly on the side of FEWER breaks.
-3. Format as a numbered or bulleted list ONLY when the speaker clearly enumerates items using explicit cues: "first... second... third...", "one... two... three...", or "next... then... finally..." used to structure discrete steps. Do NOT infer list structure from commas, "and", or loosely related sentences.
-4. Remove explicit voice commands from the output after acting on them: "new paragraph", "new line" → break; "bullet point" / "next bullet" → new bullet line.
-5. Output plain text only. No markdown headers, no bold, no italics. Lists use "- " or "1. " prefixes.
-6. Do NOT add any text not in the input: no greetings, sign-offs, summaries, or commentary.
-7. If the input has no clear structural cues${stripDisfluencies ? ' and no filler words to remove' : ''}, return it unchanged as a single paragraph.`
+2. Every word in your output MUST come directly from the transcript. You may NOT introduce any word that does not appear in the original text.
+3. If the transcript contains a question, output it as a question — never answer it.
+4. Add a paragraph break (blank line) ONLY when the speaker explicitly says "new paragraph" or "new line", OR when there is a completely obvious topic change (e.g. switching from describing a problem to listing solutions — not just a new sentence or a slight shift). When in doubt, keep it as one paragraph. Err strongly on the side of FEWER breaks.
+5. Format as a numbered or bulleted list ONLY when the speaker clearly enumerates items using explicit cues: "first... second... third...", "one... two... three...", or "next... then... finally..." used to structure discrete steps. Do NOT infer list structure from commas, "and", or loosely related sentences.
+6. Remove explicit voice commands from the output after acting on them: "new paragraph", "new line" → break; "bullet point" / "next bullet" → new bullet line.
+7. Output plain text only. No markdown headers, no bold, no italics. Lists use "- " or "1. " prefixes.
+8. Do NOT add any text not in the input: no greetings, sign-offs, summaries, or commentary.
+9. If the input has no clear structural cues${stripDisfluencies ? ' and no filler words to remove' : ''}, return it unchanged as a single paragraph.`
 
   const disfluencyRule = `
-8. Remove filler words and false starts: "um", "uh", "er", "like" as a filler (NOT as a verb or comparison), "you know", "I mean", "sort of"/"kind of" as fillers, and repeated-word stutters ("the the cat" → "the cat"). Do NOT remove content words. This rule applies even when there is no list or paragraph structure to add.`
+10. Remove filler words and false starts: "um", "uh", "er", "like" as a filler (NOT as a verb or comparison), "you know", "I mean", "sort of"/"kind of" as fillers, and repeated-word stutters ("the the cat" → "the cat"). Do NOT remove content words. This rule applies even when there is no list or paragraph structure to add.`
 
   const tail = `
 
@@ -109,8 +125,17 @@ export async function formatTranscript(
       controller.signal,
       0,
     )
-    log.info(`[format] ok in ${Date.now() - t0}ms (${rawText.length} -> ${result.length} chars)`)
-    return unwrapResponse(result)
+    const unwrapped = unwrapResponse(result)
+    // If the model broke the "don't answer" rule, its response typically opens
+    // with a conversational starter. Catch it here before it reaches the caller
+    // so the recording-controller falls back to the raw transcript.
+    const ANSWER_OPENER =
+      /^(sure[,!]?\s|of course|here'?s?\s|i (would|can|will|am)\b|the answer|to answer|yes[,!]?\s|no[,!]?\s|absolutely|great[,!]?\s|certainly\b)/i
+    if (ANSWER_OPENER.test(unwrapped)) {
+      throw new Error('format-guard: LLM produced an answer rather than a reformat')
+    }
+    log.info(`[format] ok in ${Date.now() - t0}ms (${rawText.length} -> ${unwrapped.length} chars)`)
+    return unwrapped
   } finally {
     if (currentFormatAbort === controller) currentFormatAbort = null
   }

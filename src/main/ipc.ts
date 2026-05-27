@@ -6,7 +6,21 @@ import {
   startRecording,
   stopRecording,
   onRecordingStateChange,
+  abortInFlightRecording,
 } from './recording-controller'
+import {
+  getCommands,
+  saveCommand,
+  deleteCommand,
+  resetToDefaults,
+  type Command,
+} from './commands-store'
+import {
+  registerCommandHotkeys,
+  getRegisteredCommandHotkeys,
+} from './commands-hotkey'
+import { runTransform } from './transform-controller'
+import { runWisprMigration, isWisprMigrationRunning } from './migrate-wispr'
 import {
   assertTrustedSender,
   validateHotkey,
@@ -25,11 +39,17 @@ interface SetupArgs {
 let cachedAuthToken: string | null = null
 let cachedTokenExpiresAt = 0
 
+// 60s safety margin — refuse tokens about to expire so a long-running call
+// (embedding compute + network) doesn't blow up half-way through with 401.
+const TOKEN_FRESHNESS_MARGIN_MS = 60_000
+
 export function getAuthToken(): string | null {
   if (!cachedAuthToken) return null
-  if (cachedTokenExpiresAt && Date.now() > cachedTokenExpiresAt) {
-    cachedAuthToken = null
-    cachedTokenExpiresAt = 0
+  if (cachedTokenExpiresAt && Date.now() > cachedTokenExpiresAt - TOKEN_FRESHNESS_MARGIN_MS) {
+    if (Date.now() > cachedTokenExpiresAt) {
+      cachedAuthToken = null
+      cachedTokenExpiresAt = 0
+    }
     return null
   }
   return cachedAuthToken
@@ -123,6 +143,9 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
           log.warn('Failed to update login item settings', err)
         }
       }
+      if (key === 'overlayHandleVisible' && overlayWindow && !overlayWindow.isDestroyed()) {
+        overlayWindow.webContents.send('overlay-handle-hidden', !value)
+      }
       return { ok: true }
     },
   )
@@ -141,7 +164,12 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       return { ok: true, expiresAt: result.expiresAt ?? 0 }
     },
   )
-  gatedOn('auth:clear-token', () => clearAuthTokenCache())
+  gatedOn('auth:clear-token', () => {
+    clearAuthTokenCache()
+    // Also abort any recording/transcription in flight so a sign-out can't
+    // leave a stale request continuing with the just-cleared token.
+    abortInFlightRecording('auth-cleared')
+  })
 
   gatedOn('recording:start', () => {
     startRecording().catch((err) => log.error('startRecording IPC failed', err))
@@ -150,15 +178,62 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
     stopRecording().catch((err) => log.error('stopRecording IPC failed', err))
   })
 
-  onRecordingStateChange((s) => {
-    const settings = getSettings()
-    if (!overlayWindow.isDestroyed()) {
-      if (settings.showOverlay && (s === 'starting' || s === 'recording' || s === 'stopping' || s === 'processing')) {
-        overlayWindow.showInactive()
-      } else {
-        overlayWindow.hide()
+  // ── Transform Commands ────────────────────────────────────────────────────
+  gatedHandle('commands:list', () => ({
+    commands: getCommands(),
+    registeredHotkeys: getRegisteredCommandHotkeys(),
+  }))
+  gatedHandle<Partial<Command>, { success: boolean; error?: string; command?: Command }>(
+    'commands:save',
+    (_event, raw) => {
+      if (!raw || typeof raw !== 'object') return { success: false, error: 'invalid-payload' }
+      const result = saveCommand(raw)
+      if (result.success) {
+        // Re-register all hotkeys to reflect the change.
+        registerCommandHotkeys(getCommands())
       }
+      return result
+    },
+  )
+  gatedHandle<string, { success: boolean; error?: string }>('commands:delete', (_event, id) => {
+    if (typeof id !== 'string' || !id) return { success: false, error: 'invalid-id' }
+    deleteCommand(id)
+    registerCommandHotkeys(getCommands())
+    return { success: true }
+  })
+  gatedHandle('commands:reset-defaults', () => {
+    resetToDefaults()
+    registerCommandHotkeys(getCommands())
+    return { success: true }
+  })
+  gatedHandle<string, { success: boolean; error?: string }>('commands:run', async (_event, id) => {
+    if (typeof id !== 'string' || !id) return { success: false, error: 'invalid-id' }
+    try {
+      await runTransform(id)
+      return { success: true }
+    } catch (err) {
+      log.error('commands:run failed', err)
+      return { success: false, error: (err as Error).message ?? 'unknown' }
     }
+  })
+
+  // ── One-shot migration from Wispr Flow ───────────────────────────────────
+  gatedHandle('migrate:start-wispr-import', () => runWisprMigration())
+  gatedHandle('migrate:status', () => ({ running: isWisprMigrationRunning() }))
+
+  // Push initial handle-visibility setting once the overlay renderer is ready
+  overlayWindow.webContents.on('did-finish-load', () => {
+    if (!overlayWindow.isDestroyed()) {
+      const visible = getSettings().overlayHandleVisible
+      overlayWindow.webContents.send('overlay-handle-hidden', !visible)
+    }
+  })
+
+  onRecordingStateChange((s) => {
+    // Overlay window stays shown for the whole app lifetime; visibility is
+    // controlled purely by CSS via 'recording-starting' / 'processing-
+    // complete' events. We DON'T call show/hide here because the cold-paint
+    // cost on first show is what made the overlay feel laggy.
     trayCallback?.(s === 'recording')
   })
 }

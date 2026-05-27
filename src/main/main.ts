@@ -261,10 +261,10 @@ function createOverlayWindow(): BrowserWindow {
   const { width, height } = primaryDisplay.workAreaSize
 
   const win = new BrowserWindow({
-    width: 200,
-    height: 52,
-    x: Math.floor(width / 2 - 100),
-    y: height - 72,
+    width: 160,
+    height: 44,
+    x: Math.floor(width / 2 - 80),
+    y: height - 50,
     frame: false,
     transparent: true,
     alwaysOnTop: true,
@@ -324,14 +324,35 @@ function createOverlayWindow(): BrowserWindow {
     }
   })
 
-  return win
-}
+  // Poll at 20 Hz: follow cursor across monitors and detect hover so the
+  // renderer can expand/collapse the pill.
+  let trackedDisplayId: number | null = null
+  const cursorPoll = setInterval(() => {
+    if (win.isDestroyed()) { clearInterval(cursorPoll); return }
+    const cursor  = screen.getCursorScreenPoint()
+    const display = screen.getDisplayNearestPoint(cursor)
 
-function repositionOverlay(): void {
-  if (!overlayWindow || overlayWindow.isDestroyed()) return
-  const primaryDisplay = screen.getPrimaryDisplay()
-  const { width, height } = primaryDisplay.workAreaSize
-  overlayWindow.setPosition(Math.floor(width / 2 - 100), height - 72)
+    // Jump to whichever monitor the cursor is on
+    if (display.id !== trackedDisplayId) {
+      trackedDisplayId = display.id
+      const { x, y, width: dw, height: dh } = display.workArea
+      win.setPosition(Math.floor(x + dw / 2 - 80), Math.floor(y + dh - 50))
+    }
+
+    // Hover detection: only trigger when cursor is over the 56px handle,
+    // not the entire transparent window area.
+    const b = win.getBounds()
+    const HANDLE_W = 100  // wider than 56px handle so it's easy to hit
+    const HANDLE_H = 24   // generous height around the 4px line
+    const hx = b.x + Math.floor((b.width  - HANDLE_W) / 2)
+    const hy = b.y + Math.floor((b.height - HANDLE_H) / 2)
+    const hovering =
+      cursor.x >= hx && cursor.x <= hx + HANDLE_W &&
+      cursor.y >= hy && cursor.y <= hy + HANDLE_H
+    if (!win.isDestroyed()) win.webContents.send('overlay-hover', hovering)
+  }, 50)
+
+  return win
 }
 
 function resolveIcon(): string | undefined {
@@ -377,12 +398,6 @@ app.whenReady().then(async () => {
   // (controlled by recording-starting / processing-complete events) decides
   // whether anything is actually rendered.
   overlayWindow.showInactive()
-
-  // Reposition the overlay if the display layout changes (resolution, DPI,
-  // monitor added/removed) so it never ends up off-screen.
-  screen.on('display-metrics-changed', repositionOverlay)
-  screen.on('display-added', repositionOverlay)
-  screen.on('display-removed', repositionOverlay)
 
   // Re-show after system resume — Windows can hide always-on-top transparent
   // windows during sleep and not always restore them automatically.

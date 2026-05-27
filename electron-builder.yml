@@ -22,6 +22,7 @@ extraResources:
 
 mac:
   icon: assets/icon.icns
+  artifactName: Speakflow.dmg
   category: public.app-category.productivity
   target:
     - target: dmg
@@ -36,11 +37,12 @@ mac:
 
 win:
   icon: assets/icon.ico
+  artifactName: Speakflow-Setup.exe
   target:
     - target: nsis
       arch:
         - x64
-  signAndEditExecutable: true
+  signAndEditExecutable: false
 
 nsis:
   oneClick: false

@@ -60,10 +60,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return ipcRenderer.invoke('settings:update-language', v.toLowerCase()) as Promise<SettingsResult>
   },
   updateToggle: async (
-    key: 'showOverlay' | 'dictationSounds' | 'launchAtLogin',
+    key:
+      | 'showOverlay'
+      | 'dictationSounds'
+      | 'launchAtLogin'
+      | 'enableSmartFormatting'
+      | 'stripDisfluencies',
     value: boolean,
   ): Promise<SettingsResult> => {
-    const allowed = new Set(['showOverlay', 'dictationSounds', 'launchAtLogin'])
+    const allowed = new Set([
+      'showOverlay',
+      'dictationSounds',
+      'launchAtLogin',
+      'enableSmartFormatting',
+      'stripDisfluencies',
+    ])
     if (!allowed.has(key)) return { ok: false, error: 'invalid-key' }
     if (typeof value !== 'boolean') return { ok: false, error: 'invalid-value' }
     return ipcRenderer.invoke('settings:update-toggle', { key, value }) as Promise<SettingsResult>
@@ -89,4 +100,29 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ── Recording control ─────────────────────────────────────────────────────
   startRecording: () => ipcRenderer.send('recording:start'),
   stopRecording: () => ipcRenderer.send('recording:stop'),
+
+  // ── Transform Commands ────────────────────────────────────────────────────
+  commands: {
+    list: () => ipcRenderer.invoke('commands:list'),
+    save: (cmd: unknown) => ipcRenderer.invoke('commands:save', cmd),
+    delete: (id: string) => {
+      const v = safeString(id, 64)
+      if (!v) return Promise.resolve({ success: false, error: 'invalid-id' })
+      return ipcRenderer.invoke('commands:delete', v)
+    },
+    resetDefaults: () => ipcRenderer.invoke('commands:reset-defaults'),
+    run: (id: string) => {
+      const v = safeString(id, 64)
+      if (!v) return Promise.resolve({ success: false, error: 'invalid-id' })
+      return ipcRenderer.invoke('commands:run', v)
+    },
+  },
+  onTransformStarting: (cb: () => void) => on<void>('transform-starting', cb),
+
+  // ── One-shot Wispr Flow migration ─────────────────────────────────────────
+  migrate: {
+    fromWispr: () => ipcRenderer.invoke('migrate:start-wispr-import'),
+    status: () => ipcRenderer.invoke('migrate:status'),
+    onProgress: (cb: (p: unknown) => void) => on<unknown>('migrate:progress', cb),
+  },
 })
