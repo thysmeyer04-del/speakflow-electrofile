@@ -287,7 +287,14 @@ async function processAudio(buffer: Buffer, language: string, mySession: number)
       return
     }
 
-    if (text && text.trim()) {
+    if (!text || !text.trim()) {
+      // Whisper returned empty — only show feedback if the clip was substantial
+      // (short accidental presses stay silent).
+      if (buffer.byteLength > 15_000) {
+        log.warn(`[recording] empty transcription for ${buffer.byteLength}B clip`)
+        broadcast('transcription-error', 'No speech detected — try speaking louder or closer to the mic')
+      }
+    } else if (text.trim()) {
       const rawTrimmed = collapseRepetitions(text.trim())
       let trimmed = rawTrimmed
 

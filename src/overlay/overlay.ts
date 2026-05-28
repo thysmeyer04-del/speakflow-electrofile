@@ -114,6 +114,8 @@ if (api) {
   })
 
   api.onProcessingComplete(() => {
+    // Don't wipe an error that's currently showing — let its own timeout clear it.
+    if (document.body.dataset.mode === 'error') return
     stopIdleAnim()
     document.body.removeAttribute('data-recording')
     delete document.body.dataset.mode
