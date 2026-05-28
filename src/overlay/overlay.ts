@@ -4,9 +4,10 @@
 const SAMPLE_COUNT = 5
 const BAR_MAX_H = 20  // px — fits within the 24px bar container
 
-const barsEl   = document.getElementById('bars')    as HTMLElement
-const bars      = Array.from(barsEl.querySelectorAll('span')) as HTMLElement[]
-const displayed = new Array<number>(SAMPLE_COUNT).fill(0)
+const barsEl     = document.getElementById('bars')       as HTMLElement
+const bars        = Array.from(barsEl.querySelectorAll('span')) as HTMLElement[]
+const errorLabel  = document.getElementById('error-label') as HTMLElement
+const displayed   = new Array<number>(SAMPLE_COUNT).fill(0)
 
 // ── Audio level state ─────────────────────────────────────────────────────────
 function applyLevels(levels: number[]): void {
@@ -120,15 +121,18 @@ if (api) {
     renderBars()
   })
 
-  api.onTranscriptionError((_msg: string) => {
+  api.onTranscriptionError((msg: string) => {
+    errorLabel.textContent = msg || 'Something went wrong'
     document.body.dataset.mode = 'error'
+    document.body.setAttribute('data-recording', '')
     setTimeout(() => {
       stopIdleAnim()
       document.body.removeAttribute('data-recording')
       delete document.body.dataset.mode
+      errorLabel.textContent = ''
       displayed.fill(0)
       renderBars()
-    }, 2400)
+    }, 3500)
   })
 
   api.onAudioLevels?.((levels: number[]) => {

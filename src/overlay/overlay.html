@@ -119,6 +119,26 @@
       body[data-mode='error'] .bars span {
         opacity: 0.3;
       }
+
+      /* Error message label */
+      .error-label {
+        display: none;
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 11px;
+        color: rgba(255, 120, 80, 0.95);
+        white-space: nowrap;
+        letter-spacing: 0.01em;
+        flex-shrink: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 340px;
+      }
+      body[data-mode='error'] .error-label {
+        display: block;
+      }
+      body[data-mode='error'] .hotkey-label {
+        display: none;
+      }
     </style>
   </head>
   <body>
@@ -147,6 +167,9 @@
 
       <!-- Hotkey hint -->
       <span class="hotkey-label" id="hotkey-label">F11 to dictate</span>
+
+      <!-- Error message (shown only on error state) -->
+      <span class="error-label" id="error-label"></span>
     </div>
 
     <script src="overlay.js"></script>

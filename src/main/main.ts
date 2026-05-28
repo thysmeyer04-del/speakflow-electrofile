@@ -261,9 +261,9 @@ function createOverlayWindow(): BrowserWindow {
   const { width, height } = primaryDisplay.workAreaSize
 
   const win = new BrowserWindow({
-    width: 160,
+    width: 480,
     height: 44,
-    x: Math.floor(width / 2 - 80),
+    x: Math.floor(width / 2 - 240),
     y: height - 50,
     frame: false,
     transparent: true,
@@ -336,13 +336,13 @@ function createOverlayWindow(): BrowserWindow {
     if (display.id !== trackedDisplayId) {
       trackedDisplayId = display.id
       const { x, y, width: dw, height: dh } = display.workArea
-      win.setPosition(Math.floor(x + dw / 2 - 80), Math.floor(y + dh - 50))
+      win.setPosition(Math.floor(x + dw / 2 - 240), Math.floor(y + dh - 50))
     }
 
     // Hover detection: only trigger when cursor is over the 56px handle,
     // not the entire transparent window area.
     const b = win.getBounds()
-    const HANDLE_W = 100  // wider than 56px handle so it's easy to hit
+    const HANDLE_W = 120  // wider than 56px handle so it's easy to hit
     const HANDLE_H = 24   // generous height around the 4px line
     const hx = b.x + Math.floor((b.width  - HANDLE_W) / 2)
     const hy = b.y + Math.floor((b.height - HANDLE_H) / 2)
