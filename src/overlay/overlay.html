@@ -6,8 +6,8 @@
     <title>Speakflow Overlay</title>
     <style>
       :root {
-        --accent-cyan: #22D3EE;
-        --accent-blue: #2563EB;
+        --accent-cyan: #FFB347;
+        --accent-blue: #FF6B35;
       }
       * { margin: 0; padding: 0; box-sizing: border-box; }
       html, body {
@@ -73,7 +73,7 @@
 
       /* Solid border — renders crisp without GPU acceleration */
       .overlay {
-        border: 1.5px solid rgba(37, 99, 235, 0.75);
+        border: 1.5px solid rgba(255, 107, 53, 0.75);
       }
 
       /* ── Speakflow waveform icon (left) ────────────────────────────────── */
@@ -95,8 +95,8 @@
         display: block;
         width: 3px;
         border-radius: 2px;
-        background: linear-gradient(180deg, #22D3EE 0%, #2563EB 100%);
-        box-shadow: 0 0 4px rgba(34, 211, 238, 0.50);
+        background: linear-gradient(180deg, #FFB347 0%, #FF6B35 100%);
+        box-shadow: 0 0 4px rgba(255, 179, 71, 0.50);
         transition: height 75ms ease-out;
         min-height: 3px;
         height: 3px;
@@ -129,11 +129,11 @@
     <div class="overlay" id="overlay">
       <!-- Speakflow waveform mark -->
       <svg class="icon-mark" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">
-        <rect x="1"  y="5"  width="2" height="6"  rx="1" fill="#22D3EE"/>
-        <rect x="4"  y="2"  width="2" height="12" rx="1" fill="#3B82F6"/>
-        <rect x="7"  y="4"  width="2" height="8"  rx="1" fill="#2563EB"/>
-        <rect x="10" y="2"  width="2" height="12" rx="1" fill="#3B82F6"/>
-        <rect x="13" y="5"  width="2" height="6"  rx="1" fill="#22D3EE"/>
+        <rect x="1"  y="5"  width="2" height="6"  rx="1" fill="#FFB347"/>
+        <rect x="4"  y="2"  width="2" height="12" rx="1" fill="#FF8555"/>
+        <rect x="7"  y="4"  width="2" height="8"  rx="1" fill="#FF6B35"/>
+        <rect x="10" y="2"  width="2" height="12" rx="1" fill="#FF8555"/>
+        <rect x="13" y="5"  width="2" height="6"  rx="1" fill="#FFB347"/>
       </svg>
 
       <!-- 5 animated bars -->

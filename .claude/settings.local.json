@@ -5,7 +5,12 @@
       "Skill(codex:setup:*)",
       "Bash(gemini --version)",
       "Bash(git --version)",
-      "Bash(codex exec --skip-git-repo-check 'Re-audit of inject + transcribe + JWT after consolidated fix. Previous audit found: *)"
+      "Bash(codex exec --skip-git-repo-check 'Re-audit of inject + transcribe + JWT after consolidated fix. Previous audit found: *)",
+      "Bash(powershell -Command \"Get-Process electron -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(node scripts/copy-assets.mjs)",
+      "Bash(powershell -Command \"Get-NetTCPConnection -LocalPort 5173 -ErrorAction SilentlyContinue | Select-Object -First 1 OwningProcess\")",
+      "Bash(python -c ' *)",
+      "PowerShell(Start-Process powershell -ArgumentList \"-NoExit\", \"-Command\", \"Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue; cd 'C:\\\\Users\\\\ThysMeyer\\\\OneDrive\\\\SLIM AI Projects\\\\Speakflow App\\\\Speakflow Electrofile'; npm run dev 2>&1\")"
     ]
   }
 }
