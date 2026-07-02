@@ -71,6 +71,13 @@ let segmentStartAt = 0
 // the whole-session silence gate below stays authoritative.
 let segmentPeakLevel = 0
 let silentSinceTs: number | null = null
+// Adaptive noise floor: real mics (AGC + room noise + the sqrt perceptual
+// curve in downsampleToBars) idle well above the old fixed 0.06 threshold,
+// which meant a pause was NEVER detected and streaming silently degraded to
+// single-shot transcription. Track the quietest recent level instead and
+// call "silence" anything near it.
+let noiseFloorLevel = 1
+let segLogFrameCounter = 0
 let pendingSegmentCut: Promise<void> | null = null
 // The stream/mime the active MediaRecorder was built with — needed to spin
 // up the replacement recorder mid-session.
@@ -80,8 +87,9 @@ let activeMimeType: string | undefined
 const SEGMENT_MIN_MS = 4_000
 // How long the level must stay quiet before we treat it as a pause.
 const SEGMENT_SILENCE_MS = 600
-// Normalized level under which a frame counts as silence for segmentation.
-const SEGMENT_SILENCE_LEVEL = 0.06
+// Minimum silence threshold for segmentation; the effective threshold is
+// adaptive: max(this, noiseFloor * 1.4 + 0.05).
+const SEGMENT_SILENCE_LEVEL = 0.08
 // Hard ceiling (10 min at one cut every ~4 s) — runaway-loop backstop.
 const SEGMENT_MAX_COUNT = 150
 
@@ -295,6 +303,8 @@ async function start(microphoneId: string, streaming = false): Promise<void> {
   segmentStartAt = Date.now()
   segmentPeakLevel = 0
   silentSinceTs = null
+  noiseFloorLevel = 1
+  segLogFrameCounter = 0
 
   sessionPeakLevel = 0
   levelFrameCount = 0
@@ -366,6 +376,20 @@ function maybeCutSegment(frameLevel: number): void {
     silentSinceTs = null
     return
   }
+
+  // Adapt the noise floor: drop instantly to quieter levels, drift up slowly
+  // so short loud stretches don't poison it.
+  if (frameLevel < noiseFloorLevel) noiseFloorLevel = frameLevel
+  else noiseFloorLevel = Math.min(1, noiseFloorLevel * 0.995 + frameLevel * 0.005)
+  const silenceThreshold = Math.max(SEGMENT_SILENCE_LEVEL, noiseFloorLevel * 1.4 + 0.05)
+
+  // Visibility while tuning: one line every ~5s of recording.
+  if (++segLogFrameCounter % 150 === 0) {
+    console.log(
+      `[seg] level=${frameLevel.toFixed(3)} floor=${noiseFloorLevel.toFixed(3)} thr=${silenceThreshold.toFixed(3)} segAge=${Date.now() - segmentStartAt}ms cuts=${segmentIndex}`,
+    )
+  }
+
   if (pendingSegmentCut || pendingFinalize || pendingFlush || errorRecovery) return
   if (segmentIndex >= SEGMENT_MAX_COUNT) return
   const now = Date.now()
@@ -373,7 +397,7 @@ function maybeCutSegment(frameLevel: number): void {
     silentSinceTs = null
     return
   }
-  if (frameLevel >= SEGMENT_SILENCE_LEVEL) {
+  if (frameLevel >= silenceThreshold) {
     silentSinceTs = null
     return
   }

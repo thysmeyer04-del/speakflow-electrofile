@@ -55,8 +55,31 @@ function broadcast(channel: string, payload?: unknown): void {
   })
 }
 
-const COPY_SETTLE_MS = 80
+const COPY_SETTLE_MS = 150
 const PASTE_SETTLE_MS = 120
+
+// The command hotkey (Ctrl+Shift+N) is usually still physically held when the
+// handler fires. If we send Ctrl+C now, the still-held Shift turns it into
+// Ctrl+Shift+C in the target app (devtools in browsers, nothing in most apps)
+// — the copy silently fails and a real selection looks like "no selection".
+// Synthetically releasing the modifiers makes the OS treat them as up even
+// while the fingers are still on them.
+async function releaseHotkeyModifiers(): Promise<void> {
+  if (!nutKeyboard || !nutKey) return
+  const mods = [
+    nutKey.LeftShift, nutKey.RightShift,
+    nutKey.LeftControl, nutKey.RightControl,
+    nutKey.LeftAlt, nutKey.RightAlt,
+    nutKey.LeftSuper, nutKey.RightSuper,
+  ]
+  for (const m of mods) {
+    try {
+      await nutKeyboard.releaseKey(m)
+    } catch {
+      // releasing an already-up key can throw on some platforms — ignore
+    }
+  }
+}
 
 export function runTransform(commandId: string): Promise<void> {
   const next = transformChain.then(() => doRunTransform(commandId))
@@ -126,7 +149,10 @@ async function doRunTransform(commandId: string): Promise<void> {
     `[transform] command="${cmd.name}" target=${focusTarget?.title ?? '(unknown)'}`,
   )
 
-  // Step 1: Send Ctrl+C (Cmd+C on Mac) to grab the selection.
+  // Step 1: Send Ctrl+C (Cmd+C on Mac) to grab the selection. Force-release
+  // the still-held hotkey modifiers first or the copy arrives as Ctrl+Shift+C.
+  await releaseHotkeyModifiers()
+  await sleep(30)
   const modifier =
     process.platform === 'darwin' ? nutKey.LeftSuper : nutKey.LeftControl
   try {
