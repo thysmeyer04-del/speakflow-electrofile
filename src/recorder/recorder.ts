@@ -377,11 +377,20 @@ function maybeCutSegment(frameLevel: number): void {
     return
   }
 
-  // Adapt the noise floor: drop instantly to quieter levels, drift up slowly
-  // so short loud stretches don't poison it.
-  if (frameLevel < noiseFloorLevel) noiseFloorLevel = frameLevel
-  else noiseFloorLevel = Math.min(1, noiseFloorLevel * 0.995 + frameLevel * 0.005)
-  const silenceThreshold = Math.max(SEGMENT_SILENCE_LEVEL, noiseFloorLevel * 1.4 + 0.05)
+  // Adapt the noise floor: drop instantly to quieter levels; drift up ONLY
+  // from near-floor frames, so sustained speech can't drag the floor into
+  // speech range (observed in the field: floor 0.72 → threshold 1.06 → every
+  // frame counted as "silence" and segments got cut mid-speech on a timer).
+  if (frameLevel < noiseFloorLevel) {
+    noiseFloorLevel = frameLevel
+  } else if (frameLevel < noiseFloorLevel * 1.8) {
+    noiseFloorLevel = Math.min(1, noiseFloorLevel * 0.99 + frameLevel * 0.01)
+  }
+  // Hard cap keeps the threshold safely below speech levels (~0.9-1.0).
+  const silenceThreshold = Math.min(
+    0.55,
+    Math.max(SEGMENT_SILENCE_LEVEL, noiseFloorLevel * 1.3 + 0.04),
+  )
 
   // Visibility while tuning: one line every ~5s of recording.
   if (++segLogFrameCounter % 150 === 0) {
