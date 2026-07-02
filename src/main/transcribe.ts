@@ -1,8 +1,19 @@
+import { app } from 'electron'
 import log from 'electron-log/main'
 import { getAuthToken } from './ipc'
 import { isProxyUrlAllowed } from './security'
 import { getSettings } from './settings'
 import { transcribeLocal, isLocalModelCached } from './local-whisper'
+
+const PRODUCTION_PROXY = 'https://speakflow-marketing.vercel.app/api'
+
+/** Proxy base URL when this build should route through the Speakflow API.
+ *  NOTE: keyed on app.isPackaged, NOT NODE_ENV — installed Electron apps
+ *  never set NODE_ENV, which previously sent packaged builds down the
+ *  direct-Groq path and demanded a local dev API key. */
+export function getProxyBaseUrl(): string | undefined {
+  return process.env.SPEAKFLOW_API_URL || (app.isPackaged ? PRODUCTION_PROXY : undefined)
+}
 
 const GROQ_TRANSCRIPTIONS_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
 // Turbo is ~3x faster than whisper-large-v3 with marginal accuracy tradeoff —
@@ -69,9 +80,7 @@ async function transcribeViaCloud(
     throw new Error('Recording exceeds the 25 MB Groq limit. Try a shorter clip.')
   }
 
-  const PRODUCTION_PROXY = 'https://speakflow-marketing.vercel.app/api'
-  const proxyUrl = process.env.SPEAKFLOW_API_URL ||
-    (process.env.NODE_ENV === 'production' ? PRODUCTION_PROXY : undefined)
+  const proxyUrl = getProxyBaseUrl()
   if (proxyUrl) {
     if (!isProxyUrlAllowed(proxyUrl)) {
       throw new Error('Speakflow API URL is not allowed.')

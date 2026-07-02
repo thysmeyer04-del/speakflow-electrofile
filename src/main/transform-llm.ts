@@ -1,11 +1,16 @@
-// Groq chat-completion client for Transform commands.
+// Chat-completion client for Transform commands and smart formatting.
 //
-// Mirrors transcribe.ts's error-mapping + timeout patterns. Returns the
-// assistant's trimmed message content. Supports per-call AbortSignal so the
-// caller can cancel mid-flight (e.g. user presses F11 to start a recording
-// while a transform is still resolving).
+// Packaged builds route through the Speakflow API proxy (/api/transform) with
+// the user's auth token — same pattern as transcribe.ts. Dev builds call Groq
+// directly with GROQ_API_KEY. Mirrors transcribe.ts's error-mapping + timeout
+// patterns. Returns the assistant's trimmed message content. Supports
+// per-call AbortSignal so the caller can cancel mid-flight (e.g. user presses
+// F11 to start a recording while a transform is still resolving).
 
 import log from 'electron-log/main'
+import { getAuthToken } from './ipc'
+import { getProxyBaseUrl } from './transcribe'
+import { isProxyUrlAllowed } from './security'
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const DEFAULT_MODEL = 'llama-3.1-8b-instant'
@@ -18,11 +23,6 @@ export async function transformText(
   signal?: AbortSignal,
   temperature: number = 0.3,
 ): Promise<string> {
-  const apiKey = process.env.GROQ_API_KEY
-  if (!apiKey) {
-    throw new Error('GROQ_API_KEY is not set. Add it to .env for local development.')
-  }
-
   // Compose own AbortController so we can union an external signal with our
   // own timeout. AbortSignal.any() is Node 20+, so do this manually.
   const controller = new AbortController()
@@ -30,6 +30,82 @@ export async function transformText(
   if (signal) {
     if (signal.aborted) controller.abort()
     else signal.addEventListener('abort', () => controller.abort(), { once: true })
+  }
+
+  try {
+    const proxyUrl = getProxyBaseUrl()
+    if (proxyUrl) {
+      if (!isProxyUrlAllowed(proxyUrl)) {
+        throw new Error('Speakflow API URL is not allowed.')
+      }
+      return await transformViaProxy(
+        proxyUrl, systemPrompt, userText, model, temperature, controller.signal,
+      )
+    }
+    return await transformViaGroq(
+      systemPrompt, userText, model, temperature, controller.signal,
+    )
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function transformViaProxy(
+  baseUrl: string,
+  systemPrompt: string,
+  userText: string,
+  model: string,
+  temperature: number,
+  signal: AbortSignal,
+): Promise<string> {
+  const token = getAuthToken()
+  if (!token) {
+    throw new Error('Sign in via the dashboard to use Speakflow.')
+  }
+
+  const url = baseUrl.replace(/\/+$/, '') + '/transform'
+  let response: Response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ systemPrompt, userText, model, temperature }),
+      signal,
+    })
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') {
+      throw new Error('Transform aborted.')
+    }
+    throw new Error('Could not reach the Speakflow API.')
+  }
+
+  if (!response.ok) {
+    const body = await safeReadBody(response)
+    log.error(`[transform-llm] proxy error ${response.status}`, body.slice(0, 500))
+    throw new Error(userMessageForStatus(response.status))
+  }
+
+  const data = (await response.json()) as { text?: string; error?: string }
+  const text = data.text?.trim() ?? ''
+  if (!text) {
+    throw new Error('Transform returned empty result.')
+  }
+  return text
+}
+
+async function transformViaGroq(
+  systemPrompt: string,
+  userText: string,
+  model: string,
+  temperature: number,
+  signal: AbortSignal,
+): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY
+  if (!apiKey) {
+    throw new Error('GROQ_API_KEY is not set. Add it to .env for local development.')
   }
 
   let response: Response
@@ -49,15 +125,13 @@ export async function transformText(
         temperature,
         max_tokens: 2048,
       }),
-      signal: controller.signal,
+      signal,
     })
   } catch (err) {
     if ((err as Error).name === 'AbortError') {
       throw new Error('Transform aborted.')
     }
     throw new Error('Could not reach Groq. Check your internet connection.')
-  } finally {
-    clearTimeout(timer)
   }
 
   if (!response.ok) {
