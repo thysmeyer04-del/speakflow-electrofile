@@ -1,13 +1,18 @@
 // Overlay renderer: CSS bar-based waveform (canvas avoided — GPU disabled in this app).
 // Five vertical bars animate with audio levels; a thin handle collapses when not hovered.
 
-const SAMPLE_COUNT = 5
-const BAR_MAX_H = 20  // px — fits within the 24px bar container
+const SAMPLE_COUNT = 11
+const BAR_MAX_H = 22  // px — fits within the 26px bar container
 
 const barsEl     = document.getElementById('bars')       as HTMLElement
 const bars        = Array.from(barsEl.querySelectorAll('span')) as HTMLElement[]
 const errorLabel  = document.getElementById('error-label') as HTMLElement
+const statusLabel = document.getElementById('status-label') as HTMLElement
 const displayed   = new Array<number>(SAMPLE_COUNT).fill(0)
+
+function setStatus(text: string): void {
+  if (statusLabel) statusLabel.textContent = text
+}
 
 // ── Audio level state ─────────────────────────────────────────────────────────
 function applyLevels(levels: number[]): void {
@@ -26,7 +31,7 @@ function renderBars(): void {
 }
 
 // ── Idle animation: slow breathing sine, bell-curve base (centre tallest) ────
-const IDLE_BASES = [0.28, 0.52, 0.70, 0.52, 0.28]
+const IDLE_BASES = [0.20, 0.30, 0.42, 0.54, 0.65, 0.70, 0.65, 0.54, 0.42, 0.30, 0.20]
 let idleRaf: number | null = null
 
 function idleTick(): void {
@@ -83,34 +88,45 @@ if (api) {
   api.onRecordingStarting?.(() => {
     document.body.dataset.mode = 'starting'
     document.body.setAttribute('data-recording', '')
+    setStatus('Starting…')
     stopIdleAnim()
   })
 
   api.onRecordingStarted(() => {
     document.body.dataset.mode = 'recording'
     document.body.setAttribute('data-recording', '')
+    setStatus('Listening')
     stopIdleAnim()
   })
 
+  // Recording ended — the clip is now being transcribed. Hold the distinct
+  // 'processing' visual (blue wave + label) until processing-complete fires;
+  // the old 400ms demotion to idle-anim made listening and transcribing
+  // look identical.
   api.onRecordingStopped(() => {
     document.body.dataset.mode = 'processing'
-    setTimeout(() => {
-      if (document.body.dataset.mode === 'processing') {
-        document.body.dataset.mode = 'idle-anim'
-        startIdleAnim()
-      }
-    }, 400)
+    setStatus('Transcribing…')
+    stopIdleAnim()
+  })
+
+  api.onProcessingStarted?.(() => {
+    if (document.body.dataset.mode !== 'processing') {
+      document.body.dataset.mode = 'processing'
+      setStatus('Transcribing…')
+      stopIdleAnim()
+    }
   })
 
   api.onTransformStarting?.(() => {
     document.body.dataset.mode = 'transforming'
     document.body.setAttribute('data-recording', '')
-    setTimeout(() => {
-      if (document.body.dataset.mode === 'transforming') {
-        document.body.dataset.mode = 'idle-anim'
-        startIdleAnim()
-      }
-    }, 400)
+    setStatus('Rewriting…')
+    stopIdleAnim()
+  })
+
+  // Progress messages from main (e.g. one-off local Whisper model download).
+  api.onTranscriptionStatus?.((msg: string) => {
+    if (msg) setStatus(msg)
   })
 
   api.onProcessingComplete(() => {
@@ -119,6 +135,7 @@ if (api) {
     stopIdleAnim()
     document.body.removeAttribute('data-recording')
     delete document.body.dataset.mode
+    setStatus('')
     displayed.fill(0)
     renderBars()
   })
@@ -132,6 +149,7 @@ if (api) {
       document.body.removeAttribute('data-recording')
       delete document.body.dataset.mode
       errorLabel.textContent = ''
+      setStatus('')
       displayed.fill(0)
       renderBars()
     }, 3500)
@@ -151,5 +169,18 @@ if (api) {
   // Settings: hide/show the collapsed handle
   api.onOverlayHandleHidden?.((hidden: boolean) => {
     document.body.toggleAttribute('data-handle-hidden', hidden)
+  })
+
+  // Hotkey: update display label dynamically
+  api.onHotkeyState?.((state: { accelerator: string }) => {
+    const hotkeyLabelEl = document.getElementById('hotkey-label')
+    if (hotkeyLabelEl && state && state.accelerator) {
+      const displayKey = state.accelerator
+        .replace(/\bControl\b/gi, 'Ctrl')
+        .replace(/\bMeta\b/gi, 'Cmd')
+        .replace(/\bCommandOrControl\b/gi, 'Ctrl')
+        .replace(/\bCmdOrCtrl\b/gi, 'Ctrl')
+      hotkeyLabelEl.textContent = `${displayKey} to dictate`
+    }
   })
 }

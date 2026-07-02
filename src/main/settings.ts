@@ -11,10 +11,20 @@ export interface AppSettings {
   muteMusicWhenDictating: boolean
   enableSmartFormatting: boolean
   stripDisfluencies: boolean
+  // 'cloud'  — Groq Whisper API (default; needs internet)
+  // 'local'  — on-device Whisper via @xenova/transformers (works offline;
+  //            falls back to cloud if the local pass fails)
+  transcriptionMode: 'cloud' | 'local'
+  // HuggingFace model id for local mode. Whisper sizes trade speed for
+  // accuracy: Xenova/whisper-tiny < base < small < medium.
+  localWhisperModel: string
+  // Transcribe speech-pause-delimited segments in the background WHILE the
+  // user is still talking, so stop-to-paste latency is only the final tail.
+  streamingTranscription: boolean
 }
 
 const defaults: AppSettings = {
-  hotkey: 'F11',
+  hotkey: 'Control+Shift+Space',
   microphone: 'default',
   language: 'en',
   launchAtLogin: true,
@@ -24,6 +34,9 @@ const defaults: AppSettings = {
   muteMusicWhenDictating: false,
   enableSmartFormatting: true,
   stripDisfluencies: true,
+  transcriptionMode: 'cloud',
+  localWhisperModel: 'Xenova/whisper-medium',
+  streamingTranscription: true,
 }
 
 const store = new Store<AppSettings>({
@@ -32,13 +45,32 @@ const store = new Store<AppSettings>({
   clearInvalidConfig: true,
 })
 
-// Migration: 'Control+Meta' (initial broken default) and 'F12' (often
-// already held on Windows) are upgraded to F11 so the hotkey registers
-// cleanly on first launch.
+// The proven-reliable default. Control+Shift+Space registers cleanly via
+// Electron's globalShortcut and doesn't collide with OS fullscreen/maximize.
+const NEW_DEFAULT = 'Control+Shift+Space'
+
+// Migration: 'Control+Meta' (initial broken default) and 'F12' (often already
+// held on Windows) never registered reliably — upgrade to NEW_DEFAULT.
 const LEGACY_HOTKEYS = new Set(['Control+Meta', 'F12'])
 const persistedHotkey = store.get('hotkey')
 if (typeof persistedHotkey === 'string' && LEGACY_HOTKEYS.has(persistedHotkey)) {
-  store.set('hotkey', 'F11')
+  store.set('hotkey', NEW_DEFAULT)
+}
+
+// One-shot migration off the old F11 default. F11 collides with OS fullscreen
+// and registers unreliably as a global shortcut, so move existing F11 users to
+// NEW_DEFAULT — but only ONCE (guarded by a marker), so anyone who later
+// deliberately re-selects F11 in settings keeps it.
+const F11_MIGRATION_KEY = 'migratedF11Default' as const
+const flexStore = store as unknown as {
+  get(key: string): unknown
+  set(key: string, value: unknown): void
+}
+if (!flexStore.get(F11_MIGRATION_KEY)) {
+  if (store.get('hotkey') === 'F11') {
+    store.set('hotkey', NEW_DEFAULT)
+  }
+  flexStore.set(F11_MIGRATION_KEY, true)
 }
 
 export function getSettings(): AppSettings {

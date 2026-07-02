@@ -18,7 +18,12 @@ import { clipboard, BrowserWindow, NativeImage } from 'electron'
 import log from 'electron-log/main'
 import { getCommand } from './commands-store'
 import { transformText } from './transform-llm'
-import { getRecordingState } from './recording-controller'
+import {
+  getRecordingState,
+  getPendingCommandId,
+  startCommandRecording,
+  stopRecording,
+} from './recording-controller'
 import { captureFocusTarget } from './inject'
 
 type NutKeyboard = typeof import('@nut-tree-fork/nut-js')['keyboard']
@@ -60,6 +65,23 @@ export function runTransform(commandId: string): Promise<void> {
     () => undefined,
   )
   return next
+}
+
+// Command hotkey entry point (Ctrl+Shift+N). Two behaviors:
+//  - Text highlighted → transform the selection in place (classic flow).
+//  - Nothing highlighted → start a dictation; the transcript is run through
+//    the command's prompt before pasting ("speak an email"). Pressing the
+//    same hotkey again stops the dictation.
+export function handleCommandHotkey(commandId: string): Promise<void> {
+  const state = getRecordingState()
+  if (state === 'recording' && getPendingCommandId() === commandId) {
+    return stopRecording()
+  }
+  if (state !== 'idle') {
+    broadcast('recording-busy', state)
+    return Promise.resolve()
+  }
+  return runTransform(commandId)
 }
 
 /** Called by the recording controller when F11 fires mid-transform. */
@@ -120,10 +142,13 @@ async function doRunTransform(commandId: string): Promise<void> {
   await sleep(COPY_SETTLE_MS)
   const selected = clipboard.readText()
 
-  // Empty / unchanged → nothing was highlighted.
+  // Empty / unchanged → nothing was highlighted. Instead of erroring, start
+  // a command dictation: speak, press the hotkey again, and the transcript
+  // is transformed by this command's prompt before pasting.
   if (!selected || selected === originalText) {
-    broadcast('transcription-error', 'Highlight some text first.')
+    log.info(`[transform] no selection — starting "${cmd.name}" dictation`)
     // Original clipboard wasn't actually changed; no restore needed.
+    await startCommandRecording(cmd.id)
     return
   }
 

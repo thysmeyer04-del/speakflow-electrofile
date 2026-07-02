@@ -2,29 +2,31 @@
   <!-- Dark navy background with rounded corners -->
   <rect width="512" height="512" rx="96" ry="96" fill="#0B1220"/>
 
-  <!-- Waveform mark centered in the icon -->
-  <!-- Scaled up from the 100x60 viewBox to ~280x168 centered at 256,256 -->
-  <g transform="translate(116, 172)">
-    <defs>
-      <linearGradient id="waveGrad" x1="0" y1="84" x2="280" y2="84" gradientUnits="userSpaceOnUse">
-        <stop stopColor="#2563EB"/>
-        <stop offset="1" stopColor="#22D3EE"/>
-      </linearGradient>
-    </defs>
+  <defs>
+    <linearGradient id="waveGrad" x1="116" y1="256" x2="396" y2="256" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7BD8FF"/>
+      <stop offset="1" stop-color="#2E9BFF"/>
+    </linearGradient>
+  </defs>
 
-    <!-- Flowing sine waveform (scaled 2.8x from 100x60 original) -->
+  <!-- Waveform mark centered in the icon.
+       NOTE: attributes must be kebab-case (stroke-width, stop-color) — the
+       previous camelCase (strokeWidth) is JSX-only and silently ignored by
+       SVG renderers, which made the icon render as a blank dark square. -->
+  <g transform="translate(116, 172)">
+    <!-- Flowing sine waveform -->
     <path
       d="M14 84 L28 84 M42 84 C42 70, 56 70, 56 84 C56 112, 70 112, 70 84 C70 42, 84 42, 84 84 C84 140, 98 140, 98 84 C98 28, 112 28, 112 84 C112 126, 126 126, 126 84 C126 56, 140 56, 140 84 L168 84"
       stroke="url(#waveGrad)"
-      strokeWidth="16"
-      strokeLinecap="round"
-      strokeLinejoin="round"
+      stroke-width="18"
+      stroke-linecap="round"
+      stroke-linejoin="round"
       fill="none"
     />
 
     <!-- Three horizontal text bars -->
-    <line x1="182" y1="56" x2="238" y2="56" stroke="#22D3EE" strokeWidth="14" strokeLinecap="round"/>
-    <line x1="182" y1="84" x2="266" y2="84" stroke="#22D3EE" strokeWidth="14" strokeLinecap="round"/>
-    <line x1="182" y1="112" x2="224" y2="112" stroke="#22D3EE" strokeWidth="14" strokeLinecap="round"/>
+    <line x1="182" y1="56"  x2="238" y2="56"  stroke="#7BD8FF" stroke-width="16" stroke-linecap="round"/>
+    <line x1="182" y1="84"  x2="266" y2="84"  stroke="#4FB8FF" stroke-width="16" stroke-linecap="round"/>
+    <line x1="182" y1="112" x2="224" y2="112" stroke="#2E9BFF" stroke-width="16" stroke-linecap="round"/>
   </g>
 </svg>

@@ -21,10 +21,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onTransformStarting: (cb: () => void) => on<void>('transform-starting', cb),
   onTranscriptionError: (cb: (msg: string) => void) =>
     on<string>('transcription-error', cb),
+  onTranscriptionStatus: (cb: (msg: string) => void) =>
+    on<string>('transcription-status', cb),
   onAudioLevels: (cb: (levels: number[]) => void) =>
     on<number[]>('audio-levels', cb),
   onOverlayHover: (cb: (hovering: boolean) => void) =>
     on<boolean>('overlay-hover', cb),
   onOverlayHandleHidden: (cb: (hidden: boolean) => void) =>
     on<boolean>('overlay-handle-hidden', cb),
+  onHotkeyState: (cb: (state: any) => void) => on<any>('hotkey-state', cb),
 })

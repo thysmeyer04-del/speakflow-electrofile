@@ -8,7 +8,10 @@
 import log from 'electron-log/main'
 import { transformText } from './transform-llm'
 
-const FORMAT_MODEL = 'llama-3.1-8b-instant'
+// 70B has markedly better judgment on where paragraphs/lists belong than
+// 8b-instant, at ~+0.5s on Groq — the right tradeoff for dictation quality.
+// Override via SPEAKFLOW_FORMAT_MODEL (e.g. back to llama-3.1-8b-instant).
+const FORMAT_MODEL = process.env.SPEAKFLOW_FORMAT_MODEL || 'llama-3.3-70b-versatile'
 
 let currentFormatAbort: AbortController | null = null
 
@@ -21,6 +24,24 @@ interface FormatOptions {
 // short utterances that aren't actually lists.
 const ENUM_CUE = /\b(first(ly)?|second(ly)?|third(ly)?|fourth(ly)?|fifth(ly)?|lastly|finally)\b/i
 const SENTENCE_TERMINATOR = /[.!?]/
+
+// Instant, deterministic filler removal — runs on EVERY dictation (the LLM
+// pass skips short clips, so without this "um, send it tomorrow" keeps its
+// "um"). English-gated by the caller: "um" is a real word in e.g. German.
+// Deliberately short list of unambiguous vocal fillers — anything contextual
+// ("like", "you know") is left to the LLM pass, which can read intent.
+const FILLER_RE = /(?:^|(?<=\s))(?:u+m+|u+h+m?|erm+|hm+|mhm+|a+h+h*)(?=[\s,.!?]|$)[,.]?\s*/gi
+
+export function stripFillerWords(text: string): string {
+  let out = text.replace(FILLER_RE, '')
+  out = out.replace(/\s{2,}/g, ' ')          // collapse doubled spaces
+  out = out.replace(/\s+([,.!?;:])/g, '$1')  // no space before punctuation
+  out = out.replace(/([,.!?])\1+/g, '$1')    // ",," / ".." from adjacent fillers
+  out = out.replace(/^[,.;:\s]+/, '')        // orphaned leading punctuation
+  // Re-capitalize sentence starts that lost their leading filler.
+  out = out.replace(/(^|[.!?]\s+)([a-z])/g, (_m, p: string, c: string) => p + c.toUpperCase())
+  return out.trim()
+}
 
 /** Skip rule: short or structureless utterances don't benefit from a format pass. */
 export function shouldFormat(rawText: string): boolean {
@@ -70,8 +91,8 @@ RULES — follow all of them strictly:
 1. Preserve every word exactly as spoken. Do NOT paraphrase, correct grammar, answer questions, or change vocabulary. Same words, same order${stripDisfluencies ? ' (except filler words covered by rule 8)' : ''}.
 2. Every word in your output MUST come directly from the transcript. You may NOT introduce any word that does not appear in the original text.
 3. If the transcript contains a question, output it as a question — never answer it.
-4. Add a paragraph break (blank line) ONLY when the speaker explicitly says "new paragraph" or "new line", OR when there is a completely obvious topic change (e.g. switching from describing a problem to listing solutions — not just a new sentence or a slight shift). When in doubt, keep it as one paragraph. Err strongly on the side of FEWER breaks.
-5. Format as a numbered or bulleted list ONLY when the speaker clearly enumerates items using explicit cues: "first... second... third...", "one... two... three...", or "next... then... finally..." used to structure discrete steps. Do NOT infer list structure from commas, "and", or loosely related sentences.
+4. Break the text into readable paragraphs (blank line between them): always when the speaker says "new paragraph" or "new line", and otherwise at natural topic shifts — aim for paragraphs of roughly 2-4 sentences in longer dictations. A short dictation on a single point stays one paragraph.
+5. Format as a numbered or bulleted list when the speaker is clearly enumerating discrete items or steps — explicit cues like "first... second... third...", "one... two... three...", "next... then... also... finally", or a run of short parallel items dictated as a list. Do NOT turn an ordinary sentence with commas or "and" into a list.
 6. Remove explicit voice commands from the output after acting on them: "new paragraph", "new line" → break; "bullet point" / "next bullet" → new bullet line.
 7. Output plain text only. No markdown headers, no bold, no italics. Lists use "- " or "1. " prefixes.
 8. Do NOT add any text not in the input: no greetings, sign-offs, summaries, or commentary.

@@ -221,11 +221,15 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
   gatedHandle('migrate:start-wispr-import', () => runWisprMigration())
   gatedHandle('migrate:status', () => ({ running: isWisprMigrationRunning() }))
 
-  // Push initial handle-visibility setting once the overlay renderer is ready
+  // Push initial settings and hotkey state once the overlay renderer is ready
   overlayWindow.webContents.on('did-finish-load', () => {
     if (!overlayWindow.isDestroyed()) {
       const visible = getSettings().overlayHandleVisible
       overlayWindow.webContents.send('overlay-handle-hidden', !visible)
+      const hotkeyResult = getLastRegistrationResult()
+      if (hotkeyResult) {
+        overlayWindow.webContents.send('hotkey-state', hotkeyResult)
+      }
     }
   })
 

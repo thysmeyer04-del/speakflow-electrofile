@@ -1,14 +1,15 @@
 // globalShortcut registration for Transform Commands.
 //
-// Each command has hotkeyNumber 1..9 → registers "Super+Alt+N" on Windows/Linux
-// and "Cmd+Alt+N" on macOS. Uses probe-before-swap so a failed registration
-// (number held by another app — most likely Wispr Flow during migration) leaves
-// previously-registered hotkeys intact and surfaces the failure for the UI.
+// Each command has hotkeyNumber 1..9 → registers "Ctrl+Shift+N" on
+// Windows/Linux and "Cmd+Shift+N" on macOS. Uses probe-before-swap so a
+// failed registration (number held by another app — most likely Wispr Flow
+// during migration) leaves previously-registered hotkeys intact and surfaces
+// the failure for the UI.
 
 import { globalShortcut } from 'electron'
 import log from 'electron-log/main'
 import type { Command } from './commands-store'
-import { runTransform } from './transform-controller'
+import { handleCommandHotkey } from './transform-controller'
 
 const registered = new Map<string, string>() // commandId → accelerator
 
@@ -53,8 +54,8 @@ export function registerCommandHotkeys(
     try {
       const ok = globalShortcut.register(acc, () => {
         log.info(`[commands-hotkey] ${acc} fired → ${cmd.name}`)
-        void runTransform(cmd.id).catch((err) =>
-          log.error('[commands-hotkey] runTransform threw', err),
+        void handleCommandHotkey(cmd.id).catch((err) =>
+          log.error('[commands-hotkey] handleCommandHotkey threw', err),
         )
       })
       if (!ok) {

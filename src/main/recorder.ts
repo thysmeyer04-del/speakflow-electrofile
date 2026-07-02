@@ -8,8 +8,28 @@ const READY_TIMEOUT_MS = 8_000
 const START_TIMEOUT_MS = 5_000
 const STOP_TIMEOUT_MS = 10_000
 
-interface StartPayload { microphoneId: string }
-interface BlobPayload { buffer: ArrayBuffer; mimeType: string }
+interface StartPayload { microphoneId: string; streaming?: boolean }
+interface BlobPayload { buffer: ArrayBuffer; mimeType: string; pcm?: ArrayBuffer | null }
+interface PartialSegmentPayload {
+  index: number
+  buffer: ArrayBuffer
+  mimeType: string
+  pcm?: ArrayBuffer | null
+}
+
+// A pause-delimited slice of an in-progress recording (streaming mode).
+export interface PartialSegment {
+  index: number
+  audio: Buffer
+  pcm: Float32Array | null
+}
+
+export interface RecorderResult {
+  audio: Buffer
+  // 16 kHz mono Float32 PCM decoded by the renderer — input for on-device
+  // Whisper. Null when decode failed or the clip was dropped (silence/short).
+  pcm: Float32Array | null
+}
 
 let recorderWindow: BrowserWindow | null = null
 let readyPromise: Promise<void> | null = null
@@ -17,6 +37,7 @@ let readyResolved = false
 let expectingClose = false
 let crashHandlers: Array<(reason: string) => void> = []
 let autoStopHandlers: Array<() => void> = []
+let partialSegmentHandlers: Array<(seg: PartialSegment) => void> = []
 // Where to forward live audio levels. Set once at startup by main.ts.
 let levelTargetWindow: BrowserWindow | null = null
 
@@ -26,7 +47,7 @@ interface PendingStart {
   timer: NodeJS.Timeout
 }
 interface PendingStop {
-  resolve: (buf: Buffer) => void
+  resolve: (result: RecorderResult) => void
   reject: (err: Error) => void
   timer: NodeJS.Timeout
 }
@@ -133,6 +154,13 @@ export function onAutoStop(cb: () => void): () => void {
   }
 }
 
+export function onPartialSegment(cb: (seg: PartialSegment) => void): () => void {
+  partialSegmentHandlers.push(cb)
+  return () => {
+    partialSegmentHandlers = partialSegmentHandlers.filter((h) => h !== cb)
+  }
+}
+
 /** Where to forward live audio levels — typically the overlay window. */
 export function setLevelTargetWindow(win: BrowserWindow | null): void {
   levelTargetWindow = win
@@ -180,11 +208,11 @@ export async function startRecorderSession(opts: StartPayload): Promise<void> {
   })
 }
 
-export async function stopRecorderSession(): Promise<Buffer> {
+export async function stopRecorderSession(): Promise<RecorderResult> {
   if (!recorderWindow) throw new Error('recorder-missing')
   if (pendingStop) throw new Error('stop-already-pending')
 
-  return new Promise<Buffer>((resolve, reject) => {
+  return new Promise<RecorderResult>((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingStop = null
       reject(new Error('stop-timeout'))
@@ -244,8 +272,12 @@ function registerHandlers() {
       const stop = pendingStop
       try {
         const buf = Buffer.from(payload.buffer)
+        const pcm =
+          payload.pcm && payload.pcm.byteLength > 0
+            ? new Float32Array(payload.pcm)
+            : null
         clearTimeout(stop.timer)
-        stop.resolve(buf)
+        stop.resolve({ audio: buf, pcm })
         pendingStop = null
         return { ok: true }
       } catch (err) {
@@ -256,6 +288,30 @@ function registerHandlers() {
       }
     },
   )
+
+  ipcMain.on('recorder:partial-segment', (event, payload: PartialSegmentPayload) => {
+    if (!isFromRecorder(event)) return
+    if (!payload || typeof payload.index !== 'number' || !Number.isInteger(payload.index)) return
+    if (payload.index < 0 || payload.index > 10_000) return
+    if (!(payload.buffer instanceof ArrayBuffer) || payload.buffer.byteLength === 0) return
+    let seg: PartialSegment
+    try {
+      seg = {
+        index: payload.index,
+        audio: Buffer.from(payload.buffer),
+        pcm:
+          payload.pcm instanceof ArrayBuffer && payload.pcm.byteLength > 0
+            ? new Float32Array(payload.pcm)
+            : null,
+      }
+    } catch (err) {
+      log.warn('[recorder] partial-segment decode failed', err)
+      return
+    }
+    partialSegmentHandlers.forEach((h) => {
+      try { h(seg) } catch (err) { log.warn('partialSegment handler threw', err) }
+    })
+  })
 
   ipcMain.on('recorder:auto-stop', (event) => {
     if (!isFromRecorder(event)) return

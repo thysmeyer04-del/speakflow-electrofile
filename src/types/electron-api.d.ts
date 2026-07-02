@@ -33,10 +33,12 @@ declare global {
     onProcessingComplete: (cb: () => void) => () => void
     onTranscriptionComplete: (cb: (text: string) => void) => () => void
     onTranscriptionError: (cb: (message: string) => void) => () => void
+    onTranscriptionStatus?: (cb: (message: string) => void) => () => void
     onTransformStarting?: (cb: () => void) => () => void
     onAudioLevels?: (cb: (levels: number[]) => void) => () => void
     onOverlayHover?: (cb: (hovering: boolean) => void) => () => void
     onOverlayHandleHidden?: (cb: (hidden: boolean) => void) => () => void
+    onHotkeyState?: (cb: (state: { accelerator: string }) => void) => () => void
     onNavigateTo: (cb: (route: string) => void) => () => void
     onUpdateAvailable: (cb: (version: string) => void) => () => void
 

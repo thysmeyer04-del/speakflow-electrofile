@@ -12,7 +12,7 @@ app.commandLine.appendSwitch('no-sandbox')
 import path from 'path'
 import log from 'electron-log/main'
 import { setupTray, setTrayRecording, selfCheckTrayAssets } from './tray'
-import { registerHotkey, unregisterHotkey } from './hotkey'
+import { registerHotkey, unregisterHotkey, reassertHotkey } from './hotkey'
 import { initCommandsStore, getCommands } from './commands-store'
 import {
   registerCommandHotkeys,
@@ -23,6 +23,7 @@ import { setupAutoUpdater } from './updater'
 import { requestStartupPermissions } from './permissions'
 import { getSettings } from './settings'
 import { initRecorder, destroyRecorder, setLevelTargetWindow, warmupRecorderMic } from './recorder'
+import { warmupLocalWhisper } from './local-whisper'
 import { shutdownRecording } from './recording-controller'
 import { isQuitting, markQuitting } from './quit-state'
 import { configureSecurity, isExternalUrlAllowed, isOriginTrusted } from './security'
@@ -289,6 +290,25 @@ function createOverlayWindow(): BrowserWindow {
 
   win.setIgnoreMouseEvents(true)
 
+  // 'screen-saver' is the highest standard always-on-top level — it keeps the
+  // pill above maximized/fullscreen apps instead of sinking behind them, which
+  // the default alwaysOnTop:true level does not guarantee on Windows.
+  win.setAlwaysOnTop(true, 'screen-saver')
+  // Keep it visible even when another app goes fullscreen, and across virtual
+  // desktops, so the user never loses sight of the listening indicator.
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+
+  // Re-assert top-most periodically. setPosition (on monitor switch) and
+  // foreground fullscreen transitions can quietly demote the window's z-order;
+  // re-applying the level every 2 s pulls it back to the front. Cheap no-op
+  // when it's already on top.
+  const topMostKeepAlive = setInterval(() => {
+    if (win.isDestroyed()) { clearInterval(topMostKeepAlive); return }
+    win.setAlwaysOnTop(true, 'screen-saver')
+    if (!win.isVisible()) win.showInactive()
+  }, 2_000)
+  win.on('closed', () => clearInterval(topMostKeepAlive))
+
   if (process.env.NODE_ENV === 'development') {
     win.webContents.on('console-message', (_e, level, message, line, src) => {
       const lvl = ['debug', 'info', 'warn', 'error'][level] ?? 'info'
@@ -337,6 +357,8 @@ function createOverlayWindow(): BrowserWindow {
       trackedDisplayId = display.id
       const { x, y, width: dw, height: dh } = display.workArea
       win.setPosition(Math.floor(x + dw / 2 - 240), Math.floor(y + dh - 50))
+      // setPosition can demote z-order on Windows — re-assert top-most.
+      win.setAlwaysOnTop(true, 'screen-saver')
     }
 
     // Hover detection: only trigger when cursor is over the 56px handle,
@@ -405,6 +427,14 @@ app.whenReady().then(async () => {
     if (overlayWindow && !overlayWindow.isDestroyed() && !overlayWindow.isVisible()) {
       overlayWindow.showInactive()
     }
+    // Sleep/wake can silently drop a global shortcut on Windows — reclaim F11.
+    reassertHotkey()
+  })
+
+  // Foreground app changes can leave another process holding our hotkey; every
+  // time our own window regains focus, re-assert ownership of the preferred key.
+  app.on('browser-window-focus', () => {
+    reassertHotkey()
   })
 
   selfCheckTrayAssets()
@@ -419,6 +449,18 @@ app.whenReady().then(async () => {
   // Warm up the mic stream ~2 s after launch so the recorder window is ready.
   // First F11 press then skips getUserMedia entirely — near-zero start latency.
   setTimeout(() => warmupRecorderMic(getSettings().microphone ?? 'default'), 2000)
+  // On-device Whisper: preload the model (downloads it on very first run) so
+  // the first dictation isn't hit by model-load latency. Deferred 5 s to keep
+  // startup snappy; fire-and-forget.
+  setTimeout(() => {
+    const s = getSettings()
+    const mode = process.env.SPEAKFLOW_TRANSCRIPTION_MODE || s.transcriptionMode
+    if (mode === 'local') {
+      warmupLocalWhisper(
+        process.env.SPEAKFLOW_LOCAL_WHISPER_MODEL || s.localWhisperModel,
+      )
+    }
+  }, 5000)
   registerHotkey(getSettings().hotkey)
   initCommandsStore()
   registerCommandHotkeys(getCommands())

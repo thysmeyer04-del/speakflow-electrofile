@@ -1,8 +1,9 @@
 // electron-store wrapper for user-defined Transform commands.
 //
 // A Command is a hotkey-triggered LLM transform: highlight text → press
-// Win+Alt+N (Cmd+Alt+N on macOS) → text replaced by the LLM's rewrite using
-// `prompt` as the system message.
+// Ctrl+Shift+N (Cmd+Shift+N on macOS) → text replaced by the LLM's rewrite
+// using `prompt` as the system message. With nothing highlighted, the same
+// hotkey starts a dictation whose transcript is fed through the prompt.
 //
 // Seeded defaults: Email (1), Prompt Engineer (2). User may edit, add up to
 // hotkey number 9, or reset.

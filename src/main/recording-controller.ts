@@ -15,6 +15,7 @@ import {
   stopRecorderSession,
   onRecorderCrash,
   onAutoStop,
+  onPartialSegment,
 } from './recorder'
 import { transcribeAudio } from './transcribe'
 import { syncToKnowledgeBase } from './supabase'
@@ -27,8 +28,11 @@ import {
   formatTranscript,
   shouldFormat,
   sanityCheck,
+  stripFillerWords,
   abortInFlightFormat,
 } from './format-transcript'
+import { getCommand } from './commands-store'
+import { transformText } from './transform-llm'
 
 export type RecordingState =
   | 'idle'
@@ -47,6 +51,109 @@ let focusTarget: WindowSnapshot | null = null
 // Monotonic session id — increments on every start AND on every crash so a
 // stale async path can detect "this isn't my session" and bail out.
 let sessionId = 0
+// Set when the recording was started by a command hotkey (Ctrl+Shift+N with
+// nothing highlighted): the transcript is run through that command's LLM
+// prompt instead of being pasted verbatim.
+let pendingCommandId: string | null = null
+
+export function getPendingCommandId(): string | null {
+  return pendingCommandId
+}
+
+// ── Streaming transcription ────────────────────────────────────────────────
+// While the user is still talking, the recorder ships pause-delimited audio
+// segments; each is transcribed here in the background. At stop time only
+// the final tail still needs transcribing, then all texts join in order.
+interface SegmentJob {
+  audio: Buffer
+  pcm: Float32Array | null
+  promise: Promise<string>
+  failed: boolean
+}
+let segments: Array<SegmentJob | undefined> = []
+// Language captured at doStart so background segment jobs and the tail all
+// use the same setting even if the user changes it mid-recording.
+let sessionLanguage: string | undefined
+
+onPartialSegment(({ index, audio, pcm }) => {
+  if (state !== 'recording' && state !== 'stopping') {
+    log.warn(`[recording] partial segment ${index} ignored (state=${state})`)
+    return
+  }
+  const job: SegmentJob = { audio, pcm, failed: false, promise: Promise.resolve('') }
+  job.promise = transcribeAudio(audio, { language: sessionLanguage, pcm }).catch((err) => {
+    log.warn(`[recording] segment ${index} failed — will retry at stop`, err)
+    job.failed = true
+    return ''
+  })
+  segments[index] = job
+  log.info(`[recording] segment ${index} (${audio.byteLength}B) transcribing in background`)
+})
+
+/** Transcribe the session's audio: single-shot when no partials were
+ *  streamed, otherwise await the background jobs and join in order. */
+async function transcribeSessionAudio(
+  finalBuffer: Buffer,
+  finalPcm: Float32Array | null,
+  lang: string | undefined,
+): Promise<string> {
+  const partials = segments
+  segments = []
+  if (partials.length === 0) {
+    return transcribeAudio(finalBuffer, { language: lang, pcm: finalPcm })
+  }
+
+  const t0 = Date.now()
+  // Kick the tail off in parallel with any still-running partials.
+  const tailPromise =
+    finalBuffer.byteLength > 0
+      ? transcribeAudio(finalBuffer, { language: lang, pcm: finalPcm })
+      : Promise.resolve('')
+
+  const parts: string[] = []
+  let salvageError: Error | null = null
+  for (let i = 0; i < partials.length; i++) {
+    const job = partials[i]
+    if (!job) continue
+    let text = await job.promise
+    if (job.failed) {
+      try {
+        text = await transcribeAudio(job.audio, { language: lang, pcm: job.pcm })
+      } catch (err) {
+        // Keep the rest of the dictation — losing one segment beats losing all.
+        salvageError = err as Error
+        text = ''
+        log.error(`[recording] segment ${i} failed permanently — skipping`, err)
+      }
+    }
+    parts.push(text)
+  }
+  parts.push(await tailPromise)
+
+  const joined = parts.map((p) => p.trim()).filter(Boolean).join(' ')
+  log.info(`[timing] streaming join: ${partials.length} partial(s) + tail ready in ${Date.now() - t0}ms after stop`)
+  if (salvageError) {
+    if (!joined) throw salvageError
+    broadcast('transcription-error', 'A part of the dictation could not be transcribed.')
+  }
+  return joined
+}
+
+/** Start a dictation whose transcript will be transformed by `commandId`'s
+ *  prompt (e.g. spoken rough notes → composed email) before pasting. */
+export function startCommandRecording(commandId: string): Promise<void> {
+  return enqueue(async () => {
+    if (state !== 'idle') {
+      broadcast('recording-busy', state)
+      return
+    }
+    await doStart()
+    // Only arm the command if the recorder actually started (doStart resets
+    // pendingCommandId, so set it after). getRecordingState() rather than a
+    // direct read: TS narrows `state` to 'idle' across the await otherwise.
+    if (getRecordingState() === 'recording') pendingCommandId = commandId
+  })
+}
 
 export function getRecordingState(): RecordingState {
   return state
@@ -90,6 +197,8 @@ onRecorderCrash((reason) => {
     broadcast('transcription-error', 'Recorder crashed — please try again.')
     broadcast('processing-complete')
     focusTarget = null
+    pendingCommandId = null
+    segments = []
     setState('idle')
   })
 })
@@ -163,9 +272,14 @@ async function doStart(): Promise<void> {
   // Same for an in-flight smart-formatting pass on a prior transcription.
   abortInFlightFormat()
   const mySession = ++sessionId
+  // A plain F11 dictation must never inherit a command from a previous
+  // session; startCommandRecording re-arms this after doStart returns.
+  pendingCommandId = null
+  segments = []
   setState('starting')
 
   const settings = getSettings()
+  sessionLanguage = settings.language === 'auto' ? undefined : settings.language
   // Tell the overlay to appear immediately — don't wait for the recorder
   // ACK. The overlay will show "Starting…" until 'recording-started' fires.
   // Suppress entirely if the user disabled the overlay in settings.
@@ -188,7 +302,10 @@ async function doStart(): Promise<void> {
   // Note: startRecorderSession lazy-inits the recorder window if it isn't
   // already up, so we don't reject on isRecorderHealthy() === false here.
   try {
-    await startRecorderSession({ microphoneId: settings.microphone })
+    await startRecorderSession({
+      microphoneId: settings.microphone,
+      streaming: settings.streamingTranscription,
+    })
   } catch (err) {
     const msg = (err as Error).message
     log.error('[recording] start failed', err)
@@ -219,9 +336,12 @@ async function doStop(): Promise<void> {
   if (settings.dictationSounds) playSound('stop')
 
   let audioBuffer: Buffer | null = null
+  let audioPcm: Float32Array | null = null
   try {
-    audioBuffer = await stopRecorderSession()
-    log.info(`[timing] audio blob received at +${Date.now() - t0}ms (${audioBuffer?.byteLength ?? 0} bytes)`)
+    const result = await stopRecorderSession()
+    audioBuffer = result.audio
+    audioPcm = result.pcm
+    log.info(`[timing] audio blob received at +${Date.now() - t0}ms (${audioBuffer?.byteLength ?? 0} bytes, pcm=${audioPcm ? audioPcm.length : 0} samples)`)
   } catch (err) {
     log.error('[recording] stop failed', err)
     if (mySession !== sessionId) return
@@ -241,14 +361,16 @@ async function doStop(): Promise<void> {
   broadcast('processing-started')
   log.info(`[timing] processing-started at +${Date.now() - t0}ms`)
 
-  if (!audioBuffer || audioBuffer.byteLength === 0) {
+  // Empty tail is only a no-op when streaming didn't already deliver
+  // partial segments — otherwise those still carry the dictation.
+  if ((!audioBuffer || audioBuffer.byteLength === 0) && segments.length === 0) {
     broadcast('processing-complete')
     focusTarget = null
     setState('idle')
     return
   }
 
-  await processAudio(audioBuffer, settings.language, mySession)
+  await processAudio(audioBuffer ?? Buffer.alloc(0), audioPcm, settings.language, mySession)
 }
 
 // Collapse Whisper hallucination loops — e.g. "word word word word" or
@@ -275,12 +397,17 @@ function collapseRepetitions(text: string): string {
   return words.join(' ')
 }
 
-async function processAudio(buffer: Buffer, language: string, mySession: number): Promise<void> {
+async function processAudio(
+  buffer: Buffer,
+  pcm: Float32Array | null,
+  language: string,
+  mySession: number,
+): Promise<void> {
   try {
     // Pass buffer directly — no disk round-trip. Previously we wrote a temp
     // file then transcribe.ts stat+read it back, wasting ~30-50 ms.
     const lang = language === 'auto' ? undefined : language
-    const text = await transcribeAudio(buffer, { language: lang })
+    const text = await transcribeSessionAudio(buffer, pcm, lang)
 
     if (mySession !== sessionId) {
       log.info('[recording] processAudio abandoned — session invalidated (sign-out or crash)')
@@ -295,15 +422,45 @@ async function processAudio(buffer: Buffer, language: string, mySession: number)
         broadcast('transcription-error', 'No speech detected — try speaking louder or closer to the mic')
       }
     } else if (text.trim()) {
-      const rawTrimmed = collapseRepetitions(text.trim())
+      // Re-read settings live so a mid-recording toggle is honored.
+      const liveSettings = getSettings()
+      let rawTrimmed = collapseRepetitions(text.trim())
+      // Instant filler removal (um/uh/ah) on EVERY clip — the LLM pass below
+      // skips short dictations, so this is what keeps a 10-word sentence
+      // clean. English-only: "um" is a real word in other languages.
+      if (liveSettings.stripDisfluencies && language.startsWith('en')) {
+        rawTrimmed = stripFillerWords(rawTrimmed)
+      }
       let trimmed = rawTrimmed
 
+      // Command dictation (Ctrl+Shift+N with nothing highlighted): run the
+      // transcript through the command's prompt — e.g. spoken rough notes
+      // become a composed email. Fail-open to the raw transcript.
+      const commandId = pendingCommandId
+      pendingCommandId = null
+      const command = commandId ? getCommand(commandId) : undefined
+      if (command) {
+        broadcast('transform-starting')
+        try {
+          const transformed = await transformText(command.prompt, rawTrimmed, command.model)
+          if (mySession !== sessionId) {
+            log.info('[recording] command result discarded — session invalidated')
+            return
+          }
+          trimmed = transformed
+        } catch (err) {
+          log.warn(`[recording] command "${command.name}" failed — pasting raw transcript`, err)
+          if (mySession !== sessionId) return
+          broadcast('transcription-error', `${command.name} failed — pasted the raw transcript instead.`)
+        }
+      }
+
       // Smart-formatting pass: a second LLM call structures the flat Whisper
-      // output into paragraphs / lists. Re-read settings live so a mid-recording
-      // toggle is honored. Fail-open: any error or aborted call falls back to
-      // the raw text — the user must never lose their dictation here.
-      const liveSettings = getSettings()
-      if (liveSettings.enableSmartFormatting && shouldFormat(rawTrimmed)) {
+      // output into paragraphs / lists. Skipped for command dictations — the
+      // command's LLM output is already structured. Fail-open: any error or
+      // aborted call falls back to the raw text — the user must never lose
+      // their dictation here.
+      if (!command && liveSettings.enableSmartFormatting && shouldFormat(rawTrimmed)) {
         try {
           const formatted = await formatTranscript(rawTrimmed, {
             stripDisfluencies: liveSettings.stripDisfluencies,
@@ -393,6 +550,8 @@ export function abortInFlightRecording(reason: string): void {
     broadcast('recording-stopped')
     broadcast('processing-complete')
     focusTarget = null
+    pendingCommandId = null
+    segments = []
     setState('idle')
   })
 }
@@ -442,6 +601,8 @@ export async function shutdownRecording(): Promise<void> {
     }
   } finally {
     focusTarget = null
+    pendingCommandId = null
+    segments = []
     setState('idle')
   }
 }

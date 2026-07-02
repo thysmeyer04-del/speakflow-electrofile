@@ -6,6 +6,12 @@ directories:
   output: dist-electron
   buildResources: build
 
+# All native production deps (@nut-tree-fork, onnxruntime-node) ship prebuilt
+# N-API binaries that are ABI-stable across Electron versions — no rebuild
+# needed. Rebuilding also breaks here: node-gyp chokes on the space in the
+# project path and on locked artifacts (sharp).
+npmRebuild: false
+
 files:
   - dist/**/*
   - assets/**/*
@@ -47,9 +53,16 @@ win:
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
-  createDesktopShortcut: true
+  # "always" recreates the desktop shortcut on every update, not just first install.
+  createDesktopShortcut: always
   createStartMenuShortcut: true
   shortcutName: Speakflow
+  # Launch Speakflow immediately when the installer finishes — the user should
+  # never wonder "where do I open it from" after downloading.
+  runAfterFinish: true
+  installerIcon: assets/icon.ico
+  uninstallerIcon: assets/icon.ico
+  menuCategory: false
 
 linux:
   icon: assets/icon.png

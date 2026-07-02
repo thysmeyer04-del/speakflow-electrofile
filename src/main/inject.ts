@@ -50,6 +50,12 @@ function loadNut(): boolean {
 // post-paste perceived delay.
 const PASTE_SETTLE_MS = 120
 const KEYSTROKE_LIMIT = 100
+// After releasing stray modifier keys, give the OS a beat to register the
+// key-up events before we synthesize type()/Ctrl+V. Without this, the paste
+// can still be interpreted with the modifier active. 60 ms is a safe margin
+// on loaded systems (a native GetAsyncKeyState poll would be more precise but
+// needs a native addon — overkill here). Negligible vs the transcription RTT.
+const MODIFIER_RELEASE_SETTLE_MS = 60
 
 // Process-wide mutex — clipboard injection cannot interleave.
 let injectionInFlight: Promise<unknown> = Promise.resolve()
@@ -222,6 +228,12 @@ async function doInject(
     )
   }
 
+  // The recording hotkey may include modifiers (e.g. Ctrl+Shift+Space). If the
+  // user is still holding them when we synthesize keystrokes, every typed char
+  // becomes Ctrl+Shift+<char> (and Ctrl+V becomes Ctrl+Shift+V) — so nothing
+  // lands. Proactively release stray modifiers first.
+  await clearStrayModifiers()
+
   if (text.length <= KEYSTROKE_LIMIT && isPureAscii(text)) {
     try {
       await nutKeyboard!.type(text)
@@ -288,6 +300,34 @@ async function injectViaClipboard(text: string): Promise<InjectionResult> {
     return { ok: false, method: 'clipboard', error: 'paste-failed' }
   }
   return { ok: true, method: 'clipboard' }
+}
+
+/**
+ * Send key-up for every modifier so a still-held recording hotkey (e.g.
+ * Ctrl+Shift+Space) doesn't combine with the keystrokes we're about to
+ * synthesize. Best-effort: each release is guarded, and we settle briefly so
+ * the OS processes the key-ups before the subsequent type()/Ctrl+V.
+ */
+async function clearStrayModifiers(): Promise<void> {
+  if (!nutKeyboard || !nutKey) return
+  const modifiers = [
+    nutKey.LeftControl,
+    nutKey.RightControl,
+    nutKey.LeftShift,
+    nutKey.RightShift,
+    nutKey.LeftAlt,
+    nutKey.RightAlt,
+    nutKey.LeftSuper,
+    nutKey.RightSuper,
+  ]
+  for (const m of modifiers) {
+    try {
+      await nutKeyboard.releaseKey(m)
+    } catch {
+      // A modifier that wasn't down can throw on some backends — ignore.
+    }
+  }
+  await sleep(MODIFIER_RELEASE_SETTLE_MS)
 }
 
 function isPureAscii(text: string): boolean {

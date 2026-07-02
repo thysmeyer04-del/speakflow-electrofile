@@ -7,6 +7,14 @@ import { toggleRecording } from './recording-controller'
 const SAFE_FALLBACK = 'Control+Shift+Space'
 
 let currentAccelerator: string | null = null
+// The accelerator the user actually wants (e.g. F11). The watchdog keeps
+// trying to (re)claim THIS even if we're temporarily parked on the fallback.
+let preferredAccelerator: string | null = null
+let watchdogTimer: NodeJS.Timeout | null = null
+// How often the watchdog re-attempts to claim the preferred accelerator while
+// we're stuck on the fallback (or have nothing). 3 s is responsive without
+// hammering the OS.
+const WATCHDOG_INTERVAL_MS = 3_000
 let lastRegistrationResult: {
   accelerator: string
   ok: boolean
@@ -17,8 +25,14 @@ let lastRegistrationResult: {
  * Probe-before-swap: register the candidate FIRST, and only unregister the
  * previously active accelerator after the new one is confirmed. If both
  * preferred and fallback fail, the previously working hotkey is preserved.
+ *
+ * Also remembers the preferred accelerator and starts a watchdog so that, if
+ * we had to park on the fallback (or another app momentarily held the key),
+ * we keep trying to reclaim the preferred one instead of silently giving up.
  */
 export function registerHotkey(preferred: string): boolean {
+  preferredAccelerator = preferred
+  startWatchdog()
   const result = tryRegisterCandidate(preferred)
     ?? (preferred !== SAFE_FALLBACK ? tryRegisterCandidate(SAFE_FALLBACK) : null)
 
@@ -113,6 +127,8 @@ function tryRegisterCandidate(acc: string): string | null {
 }
 
 export function unregisterHotkey(): void {
+  stopWatchdog()
+  preferredAccelerator = null
   if (currentAccelerator) {
     try {
       globalShortcut.unregister(currentAccelerator)
@@ -121,6 +137,74 @@ export function unregisterHotkey(): void {
     }
     currentAccelerator = null
   }
+}
+
+/**
+ * Watchdog: while the active hotkey isn't the preferred one (we're parked on
+ * the fallback, or have nothing), keep retrying the preferred accelerator so
+ * we reclaim it the instant the conflicting app releases it. Also catches the
+ * case where the OS silently drops our registration (sleep/wake, fast user
+ * switch) — if the active accelerator is no longer actually registered, we
+ * re-register it.
+ */
+function startWatchdog(): void {
+  if (watchdogTimer) return
+  watchdogTimer = setInterval(() => {
+    if (!preferredAccelerator) return
+
+    // Already on the preferred key AND it's still actually held — nothing to do.
+    if (currentAccelerator === preferredAccelerator && safeIsRegistered(preferredAccelerator)) {
+      return
+    }
+
+    // Either we're on the fallback, or our registration got dropped. Re-run the
+    // full probe-and-swap against the preferred accelerator.
+    log.info(`[hotkey] watchdog reclaiming preferred "${preferredAccelerator}" (active=${currentAccelerator})`)
+    reclaimPreferred()
+  }, WATCHDOG_INTERVAL_MS)
+  // Don't keep the event loop alive just for the watchdog.
+  watchdogTimer.unref?.()
+}
+
+function stopWatchdog(): void {
+  if (watchdogTimer) {
+    clearInterval(watchdogTimer)
+    watchdogTimer = null
+  }
+}
+
+/** Re-run registration of the preferred accelerator (used by the watchdog and
+ *  by reassertHotkey on focus/resume). Reuses the same probe-before-swap path. */
+function reclaimPreferred(): void {
+  if (!preferredAccelerator) return
+  const result = tryRegisterCandidate(preferredAccelerator)
+  if (!result) return // still held by something else; try again next tick
+
+  const previous = currentAccelerator
+  currentAccelerator = result
+  if (previous && previous !== result) {
+    try {
+      globalShortcut.unregister(previous)
+    } catch {
+      // best effort — the new key is already active
+    }
+  }
+  lastRegistrationResult = { accelerator: result, ok: true, fellBackFrom: null }
+  log.info(`[hotkey] reclaimed preferred hotkey: ${result}`)
+  broadcastHotkeyState()
+}
+
+/**
+ * Re-assert the hotkey after events that can quietly invalidate a global
+ * shortcut on Windows (window focus changes, power resume, fast user switch).
+ * Cheap to call often — it no-ops when the preferred key is already held.
+ */
+export function reassertHotkey(): void {
+  if (!preferredAccelerator) return
+  if (currentAccelerator === preferredAccelerator && safeIsRegistered(preferredAccelerator)) {
+    return
+  }
+  reclaimPreferred()
 }
 
 export function updateHotkey(newAccelerator: string): boolean {

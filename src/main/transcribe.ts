@@ -1,17 +1,22 @@
 import log from 'electron-log/main'
 import { getAuthToken } from './ipc'
 import { isProxyUrlAllowed } from './security'
+import { getSettings } from './settings'
+import { transcribeLocal, isLocalModelCached } from './local-whisper'
 
 const GROQ_TRANSCRIPTIONS_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
-// Turbo is ~3x faster than whisper-large-v3 with marginal accuracy tradeoff.
-// Override via SPEAKFLOW_WHISPER_MODEL if you want the full model.
-const WHISPER_MODEL = process.env.SPEAKFLOW_WHISPER_MODEL || 'whisper-large-v3'
+// Turbo is ~3x faster than whisper-large-v3 with marginal accuracy tradeoff —
+// the right default for dictation latency. Override via SPEAKFLOW_WHISPER_MODEL
+// to get the full model back.
+const WHISPER_MODEL = process.env.SPEAKFLOW_WHISPER_MODEL || 'whisper-large-v3-turbo'
 const MAX_BYTES = 25 * 1024 * 1024 // Groq hard limit
 const REQUEST_TIMEOUT_MS = 60_000
 const AUDIO_FILENAME = 'audio.webm'
 
 interface TranscribeOptions {
   language?: string
+  // 16 kHz mono PCM from the recorder — enables the on-device Whisper path.
+  pcm?: Float32Array | null
 }
 
 export async function transcribeAudio(
@@ -19,6 +24,47 @@ export async function transcribeAudio(
   opts: TranscribeOptions = {},
 ): Promise<string> {
   if (audio.byteLength === 0) return ''
+
+  const settings = getSettings()
+  const mode = process.env.SPEAKFLOW_TRANSCRIPTION_MODE || settings.transcriptionMode
+  const localModel =
+    process.env.SPEAKFLOW_LOCAL_WHISPER_MODEL || settings.localWhisperModel
+
+  if (mode === 'local' && opts.pcm && opts.pcm.length > 0) {
+    const t0 = Date.now()
+    try {
+      const text = await transcribeLocal(opts.pcm, localModel, {
+        language: opts.language,
+      })
+      log.info(`[timing] transcription path=local took ${Date.now() - t0}ms`)
+      return text
+    } catch (err) {
+      log.warn('[transcribe] local whisper failed — falling back to cloud', err)
+    }
+  }
+
+  const t0 = Date.now()
+  try {
+    const text = await transcribeViaCloud(audio, opts)
+    log.info(`[timing] transcription path=cloud took ${Date.now() - t0}ms`)
+    return text
+  } catch (err) {
+    // Offline resilience: if the cloud is unreachable and the local model is
+    // already on disk, transcribe on-device instead of failing the dictation.
+    const msg = (err as Error).message
+    const networkFail = msg.includes('Could not reach') || msg.toLowerCase().includes('timeout')
+    if (networkFail && opts.pcm && opts.pcm.length > 0 && isLocalModelCached(localModel)) {
+      log.warn('[transcribe] cloud unreachable — falling back to local whisper')
+      return transcribeLocal(opts.pcm, localModel, { language: opts.language })
+    }
+    throw err
+  }
+}
+
+async function transcribeViaCloud(
+  audio: Buffer,
+  opts: TranscribeOptions,
+): Promise<string> {
   if (audio.byteLength > MAX_BYTES) {
     throw new Error('Recording exceeds the 25 MB Groq limit. Try a shorter clip.')
   }
