@@ -15,6 +15,26 @@ export function getProxyBaseUrl(): string | undefined {
   return process.env.SPEAKFLOW_API_URL || (app.isPackaged ? PRODUCTION_PROXY : undefined)
 }
 
+// Keep the serverless proxy warm: an idle Vercel function adds a 1-3s
+// cold-start to the FIRST dictation after a quiet period — the single
+// biggest avoidable latency spike in the packaged app. A GET returns 405
+// from inside the lambda, which is exactly enough to keep it hot.
+const KEEPALIVE_INTERVAL_MS = 4 * 60_000
+let keepAliveTimer: NodeJS.Timeout | null = null
+
+export function startProxyKeepAlive(): void {
+  const base = getProxyBaseUrl()
+  if (!base || keepAliveTimer) return
+  const ping = (): void => {
+    fetch(base.replace(/\/+$/, '') + '/transcribe', { method: 'GET' }).catch(() => undefined)
+  }
+  ping()
+  keepAliveTimer = setInterval(ping, KEEPALIVE_INTERVAL_MS)
+  // Don't let the keep-alive keep the process alive at quit.
+  keepAliveTimer.unref?.()
+  log.info('[transcribe] proxy keep-alive started')
+}
+
 const GROQ_TRANSCRIPTIONS_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
 // Turbo is ~3x faster than whisper-large-v3 with marginal accuracy tradeoff —
 // the right default for dictation latency. Override via SPEAKFLOW_WHISPER_MODEL
