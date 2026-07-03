@@ -1,54 +1,46 @@
-// On-device Whisper transcription via @xenova/transformers (ONNX, CPU).
+// On-device Whisper transcription — parent-side manager.
 //
-// Input is raw 16 kHz mono Float32 PCM decoded by the recorder renderer —
-// the main process never needs an audio decoder. The model is downloaded
-// from HuggingFace on first use and cached under userData/models, after
-// which transcription is fully offline.
+// The actual model runs in an isolated utilityProcess (see
+// local-whisper-worker.ts): onnxruntime inference can hard-crash at the
+// native level, and in-process that killed the whole app mid-dictation.
+// Here a worker crash only rejects the in-flight requests — callers fall
+// back to cloud — and after MAX_CRASHES the app auto-reverts the
+// transcriptionMode setting to 'cloud' so a machine that can't run the
+// model never degrades the dictation experience.
 //
-// Same ESM-from-CJS constraint as embeddings.ts: @xenova/transformers is
-// ESM-only, so the import must be an opaque dynamic import TypeScript
-// cannot rewrite into require().
+// The model downloads from HuggingFace on first use and is cached under
+// userData/models, after which transcription is fully offline.
 
-import { app, BrowserWindow } from 'electron'
+import { app, BrowserWindow, utilityProcess } from 'electron'
+import type { UtilityProcess } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import log from 'electron-log/main'
 import { setSetting } from './settings'
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const importTransformers: () => Promise<any> = new Function(
-  'return import("@xenova/transformers")',
-) as () => Promise<any>
+const MAX_CRASHES = 2
+const LOAD_TIMEOUT_MS = 15 * 60_000 // generous: covers the one-off download
+const TRANSCRIBE_TIMEOUT_MS = 180_000
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let transcriber: any = null
-let loadedModel: string | null = null
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let loadPromise: Promise<any> | null = null
+let worker: UtilityProcess | null = null
+let workerModel: string | null = null
+let workerReady: Promise<void> | null = null
+let crashCount = 0
+let seq = 0
+
+interface PendingRequest {
+  resolve: (text: string) => void
+  reject: (err: Error) => void
+  timer: NodeJS.Timeout
+}
+const pending = new Map<number, PendingRequest>()
 
 function modelCacheDir(): string {
   return path.join(app.getPath('userData'), 'models')
 }
 
-// Crash-loop guard. A native-level failure while loading the model (e.g.
-// mispackaged onnxruntime) kills the whole process with nothing catchable in
-// JS — and since the load runs at startup in local mode, the app would crash
-// on every launch. Sentinel-on-disk detects "the last load never finished".
-const LOAD_SENTINEL = () => path.join(app.getPath('userData'), 'local-whisper-loading')
-
-function sentinelExists(): boolean {
-  try { return fs.existsSync(LOAD_SENTINEL()) } catch { return false }
-}
-function writeSentinel(): void {
-  try { fs.writeFileSync(LOAD_SENTINEL(), String(Date.now())) } catch { /* best effort */ }
-}
-function clearSentinel(): void {
-  try { fs.unlinkSync(LOAD_SENTINEL()) } catch { /* best effort */ }
-}
-
 /** True once the model files exist on disk (i.e. offline use is possible). */
 export function isLocalModelCached(model: string): boolean {
-  if (loadedModel === model && transcriber) return true
   try {
     return fs.existsSync(path.join(modelCacheDir(), ...model.split('/')))
   } catch {
@@ -62,73 +54,124 @@ function broadcastStatus(message: string): void {
   })
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function getTranscriber(model: string): Promise<any> {
-  if (transcriber && loadedModel === model) return transcriber
-  if (loadPromise) return loadPromise
+function handleWorkerExit(code: number): void {
+  const inFlight = pending.size
+  log.error(`[local-whisper] worker exited (code ${code}) with ${inFlight} in-flight request(s)`)
+  for (const [, p] of pending) {
+    clearTimeout(p.timer)
+    p.reject(new Error('local-whisper-worker-crashed'))
+  }
+  pending.clear()
+  worker = null
+  workerModel = null
+  workerReady = null
+  crashCount++
+  if (crashCount >= MAX_CRASHES) {
+    log.error('[local-whisper] repeated worker crashes — reverting transcriptionMode to cloud')
+    broadcastStatus('Local Whisper keeps failing on this machine — switched back to cloud.')
+    try {
+      setSetting('transcriptionMode', 'cloud')
+    } catch (err) {
+      log.warn('[local-whisper] failed to revert transcriptionMode', err)
+    }
+  }
+}
 
-  if (sentinelExists()) {
-    // The previous load took the process down — refuse rather than crash
-    // again. Callers fall back to cloud; warmup reverts the setting.
-    throw new Error('local-whisper-disabled-after-crash')
+function ensureWorker(model: string): Promise<void> {
+  if (worker && workerModel === model && workerReady) return workerReady
+  if (crashCount >= MAX_CRASHES) {
+    return Promise.reject(new Error('local-whisper-disabled-after-crashes'))
+  }
+  if (worker) {
+    try {
+      worker.kill()
+    } catch {
+      // already gone
+    }
+    worker = null
   }
 
-  loadPromise = (async () => {
-    const t0 = Date.now()
-    writeSentinel()
-    const transformers = await importTransformers()
-    transformers.env.cacheDir = modelCacheDir()
-    transformers.env.allowLocalModels = false
+  workerModel = model
+  const child = utilityProcess.fork(
+    path.join(__dirname, 'local-whisper-worker.js'),
+    [],
+    { serviceName: 'speakflow-local-whisper' },
+  )
+  worker = child
 
-    const firstDownload = !isLocalModelCached(model)
-    if (firstDownload) {
-      log.info(`[local-whisper] downloading ${model} (first run, one-off)`)
-      broadcastStatus('Downloading Whisper model (one-off)…')
-    }
+  workerReady = new Promise<void>((resolve, reject) => {
+    const loadTimer = setTimeout(() => {
+      reject(new Error('local-whisper-load-timeout'))
+      try {
+        child.kill()
+      } catch {
+        // best effort
+      }
+    }, LOAD_TIMEOUT_MS)
 
-    let lastPct = -1
-    const pipe = await transformers.pipeline('automatic-speech-recognition', model, {
-      // quantized (default true) keeps whisper-medium around ~0.8 GB on disk.
-      progress_callback: (p: { status?: string; progress?: number; file?: string }) => {
-        if (firstDownload && p.status === 'progress' && typeof p.progress === 'number') {
-          const pct = Math.floor(p.progress)
-          if (pct !== lastPct && pct % 5 === 0) {
-            lastPct = pct
-            broadcastStatus(`Downloading Whisper model… ${pct}%`)
+    child.on('message', (msg: unknown) => {
+      const m = msg as {
+        type?: string
+        message?: string
+        ms?: number
+        id?: number
+        text?: string
+      }
+      if (!m || typeof m !== 'object') return
+      switch (m.type) {
+        case 'status':
+          if (typeof m.message === 'string') broadcastStatus(m.message)
+          break
+        case 'loaded':
+          clearTimeout(loadTimer)
+          log.info(`[timing] local whisper ${model} loaded in worker in ${m.ms}ms`)
+          resolve()
+          break
+        case 'load-error':
+          clearTimeout(loadTimer)
+          log.warn(`[local-whisper] load failed: ${m.message}`)
+          reject(new Error(m.message || 'local-whisper-load-failed'))
+          break
+        case 'result': {
+          const p = typeof m.id === 'number' ? pending.get(m.id) : undefined
+          if (p && typeof m.id === 'number') {
+            clearTimeout(p.timer)
+            pending.delete(m.id)
+            p.resolve(m.text ?? '')
           }
+          break
         }
-      },
+        case 'error': {
+          const p = typeof m.id === 'number' ? pending.get(m.id) : undefined
+          if (p && typeof m.id === 'number') {
+            clearTimeout(p.timer)
+            pending.delete(m.id)
+            p.reject(new Error(m.message || 'local-whisper-transcribe-failed'))
+          }
+          break
+        }
+      }
     })
-    transcriber = pipe
-    loadedModel = model
-    clearSentinel()
-    log.info(`[timing] local whisper ${model} loaded in ${Date.now() - t0}ms`)
-    return pipe
-  })()
-    .catch((err) => {
-      // A catchable JS failure is NOT a crash — clear the sentinel so the
-      // next attempt (e.g. after connectivity returns) can run.
-      clearSentinel()
-      throw err
+
+    child.on('exit', (code) => {
+      clearTimeout(loadTimer)
+      handleWorkerExit(code)
+      reject(new Error('local-whisper-worker-crashed'))
     })
-    .finally(() => {
-      loadPromise = null
+
+    child.postMessage({
+      type: 'load',
+      model,
+      cacheDir: modelCacheDir(),
+      firstDownload: !isLocalModelCached(model),
     })
-  return loadPromise
+  })
+  return workerReady
 }
 
 /** Fire-and-forget preload so the first dictation doesn't pay model-load cost. */
 export function warmupLocalWhisper(model: string): void {
-  if (sentinelExists()) {
-    log.error(
-      '[local-whisper] previous model load crashed the app — reverting transcriptionMode to cloud',
-    )
-    broadcastStatus('Local Whisper failed to load — switched back to cloud.')
-    setSetting('transcriptionMode', 'cloud')
-    clearSentinel()
-    return
-  }
-  getTranscriber(model).catch((err) =>
+  ensureWorker(model).catch((err) =>
     log.warn('[local-whisper] warmup failed (will retry on first use)', err),
   )
 }
@@ -142,21 +185,32 @@ export async function transcribeLocal(
   model: string,
   opts: LocalTranscribeOptions = {},
 ): Promise<string> {
-  const pipe = await getTranscriber(model)
+  await ensureWorker(model)
+  const w = worker
+  if (!w) throw new Error('local-whisper-worker-missing')
+
+  const id = ++seq
   const t0 = Date.now()
   const audioSeconds = pcm.length / 16_000
-  // .en model variants are English-only and reject language/task options.
-  const multilingual = !model.endsWith('.en')
-  const result = await pipe(pcm, {
-    chunk_length_s: 30,
-    stride_length_s: 5,
-    ...(multilingual
-      ? { language: opts.language, task: 'transcribe' }
-      : {}),
+
+  const text = await new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id)
+      reject(new Error('local-whisper-timeout'))
+    }, TRANSCRIBE_TIMEOUT_MS)
+    pending.set(id, { resolve, reject, timer })
+    w.postMessage({
+      type: 'transcribe',
+      id,
+      pcm,
+      language: opts.language,
+      // .en model variants are English-only and reject language/task options.
+      multilingual: !model.endsWith('.en'),
+    })
   })
-  const text: string = (result?.text ?? '').trim()
+
   log.info(
     `[timing] local whisper transcribed ${audioSeconds.toFixed(1)}s audio in ${Date.now() - t0}ms (${model})`,
   )
-  return text
+  return text.trim()
 }
