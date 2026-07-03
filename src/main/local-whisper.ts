@@ -13,6 +13,7 @@ import { app, BrowserWindow } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import log from 'electron-log/main'
+import { setSetting } from './settings'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const importTransformers: () => Promise<any> = new Function(
@@ -27,6 +28,22 @@ let loadPromise: Promise<any> | null = null
 
 function modelCacheDir(): string {
   return path.join(app.getPath('userData'), 'models')
+}
+
+// Crash-loop guard. A native-level failure while loading the model (e.g.
+// mispackaged onnxruntime) kills the whole process with nothing catchable in
+// JS — and since the load runs at startup in local mode, the app would crash
+// on every launch. Sentinel-on-disk detects "the last load never finished".
+const LOAD_SENTINEL = () => path.join(app.getPath('userData'), 'local-whisper-loading')
+
+function sentinelExists(): boolean {
+  try { return fs.existsSync(LOAD_SENTINEL()) } catch { return false }
+}
+function writeSentinel(): void {
+  try { fs.writeFileSync(LOAD_SENTINEL(), String(Date.now())) } catch { /* best effort */ }
+}
+function clearSentinel(): void {
+  try { fs.unlinkSync(LOAD_SENTINEL()) } catch { /* best effort */ }
 }
 
 /** True once the model files exist on disk (i.e. offline use is possible). */
@@ -50,8 +67,15 @@ async function getTranscriber(model: string): Promise<any> {
   if (transcriber && loadedModel === model) return transcriber
   if (loadPromise) return loadPromise
 
+  if (sentinelExists()) {
+    // The previous load took the process down — refuse rather than crash
+    // again. Callers fall back to cloud; warmup reverts the setting.
+    throw new Error('local-whisper-disabled-after-crash')
+  }
+
   loadPromise = (async () => {
     const t0 = Date.now()
+    writeSentinel()
     const transformers = await importTransformers()
     transformers.env.cacheDir = modelCacheDir()
     transformers.env.allowLocalModels = false
@@ -77,16 +101,33 @@ async function getTranscriber(model: string): Promise<any> {
     })
     transcriber = pipe
     loadedModel = model
+    clearSentinel()
     log.info(`[timing] local whisper ${model} loaded in ${Date.now() - t0}ms`)
     return pipe
-  })().finally(() => {
-    loadPromise = null
-  })
+  })()
+    .catch((err) => {
+      // A catchable JS failure is NOT a crash — clear the sentinel so the
+      // next attempt (e.g. after connectivity returns) can run.
+      clearSentinel()
+      throw err
+    })
+    .finally(() => {
+      loadPromise = null
+    })
   return loadPromise
 }
 
 /** Fire-and-forget preload so the first dictation doesn't pay model-load cost. */
 export function warmupLocalWhisper(model: string): void {
+  if (sentinelExists()) {
+    log.error(
+      '[local-whisper] previous model load crashed the app — reverting transcriptionMode to cloud',
+    )
+    broadcastStatus('Local Whisper failed to load — switched back to cloud.')
+    setSetting('transcriptionMode', 'cloud')
+    clearSentinel()
+    return
+  }
   getTranscriber(model).catch((err) =>
     log.warn('[local-whisper] warmup failed (will retry on first use)', err),
   )

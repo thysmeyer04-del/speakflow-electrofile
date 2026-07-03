@@ -19,8 +19,17 @@ files:
   - "!**/*.ts"
   - "!**/*.map"
 
+# Native modules cannot execute from inside the asar archive — the .node
+# bindings and their companion DLLs must exist as real files on disk.
+# Missing @xenova/onnxruntime here made local Whisper (and embeddings) crash
+# the packaged app the moment the model loaded.
 asarUnpack:
   - "node_modules/@nut-tree-fork/**"
+  - "node_modules/@xenova/**"
+  - "node_modules/onnxruntime-node/**"
+  - "node_modules/onnxruntime-common/**"
+  - "node_modules/onnxruntime-web/**"
+  - "node_modules/sharp/**"
 
 extraResources:
   - from: assets/sounds
