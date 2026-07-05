@@ -8,10 +8,30 @@ const barsEl     = document.getElementById('bars')       as HTMLElement
 const bars        = Array.from(barsEl.querySelectorAll('span')) as HTMLElement[]
 const errorLabel  = document.getElementById('error-label') as HTMLElement
 const statusLabel = document.getElementById('status-label') as HTMLElement
+const partialEl   = document.getElementById('partial-text') as HTMLElement
 const displayed   = new Array<number>(SAMPLE_COUNT).fill(0)
 
 function setStatus(text: string): void {
   if (statusLabel) statusLabel.textContent = text
+}
+
+// Live partial transcript: show only the tail (~70 chars) so the newest
+// words are always visible in the single-line pill slot.
+const PARTIAL_TAIL_CHARS = 70
+
+function setPartial(text: string): void {
+  if (!partialEl) return
+  const trimmed = (text || '').trim()
+  if (!trimmed) {
+    partialEl.textContent = ''
+    document.body.removeAttribute('data-has-partial')
+    return
+  }
+  partialEl.textContent =
+    trimmed.length > PARTIAL_TAIL_CHARS
+      ? '…' + trimmed.slice(-PARTIAL_TAIL_CHARS)
+      : trimmed
+  document.body.setAttribute('data-has-partial', '')
 }
 
 // ── Audio level state ─────────────────────────────────────────────────────────
@@ -89,6 +109,7 @@ if (api) {
     document.body.dataset.mode = 'starting'
     document.body.setAttribute('data-recording', '')
     setStatus('Starting…')
+    setPartial('') // never carry a previous session's text into a new one
     stopIdleAnim()
   })
 
@@ -129,6 +150,15 @@ if (api) {
     if (msg) setStatus(msg)
   })
 
+  // Streaming mode: accumulated transcript-so-far while the user talks.
+  // Only rendered in listening/transcribing states — ignore anything that
+  // arrives late while idle or errored.
+  api.onPartialTranscript?.((text: string) => {
+    const mode = document.body.dataset.mode
+    if (mode !== 'recording' && mode !== 'processing') return
+    setPartial(text)
+  })
+
   api.onProcessingComplete(() => {
     // Don't wipe an error that's currently showing — let its own timeout clear it.
     if (document.body.dataset.mode === 'error') return
@@ -136,6 +166,7 @@ if (api) {
     document.body.removeAttribute('data-recording')
     delete document.body.dataset.mode
     setStatus('')
+    setPartial('')
     displayed.fill(0)
     renderBars()
   })
@@ -144,12 +175,14 @@ if (api) {
     errorLabel.textContent = msg || 'Something went wrong'
     document.body.dataset.mode = 'error'
     document.body.setAttribute('data-recording', '')
+    setPartial('')
     setTimeout(() => {
       stopIdleAnim()
       document.body.removeAttribute('data-recording')
       delete document.body.dataset.mode
       errorLabel.textContent = ''
       setStatus('')
+      setPartial('')
       displayed.fill(0)
       renderBars()
     }, 3500)

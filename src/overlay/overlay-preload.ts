@@ -23,6 +23,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     on<string>('transcription-error', cb),
   onTranscriptionStatus: (cb: (msg: string) => void) =>
     on<string>('transcription-status', cb),
+  onPartialTranscript: (cb: (text: string) => void) =>
+    on<string>('partial-transcript', cb),
   onAudioLevels: (cb: (levels: number[]) => void) =>
     on<number[]>('audio-levels', cb),
   onOverlayHover: (cb: (hovering: boolean) => void) =>

@@ -116,6 +116,28 @@
         display: none;
       }
 
+      /* ── Live partial transcript (streaming mode) ──────────────────────── */
+      /* Single ellipsized line of the accumulated transcript while the user
+         is still talking. Hidden when empty (the [data-has-partial] gate) so
+         the pill stays compact. The max-width keeps the whole pill well
+         under 560px even with bars + status label. */
+      .partial-text {
+        display: none;
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 11px;
+        color: rgba(255, 255, 255, 0.9);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        letter-spacing: 0.01em;
+        max-width: 330px;
+        flex-shrink: 1;
+      }
+      body[data-has-partial][data-mode='recording'] .partial-text,
+      body[data-has-partial][data-mode='processing'] .partial-text {
+        display: block;
+      }
+
       /* ── Status label: tells the user WHAT the app is doing ─────────────── */
       .status-label {
         display: none;
@@ -239,6 +261,9 @@
 
       <!-- Live status: Starting… / Listening / Transcribing… -->
       <span class="status-label" id="status-label"></span>
+
+      <!-- Live partial transcript (streaming mode, tail-ellipsized) -->
+      <span class="partial-text" id="partial-text"></span>
 
       <!-- Hotkey hint -->
       <span class="hotkey-label" id="hotkey-label">F11 to dictate</span>

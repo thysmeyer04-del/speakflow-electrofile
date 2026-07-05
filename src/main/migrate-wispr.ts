@@ -175,7 +175,7 @@ export async function runWisprMigration(
     const { generateEmbedding } = await import('./embeddings')
 
     let imported = 0
-    let skipped = alreadyImported.size > 0 ? 0 : 0  // counted at iteration time
+    let skipped = 0 // counted at iteration time
     let failed = 0
 
     for (let i = 0; i < data.transcripts.length; i += BATCH_SIZE) {

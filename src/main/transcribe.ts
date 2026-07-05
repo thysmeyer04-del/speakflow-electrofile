@@ -4,6 +4,7 @@ import { getAuthToken } from './ipc'
 import { isProxyUrlAllowed } from './security'
 import { getSettings } from './settings'
 import { transcribeLocal, isLocalModelCached } from './local-whisper'
+import { getWhisperPrompt } from './user-context'
 
 const PRODUCTION_PROXY = 'https://speakflow-marketing.vercel.app/api'
 
@@ -43,6 +44,11 @@ const WHISPER_MODEL = process.env.SPEAKFLOW_WHISPER_MODEL || 'whisper-large-v3-t
 const MAX_BYTES = 25 * 1024 * 1024 // Groq hard limit
 const REQUEST_TIMEOUT_MS = 60_000
 const AUDIO_FILENAME = 'audio.webm'
+
+// Deepgram Nova-3 — alternative cloud engine (better proper-noun accuracy,
+// built-in smart formatting). Any Deepgram failure falls back to Groq.
+const DEEPGRAM_LISTEN_URL =
+  'https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&language=multi'
 
 interface TranscribeOptions {
   language?: string
@@ -101,10 +107,28 @@ async function transcribeViaCloud(
   }
 
   const proxyUrl = getProxyBaseUrl()
-  if (proxyUrl) {
-    if (!isProxyUrlAllowed(proxyUrl)) {
-      throw new Error('Speakflow API URL is not allowed.')
+  if (proxyUrl && !isProxyUrlAllowed(proxyUrl)) {
+    throw new Error('Speakflow API URL is not allowed.')
+  }
+
+  // Env override wins over the setting — same pattern as
+  // SPEAKFLOW_TRANSCRIPTION_MODE above.
+  const provider =
+    process.env.SPEAKFLOW_TRANSCRIPTION_PROVIDER || getSettings().transcriptionProvider
+
+  if (provider === 'deepgram') {
+    try {
+      return proxyUrl
+        ? await transcribeViaProxy(audio, proxyUrl, opts, 'deepgram')
+        : await transcribeViaDeepgram(audio)
+    } catch (err) {
+      // Deepgram is best-effort: missing key, non-200, or proxy
+      // provider_unavailable all fall back to the Groq path transparently.
+      log.warn('[transcribe] deepgram failed — falling back to groq', err)
     }
+  }
+
+  if (proxyUrl) {
     return transcribeViaProxy(audio, proxyUrl, opts)
   }
 
@@ -143,7 +167,9 @@ async function transcribeViaGroq(
   form.append('temperature', '0')
   // A non-empty prompt suppresses Whisper's "Thank you." / "Thanks for watching."
   // hallucinations that occur when it receives silent or low-energy audio.
-  form.append('prompt', ' ')
+  // When the user has a personal dictionary, their words become the prompt —
+  // this biases Whisper toward their spellings (names, jargon, brands).
+  form.append('prompt', getWhisperPrompt() || ' ')
   if (opts.language) form.append('language', opts.language)
 
   let response: Response
@@ -174,10 +200,50 @@ async function transcribeViaGroq(
   return data.text ?? ''
 }
 
+async function transcribeViaDeepgram(buffer: Buffer): Promise<string> {
+  const apiKey = process.env.DEEPGRAM_API_KEY
+  if (!apiKey) {
+    throw new Error('DEEPGRAM_API_KEY is not set.')
+  }
+
+  let response: Response
+  try {
+    response = await fetchWithTimeout(
+      DEEPGRAM_LISTEN_URL,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Token ${apiKey}`,
+          'Content-Type': 'audio/webm',
+        },
+        body: new Uint8Array(buffer),
+      },
+      REQUEST_TIMEOUT_MS,
+    )
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') {
+      throw new Error('Transcription timeout — please try again.')
+    }
+    throw new Error('Could not reach Deepgram.')
+  }
+
+  if (!response.ok) {
+    const body = await safeReadBody(response)
+    log.error(`[transcribe] Deepgram error ${response.status}`, body.slice(0, 500))
+    throw new Error(`Deepgram returned ${response.status}`)
+  }
+
+  const data = (await response.json()) as {
+    results?: { channels?: Array<{ alternatives?: Array<{ transcript?: string }> }> }
+  }
+  return data.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? ''
+}
+
 async function transcribeViaProxy(
   buffer: Buffer,
   baseUrl: string,
   opts: TranscribeOptions,
+  provider?: 'deepgram',
 ): Promise<string> {
   const token = getAuthToken()
   if (!token) {
@@ -186,8 +252,15 @@ async function transcribeViaProxy(
 
   const form = buildAudioForm(buffer, 'audio.webm')
   if (opts.language) form.append('language', opts.language)
+  // Personal-dictionary spelling bias — the proxy forwards the prompt field
+  // to Whisper when present.
+  const prompt = getWhisperPrompt()
+  if (prompt) form.append('prompt', prompt)
 
-  const url = baseUrl.replace(/\/+$/, '') + '/transcribe'
+  const url =
+    baseUrl.replace(/\/+$/, '') +
+    '/transcribe' +
+    (provider === 'deepgram' ? '?provider=deepgram' : '')
   let response: Response
   try {
     response = await fetchWithTimeout(
@@ -230,6 +303,7 @@ async function safeReadBody(response: Response): Promise<string> {
 
 function userMessageForStatus(status: number): string {
   if (status === 401) return 'Authentication failed. Sign in again.'
+  if (status === 402) return 'Weekly free limit reached — upgrade to Pro in your Speakflow dashboard'
   if (status === 403) return 'Your plan limit was reached. Upgrade to continue.'
   if (status === 413) return 'Audio too long. Record a shorter clip.'
   if (status === 429) return 'Rate limit hit. Try again in a moment.'

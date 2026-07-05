@@ -15,6 +15,9 @@ export interface AppSettings {
   // 'local'  — on-device Whisper via @xenova/transformers (works offline;
   //            falls back to cloud if the local pass fails)
   transcriptionMode: 'cloud' | 'local'
+  // Cloud STT engine. 'groq' = Whisper (default), 'deepgram' = Nova-3.
+  // Deepgram failures always fall back to Groq transparently.
+  transcriptionProvider: 'groq' | 'deepgram'
   // HuggingFace model id for local mode. Whisper sizes trade speed for
   // accuracy: Xenova/whisper-tiny < base < small < medium.
   localWhisperModel: string
@@ -35,6 +38,7 @@ const defaults: AppSettings = {
   enableSmartFormatting: true,
   stripDisfluencies: true,
   transcriptionMode: 'cloud',
+  transcriptionProvider: 'groq',
   localWhisperModel: 'Xenova/whisper-medium',
   streamingTranscription: true,
 }

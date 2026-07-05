@@ -24,6 +24,16 @@ interface CommandSaveResult {
   command?: SpeakflowCommand
 }
 
+// Rich payload sent on 'transcription-complete'. Older app builds sent a
+// plain string, so renderers must accept both shapes.
+interface TranscriptionPayload {
+  text: string
+  durationSeconds: number
+  appName: string | null
+  windowTitle: string | null
+  source: 'dictation' | 'transform'
+}
+
 declare global {
   interface SpeakflowElectronAPI {
     onRecordingStarting?: (cb: () => void) => () => void
@@ -31,9 +41,13 @@ declare global {
     onRecordingStopped: (cb: () => void) => () => void
     onProcessingStarted: (cb: () => void) => () => void
     onProcessingComplete: (cb: () => void) => () => void
-    onTranscriptionComplete: (cb: (text: string) => void) => () => void
+    onTranscriptionComplete: (
+      cb: (payload: string | TranscriptionPayload) => void,
+    ) => () => void
     onTranscriptionError: (cb: (message: string) => void) => () => void
     onTranscriptionStatus?: (cb: (message: string) => void) => () => void
+    // Streaming mode only: accumulated transcript-so-far while recording.
+    onPartialTranscript?: (cb: (text: string) => void) => () => void
     onTransformStarting?: (cb: () => void) => () => void
     onAudioLevels?: (cb: (levels: number[]) => void) => () => void
     onOverlayHover?: (cb: (hovering: boolean) => void) => () => void
@@ -73,8 +87,13 @@ declare global {
         | 'dictationSounds'
         | 'launchAtLogin'
         | 'enableSmartFormatting'
-        | 'stripDisfluencies',
+        | 'stripDisfluencies'
+        | 'streamingTranscription',
       value: boolean,
+    ) => Promise<{ ok: boolean; error?: string }>
+    setChoiceSetting: (
+      key: 'transcriptionMode' | 'transcriptionProvider',
+      value: string,
     ) => Promise<{ ok: boolean; error?: string }>
     getSettings: () => Promise<Record<string, unknown>>
 

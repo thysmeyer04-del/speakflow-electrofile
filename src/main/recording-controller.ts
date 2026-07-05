@@ -33,6 +33,7 @@ import {
 } from './format-transcript'
 import { getCommand } from './commands-store'
 import { transformText } from './transform-llm'
+import { getDictionaryWords, expandSnippets } from './user-context'
 
 export type RecordingState =
   | 'idle'
@@ -55,6 +56,9 @@ let sessionId = 0
 // nothing highlighted): the transcript is run through that command's LLM
 // prompt instead of being pasted verbatim.
 let pendingCommandId: string | null = null
+// Wall-clock moment the recorder ACKed 'recording-started' — used to report
+// the actual audio duration (not processing time) in the completion payload.
+let recordingStartedAt = 0
 
 export function getPendingCommandId(): string | null {
   return pendingCommandId
@@ -74,18 +78,38 @@ let segments: Array<SegmentJob | undefined> = []
 // Language captured at doStart so background segment jobs and the tail all
 // use the same setting even if the user changes it mid-recording.
 let sessionLanguage: string | undefined
+// Accumulated partial texts (indexed by segment) for the live overlay
+// preview. Guarded by sessionId: a slow segment result from a PREVIOUS
+// session must never surface in the overlay of the current one.
+let partialTexts: Array<string | undefined> = []
 
 onPartialSegment(({ index, audio, pcm }) => {
   if (state !== 'recording' && state !== 'stopping') {
     log.warn(`[recording] partial segment ${index} ignored (state=${state})`)
     return
   }
+  const mySession = sessionId
   const job: SegmentJob = { audio, pcm, failed: false, promise: Promise.resolve('') }
-  job.promise = transcribeAudio(audio, { language: sessionLanguage, pcm }).catch((err) => {
-    log.warn(`[recording] segment ${index} failed — will retry at stop`, err)
-    job.failed = true
-    return ''
-  })
+  job.promise = transcribeAudio(audio, { language: sessionLanguage, pcm })
+    .then((text) => {
+      // Live preview: push the accumulated transcript-so-far to the overlay
+      // while the user is still talking. Only while this session still owns
+      // the mic — after stop the final pipeline takes over.
+      if (mySession === sessionId && (state === 'recording' || state === 'stopping')) {
+        partialTexts[index] = text
+        const joined = partialTexts
+          .map((p) => (p ?? '').trim())
+          .filter(Boolean)
+          .join(' ')
+        if (joined) broadcast('partial-transcript', joined)
+      }
+      return text
+    })
+    .catch((err) => {
+      log.warn(`[recording] segment ${index} failed — will retry at stop`, err)
+      job.failed = true
+      return ''
+    })
   segments[index] = job
   log.info(`[recording] segment ${index} (${audio.byteLength}B) transcribing in background`)
 })
@@ -199,6 +223,7 @@ onRecorderCrash((reason) => {
     focusTarget = null
     pendingCommandId = null
     segments = []
+    partialTexts = []
     setState('idle')
   })
 })
@@ -276,6 +301,7 @@ async function doStart(): Promise<void> {
   // session; startCommandRecording re-arms this after doStart returns.
   pendingCommandId = null
   segments = []
+  partialTexts = []
   setState('starting')
 
   const settings = getSettings()
@@ -320,6 +346,7 @@ async function doStart(): Promise<void> {
     return
   }
   setState('recording')
+  recordingStartedAt = Date.now()
   broadcast('recording-started')
   log.info(`[timing] recording-started at +${Date.now() - t0}ms`)
   if (settings.dictationSounds) playSound('start')
@@ -328,6 +355,10 @@ async function doStart(): Promise<void> {
 async function doStop(): Promise<void> {
   const t0 = Date.now()
   const mySession = sessionId
+  // Audio duration = hotkey-to-hotkey, measured from the recorder's start
+  // ACK. Captured here, before any network round-trips inflate the clock.
+  const durationSeconds =
+    recordingStartedAt > 0 ? Math.round((Date.now() - recordingStartedAt) / 1000) : 0
   setState('stopping')
   broadcast('recording-stopped')
   log.info(`[timing] recording-stopped broadcast at +${Date.now() - t0}ms`)
@@ -370,7 +401,13 @@ async function doStop(): Promise<void> {
     return
   }
 
-  await processAudio(audioBuffer ?? Buffer.alloc(0), audioPcm, settings.language, mySession)
+  await processAudio(
+    audioBuffer ?? Buffer.alloc(0),
+    audioPcm,
+    settings.language,
+    mySession,
+    durationSeconds,
+  )
 }
 
 // Collapse Whisper hallucination loops — e.g. "word word word word" or
@@ -402,6 +439,7 @@ async function processAudio(
   pcm: Float32Array | null,
   language: string,
   mySession: number,
+  durationSeconds: number,
 ): Promise<void> {
   try {
     // Pass buffer directly — no disk round-trip. Previously we wrote a temp
@@ -460,10 +498,15 @@ async function processAudio(
       // command's LLM output is already structured. Fail-open: any error or
       // aborted call falls back to the raw text — the user must never lose
       // their dictation here.
+      const targetSnapshot = focusTarget // captured before inject clears it
+
       if (!command && liveSettings.enableSmartFormatting && shouldFormat(rawTrimmed)) {
         try {
           const formatted = await formatTranscript(rawTrimmed, {
             stripDisfluencies: liveSettings.stripDisfluencies,
+            dictionaryWords: getDictionaryWords(),
+            appName: targetSnapshot?.processName ?? null,
+            windowTitle: targetSnapshot?.title ?? null,
           })
           if (mySession !== sessionId) {
             log.info('[recording] format result discarded — session invalidated')
@@ -479,7 +522,11 @@ async function processAudio(
         }
       }
 
-      const targetSnapshot = focusTarget // captured before inject clears it
+      // Snippet expansion — replace standalone trigger phrases with their
+      // expansions ("my address" → the full address). After formatting so
+      // the LLM never sees/rewrites the expansion; before inject so the
+      // pasted text is the expanded one.
+      trimmed = expandSnippets(trimmed)
 
       // Inject FIRST so the paste isn't delayed by anything else.
       let injectResult
@@ -493,7 +540,13 @@ async function processAudio(
         log.info('[recording] post-inject broadcast skipped — session invalidated')
         return
       }
-      broadcast('transcription-complete', trimmed)
+      broadcast('transcription-complete', {
+        text: trimmed,
+        durationSeconds,
+        appName: targetSnapshot?.processName ?? null,
+        windowTitle: targetSnapshot?.title ?? null,
+        source: 'dictation',
+      })
       if (!injectResult.ok) {
         broadcast('transcription-error', humanizeInjectError(injectResult.error ?? ''))
       }
@@ -552,6 +605,7 @@ export function abortInFlightRecording(reason: string): void {
     focusTarget = null
     pendingCommandId = null
     segments = []
+    partialTexts = []
     setState('idle')
   })
 }
@@ -565,6 +619,7 @@ function humanizeStartError(msg: string): string {
 }
 function humanizeTranscribeError(err: Error): string {
   if (err.message.startsWith('GROQ_API_KEY')) return err.message
+  if (err.message.includes('Weekly free limit')) return err.message
   if (err.message.includes('25 MB')) return 'Recording too long. Try a shorter clip.'
   if (err.message.includes('Sign in')) return 'Please sign in to use Speakflow.'
   if (err.message.toLowerCase().includes('timeout')) return 'Transcription timed out. Check your connection.'
@@ -603,6 +658,7 @@ export async function shutdownRecording(): Promise<void> {
     focusTarget = null
     pendingCommandId = null
     segments = []
+    partialTexts = []
     setState('idle')
   }
 }

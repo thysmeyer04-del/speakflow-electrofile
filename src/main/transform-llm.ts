@@ -160,6 +160,7 @@ async function safeReadBody(response: Response): Promise<string> {
 
 function userMessageForStatus(status: number): string {
   if (status === 401) return 'Authentication failed. Check GROQ_API_KEY.'
+  if (status === 402) return 'Weekly free limit reached — upgrade to Pro in your Speakflow dashboard'
   if (status === 403) return 'Plan limit reached on Groq.'
   if (status === 413) return 'Selected text is too long for transform.'
   if (status === 429) return 'Groq rate limit hit. Wait a moment and try again.'

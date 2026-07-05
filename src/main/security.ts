@@ -129,6 +129,7 @@ export type ToggleKey =
   | 'launchAtLogin'
   | 'enableSmartFormatting'
   | 'stripDisfluencies'
+  | 'streamingTranscription'
 
 export function validateToggleKey(input: unknown): ToggleKey | null {
   if (typeof input !== 'string') return null
@@ -139,8 +140,31 @@ export function validateToggleKey(input: unknown): ToggleKey | null {
     'launchAtLogin',
     'enableSmartFormatting',
     'stripDisfluencies',
+    'streamingTranscription',
   ])
   return (allowed as Set<string>).has(input) ? (input as ToggleKey) : null
+}
+
+// ── Choice settings (string enums the dashboard may set over IPC) ──────────
+// Strict allowlist of key → permitted values. Anything else is rejected —
+// never write a renderer-supplied string into electron-store unvalidated.
+export type ChoiceSetting =
+  | { key: 'transcriptionMode'; value: 'cloud' | 'local' }
+  | { key: 'transcriptionProvider'; value: 'groq' | 'deepgram' }
+
+const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
+  transcriptionMode: new Set(['cloud', 'local']),
+  transcriptionProvider: new Set(['groq', 'deepgram']),
+}
+
+export function validateChoiceSetting(
+  key: unknown,
+  value: unknown,
+): ChoiceSetting | null {
+  if (typeof key !== 'string' || typeof value !== 'string') return null
+  const allowed = CHOICE_SETTINGS[key]
+  if (!allowed || !allowed.has(value)) return null
+  return { key, value } as ChoiceSetting
 }
 
 // ── JWT validation (decode-only — signature verification happens server-side) ──

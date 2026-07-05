@@ -28,14 +28,31 @@ function safeString(input: unknown, maxLength: number): string | null {
 
 type SettingsResult = { ok: boolean; error?: string }
 
+// Rich transcription-complete payload (older dashboards may still receive a
+// plain string from other builds — the renderer handles both shapes).
+interface TranscriptionPayload {
+  text: string
+  durationSeconds: number
+  appName: string | null
+  windowTitle: string | null
+  source: 'dictation' | 'transform'
+}
+
+// Choice settings the dashboard may change — mirrors main's allowlist in
+// security.ts (defence in depth; main re-validates).
+const ALLOWED_CHOICE_SETTINGS: Record<string, Set<string>> = {
+  transcriptionMode: new Set(['cloud', 'local']),
+  transcriptionProvider: new Set(['groq', 'deepgram']),
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   // ── Recording state listeners (main → renderer) ────────────────────────────
   onRecordingStarted: (cb: () => void) => on<void>('recording-started', cb),
   onRecordingStopped: (cb: () => void) => on<void>('recording-stopped', cb),
   onProcessingStarted: (cb: () => void) => on<void>('processing-started', cb),
   onProcessingComplete: (cb: () => void) => on<void>('processing-complete', cb),
-  onTranscriptionComplete: (cb: (text: string) => void) =>
-    on<string>('transcription-complete', cb),
+  onTranscriptionComplete: (cb: (payload: string | TranscriptionPayload) => void) =>
+    on<string | TranscriptionPayload>('transcription-complete', cb),
   onTranscriptionError: (cb: (message: string) => void) =>
     on<string>('transcription-error', cb),
   onNavigateTo: (cb: (route: string) => void) => on<string>('navigate-to', cb),
@@ -62,22 +79,33 @@ contextBridge.exposeInMainWorld('electronAPI', {
   updateToggle: async (
     key:
       | 'showOverlay'
+      | 'overlayHandleVisible'
       | 'dictationSounds'
       | 'launchAtLogin'
       | 'enableSmartFormatting'
-      | 'stripDisfluencies',
+      | 'stripDisfluencies'
+      | 'streamingTranscription',
     value: boolean,
   ): Promise<SettingsResult> => {
     const allowed = new Set([
       'showOverlay',
+      'overlayHandleVisible',
       'dictationSounds',
       'launchAtLogin',
       'enableSmartFormatting',
       'stripDisfluencies',
+      'streamingTranscription',
     ])
     if (!allowed.has(key)) return { ok: false, error: 'invalid-key' }
     if (typeof value !== 'boolean') return { ok: false, error: 'invalid-value' }
     return ipcRenderer.invoke('settings:update-toggle', { key, value }) as Promise<SettingsResult>
+  },
+  setChoiceSetting: async (key: string, value: string): Promise<SettingsResult> => {
+    const allowedValues = ALLOWED_CHOICE_SETTINGS[key]
+    if (!allowedValues || !allowedValues.has(value)) {
+      return { ok: false, error: 'invalid-choice' }
+    }
+    return ipcRenderer.invoke('settings:set-choice', { key, value }) as Promise<SettingsResult>
   },
   getSettings: () => ipcRenderer.invoke('settings:get'),
 

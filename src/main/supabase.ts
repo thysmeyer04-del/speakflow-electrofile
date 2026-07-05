@@ -41,8 +41,10 @@ const anonClient: SupabaseClient | null =
     ? createClient(supabaseUrl, supabaseAnonKey, { realtime: REALTIME_TRANSPORT })
     : null
 
-/** Authenticated client for the current user; falls back to null if no JWT. */
-function clientForUser(): SupabaseClient | null {
+/** Authenticated client for the current user; falls back to null if no JWT.
+ *  Exported so user-context (dictionary/snippets) fetches reuse the exact
+ *  same RLS-authorized pattern as syncToKnowledgeBase. */
+export function clientForUser(): SupabaseClient | null {
   if (!supabaseUrl || !supabaseAnonKey) return null
   const token = getAuthToken()
   if (!token) return null

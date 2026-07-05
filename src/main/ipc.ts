@@ -27,8 +27,10 @@ import {
   validateMicrophoneId,
   validateLanguage,
   validateToggleKey,
+  validateChoiceSetting,
   validateAuthToken,
 } from './security'
+import { refreshUserContext, clearUserContext } from './user-context'
 
 interface SetupArgs {
   mainWindow: BrowserWindow
@@ -150,6 +152,25 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
     },
   )
 
+  // String-enum settings (engine controls). Strictly allowlisted in
+  // security.ts — only transcriptionMode and transcriptionProvider, and only
+  // their known values, ever reach electron-store.
+  gatedHandle<{ key: unknown; value: unknown }, { ok: boolean; error?: string }>(
+    'settings:set-choice',
+    (_event, raw) => {
+      if (!raw || typeof raw !== 'object') return { ok: false, error: 'invalid-payload' }
+      const validated = validateChoiceSetting(raw.key, raw.value)
+      if (!validated) return { ok: false, error: 'invalid-choice' }
+      // Narrow per key so setSetting gets a correlated key/value pair.
+      if (validated.key === 'transcriptionMode') {
+        setSetting('transcriptionMode', validated.value)
+      } else {
+        setSetting('transcriptionProvider', validated.value)
+      }
+      return { ok: true }
+    },
+  )
+
   gatedHandle<string, { ok: boolean; error?: string; expiresAt?: number }>(
     'auth:set-token',
     (_event, raw) => {
@@ -161,11 +182,17 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       }
       cachedAuthToken = (raw as string).trim()
       cachedTokenExpiresAt = result.expiresAt ?? 0
+      // Warm the personal dictionary + snippets cache now that we can make
+      // RLS-authorized reads. Fire-and-forget — never blocks the auth reply.
+      void refreshUserContext()
       return { ok: true, expiresAt: result.expiresAt ?? 0 }
     },
   )
   gatedOn('auth:clear-token', () => {
     clearAuthTokenCache()
+    // Drop the signed-out user's dictionary/snippets so they can't leak
+    // into another account's session.
+    clearUserContext()
     // Also abort any recording/transcription in flight so a sign-out can't
     // leave a stale request continuing with the just-cleared token.
     abortInFlightRecording('auth-cleared')

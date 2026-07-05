@@ -224,7 +224,14 @@ async function doRunTransform(commandId: string): Promise<void> {
 
   // Step 5: Restore original clipboard and hide overlay.
   restoreClipboard(originalText, originalHtml, originalRtf, originalImage)
-  broadcast('transcription-complete', transformed)
+  broadcast('transcription-complete', {
+    text: transformed,
+    // Transforms have no recording — duration is always 0.
+    durationSeconds: 0,
+    appName: focusTarget?.processName ?? null,
+    windowTitle: focusTarget?.title ?? null,
+    source: 'transform',
+  })
   broadcast('processing-complete')
 }
 
