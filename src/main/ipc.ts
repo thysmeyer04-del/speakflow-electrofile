@@ -182,6 +182,19 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       }
       cachedAuthToken = (raw as string).trim()
       cachedTokenExpiresAt = result.expiresAt ?? 0
+      // The renderer writes the (possibly just-rotated) Supabase session to
+      // localStorage immediately before pushing it here, so commit it to disk
+      // now. Chromium flushes DOM storage lazily; without this a crash or
+      // abrupt quit can drop the newest refresh token, and Supabase's
+      // reuse-detection then revokes the whole session → forced re-login.
+      // Best-effort and non-blocking.
+      try {
+        if (!mainWindow.isDestroyed()) {
+          mainWindow.webContents.session.flushStorageData()
+        }
+      } catch (err) {
+        log.warn('flushStorageData after auth:set-token failed', err)
+      }
       // Warm the personal dictionary + snippets cache now that we can make
       // RLS-authorized reads. Fire-and-forget — never blocks the auth reply.
       void refreshUserContext()

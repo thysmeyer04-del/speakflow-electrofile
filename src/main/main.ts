@@ -74,6 +74,15 @@ async function createMainWindow(): Promise<BrowserWindow> {
       sandbox: true,
       webviewTag: false,
       spellcheck: true,
+      // This window hosts the dashboard renderer, which owns the Supabase
+      // session and its JWT auto-refresh timer. Speakflow lives in the tray
+      // with this window hidden most of the time — and Chromium freezes timers
+      // in hidden windows. Without this, the ~55-min token refresh never fires,
+      // the 1-hour JWT expires, and the next dictation fails with "sign in via
+      // the dashboard" (getAuthToken() returns null → transcribe.ts throws).
+      // The overlay and recorder windows already disable throttling for the
+      // same reason.
+      backgroundThrottling: false,
     },
   })
 
@@ -208,10 +217,15 @@ async function createMainWindow(): Promise<BrowserWindow> {
     storages: ['cookies'],
   })
 
-  // On first load: check if the stored Supabase session is expired and clear
-  // it before the React app initialises. An expired token causes Supabase to
-  // attempt a silent refresh that hangs indefinitely, keeping the app on its
-  // loading screen. Clearing it forces a clean login instead.
+  // On first load: drop the stored Supabase session ONLY if it's genuinely
+  // unrecoverable — i.e. the entry is corrupt or has no refresh_token. We must
+  // NOT clear a session just because its ACCESS token has expired: that token
+  // lives ~1 hour, but the refresh_token beside it lasts weeks, and Supabase
+  // silently mints a new access token from it. Deleting the whole entry on
+  // access-token expiry (the old behaviour) forced a full re-login on every
+  // launch after the app had been closed ~1h — the "have to sign in again"
+  // bug. A hung refresh is handled separately by the getSession() timeout in
+  // useAuth.ts, so we no longer need to pre-empt it by destroying credentials.
   let tokenCheckDone = false
   win.webContents.on('did-finish-load', () => {
     if (tokenCheckDone || win.isDestroyed()) return
@@ -222,17 +236,23 @@ async function createMainWindow(): Promise<BrowserWindow> {
         const raw = localStorage.getItem(key)
         if (!raw) return false
         try {
-          const { expires_at } = JSON.parse(raw)
-          if (typeof expires_at === 'number' && expires_at < Math.floor(Date.now() / 1000) + 60) {
-            localStorage.removeItem(key)
-            return true
+          const parsed = JSON.parse(raw)
+          // Recoverable as long as we hold a refresh token — keep it.
+          if (parsed && typeof parsed.refresh_token === 'string' && parsed.refresh_token.length > 0) {
+            return false
           }
-        } catch (_) { return false }
-        return false
+          // No refresh token → nothing to refresh from → safe to clear.
+          localStorage.removeItem(key)
+          return true
+        } catch (_) {
+          // Corrupt/unparseable entry — drop it so a clean login can proceed.
+          localStorage.removeItem(key)
+          return true
+        }
       })()
     `).then((cleared) => {
       if (cleared && !win.isDestroyed()) {
-        log.info('[auth] Cleared expired Supabase token — reloading dashboard')
+        log.info('[auth] Cleared unrecoverable Supabase session — reloading dashboard')
         win.webContents.reload()
       }
     }).catch(() => undefined)
@@ -495,6 +515,18 @@ app.on('before-quit', (event) => {
   if (shuttingDown) return
   shuttingDown = true
   markQuitting()
+  // Commit any not-yet-written localStorage (incl. the latest rotated Supabase
+  // refresh token) to disk before we exit. Chromium writes DOM storage lazily,
+  // so an abrupt quit / auto-update restart can otherwise lose the newest
+  // token — which makes Supabase's reuse-detection revoke the whole session on
+  // next launch and force a re-login. flushStorageData() is best-effort.
+  try {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.session.flushStorageData()
+    }
+  } catch (err) {
+    log.warn('flushStorageData on quit failed', err)
+  }
   unregisterHotkey()
   unregisterAllCommandHotkeys()
   event.preventDefault()
