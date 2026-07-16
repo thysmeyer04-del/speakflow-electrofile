@@ -71,7 +71,14 @@ export interface AsrStreamOptions {
   // Fired on EVERY Results message with the full accumulated text (finals +
   // current hypothesis) — the caller broadcasts it to the overlay.
   onInterim: (fullText: string) => void
+  // Nova-3 keyterm prompting (en-only, which this stream already is):
+  // pronunciation-trained spellings + dictionary head. Caller supplies; we
+  // cap/dedup defensively here because these become URL params.
+  keyterms?: string[]
 }
+
+const MAX_KEYTERMS = 20
+const MAX_KEYTERM_LEN = 40
 
 export interface AsrSession {
   /** Forward one 50 ms PCM frame. Silently dropped unless the socket is open
@@ -126,6 +133,20 @@ async function mintAndConnect(opts: AsrStreamOptions): Promise<AsrSession> {
   url.searchParams.set('dictation', 'true')
   url.searchParams.set('interim_results', 'true')
   url.searchParams.set('language', opts.language)
+  // Keyterm biasing (v0.7.0): repeated param, one per term. Host unchanged →
+  // isAsrWsUrlAllowed unaffected.
+  if (opts.keyterms?.length) {
+    const seen = new Set<string>()
+    for (const term of opts.keyterms) {
+      const t = term.trim()
+      if (!t || t.length > MAX_KEYTERM_LEN) continue
+      const key = t.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      url.searchParams.append('keyterm', t)
+      if (seen.size >= MAX_KEYTERMS) break
+    }
+  }
   const wsUrl = url.toString()
   // Belt + braces: the URL is built from constants two lines up, but this is
   // the choke point where raw mic audio + a grant token leave the machine —

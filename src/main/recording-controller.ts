@@ -39,7 +39,12 @@ import {
 } from './format-transcript'
 import { getCommand, toneInstruction } from './commands-store'
 import { transformText } from './transform-llm'
-import { getDictionaryWords, expandSnippets } from './user-context'
+import {
+  getDictionaryWords,
+  expandSnippets,
+  applyPronunciationAliases,
+  getPronunciationSpellings,
+} from './user-context'
 
 export type RecordingState =
   | 'idle'
@@ -185,6 +190,9 @@ function beginAsrStream(mySession: number, t0: number): void {
     // 'partial-transcript' channel + overlay renderer are kept dormant in
     // case live words ever return as an opt-in setting.
     onInterim: () => {},
+    // Keyterm bias (v0.7.0): trained pronunciations first (user explicitly
+    // recorded these), then dictionary head up to the cap of 20.
+    keyterms: [...getPronunciationSpellings(), ...getDictionaryWords().slice(0, 20)],
   })
     .then((session) => {
       if (mySession !== sessionId || !asrPendingSetup) {
@@ -754,6 +762,16 @@ async function processAudio(
       )
       rawText = ''
       serverFormatted = undefined
+    }
+
+    // Pronunciation-trained corrections (v0.7.0): replace known mis-hearings
+    // ("tice") with the intended spelling ("Thys"). ONE site covers all four
+    // paths (stream/dictate/legacy/local) plus command dictations. Applied to
+    // BOTH texts so the sanityCheck word-overlap comparison below stays
+    // apples-to-apples — correcting only one side would skew it.
+    if (rawText) {
+      rawText = applyPronunciationAliases(rawText)
+      if (serverFormatted) serverFormatted = applyPronunciationAliases(serverFormatted)
     }
 
     if (!rawText || !rawText.trim()) {

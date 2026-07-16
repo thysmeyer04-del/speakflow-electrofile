@@ -4,7 +4,7 @@ import { getAuthToken } from './ipc'
 import { isProxyUrlAllowed } from './security'
 import { getSettings } from './settings'
 import { transcribeLocal, isLocalModelCached } from './local-whisper'
-import { getWhisperPrompt } from './user-context'
+import { getWhisperPrompt, getPronunciationSpellings } from './user-context'
 import { decodePcmViaRecorder } from './recorder'
 
 const PRODUCTION_PROXY = 'https://speakflow-marketing.vercel.app/api'
@@ -62,8 +62,23 @@ const AUDIO_FILENAME = 'audio.webm'
 
 // Deepgram Nova-3 — alternative cloud engine (better proper-noun accuracy,
 // built-in smart formatting). Any Deepgram failure falls back to Groq.
-const DEEPGRAM_LISTEN_URL =
-  'https://api.deepgram.com/v1/listen?model=nova-3&smart_format=true&language=multi'
+// English sessions get language=en + keyterm biasing from trained
+// pronunciations (keyterm prompting is nova-3 English-only); everything else
+// keeps the multi autodetect with no keyterms.
+function buildDeepgramListenUrl(language?: string): string {
+  const url = new URL('https://api.deepgram.com/v1/listen')
+  url.searchParams.set('model', 'nova-3')
+  url.searchParams.set('smart_format', 'true')
+  if (language && language.toLowerCase().startsWith('en')) {
+    url.searchParams.set('language', 'en')
+    for (const term of getPronunciationSpellings().slice(0, 20)) {
+      if (term.length <= 40) url.searchParams.append('keyterm', term)
+    }
+  } else {
+    url.searchParams.set('language', 'multi')
+  }
+  return url.toString()
+}
 
 interface TranscribeOptions {
   language?: string
@@ -164,7 +179,7 @@ async function transcribeViaCloud(
     try {
       return proxyUrl
         ? await transcribeViaProxy(audio, proxyUrl, opts, 'deepgram')
-        : await transcribeViaDeepgram(audio)
+        : await transcribeViaDeepgram(audio, opts.language)
     } catch (err) {
       // Deepgram is best-effort: missing key, non-200, or proxy
       // provider_unavailable all fall back to the Groq path transparently.
@@ -247,7 +262,7 @@ async function transcribeViaGroq(
   return data.text ?? ''
 }
 
-async function transcribeViaDeepgram(buffer: Buffer): Promise<string> {
+async function transcribeViaDeepgram(buffer: Buffer, language?: string): Promise<string> {
   const apiKey = process.env.DEEPGRAM_API_KEY
   if (!apiKey) {
     throw new Error('DEEPGRAM_API_KEY is not set.')
@@ -256,7 +271,7 @@ async function transcribeViaDeepgram(buffer: Buffer): Promise<string> {
   let response: Response
   try {
     response = await fetchWithTimeout(
-      DEEPGRAM_LISTEN_URL,
+      buildDeepgramListenUrl(language),
       {
         method: 'POST',
         headers: {
@@ -304,6 +319,12 @@ async function transcribeViaProxy(
   // forces the single-space prompt instead of the dictionary (hallucination
   // guard), which is still better than no prompt at all.
   form.append('prompt', whisperPromptForClip(opts.speechMs))
+  // Keyterm bias for the Deepgram proxy branch (v0.7.0, en-only server-side).
+  // Old servers ignore the unknown field.
+  if (provider === 'deepgram') {
+    const keyterms = getPronunciationSpellings().slice(0, 20).join(',')
+    if (keyterms) form.append('keyterms', keyterms.slice(0, 300))
+  }
 
   const url =
     baseUrl.replace(/\/+$/, '') +
