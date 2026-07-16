@@ -17,6 +17,7 @@ import { initCommandsStore, getCommands } from './commands-store'
 import {
   registerCommandHotkeys,
   unregisterAllCommandHotkeys,
+  reassertCommandHotkeys,
 } from './commands-hotkey'
 import { setupIPC } from './ipc'
 import { setupAutoUpdater } from './updater'
@@ -448,14 +449,17 @@ app.whenReady().then(async () => {
     if (overlayWindow && !overlayWindow.isDestroyed() && !overlayWindow.isVisible()) {
       overlayWindow.showInactive()
     }
-    // Sleep/wake can silently drop a global shortcut on Windows — reclaim F11.
+    // Sleep/wake can silently drop a global shortcut on Windows — reclaim F11
+    // and any command hotkeys another app was holding.
     reassertHotkey()
+    reassertCommandHotkeys()
   })
 
   // Foreground app changes can leave another process holding our hotkey; every
   // time our own window regains focus, re-assert ownership of the preferred key.
   app.on('browser-window-focus', () => {
     reassertHotkey()
+    reassertCommandHotkeys()
   })
 
   selfCheckTrayAssets()
