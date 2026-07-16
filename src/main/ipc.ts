@@ -31,7 +31,7 @@ import {
   validateAuthToken,
 } from './security'
 import { refreshUserContext, clearUserContext } from './user-context'
-import { clearAsrToken } from './asr-token'
+import { clearAsrToken, prewarmAsrToken } from './asr-token'
 
 interface SetupArgs {
   mainWindow: BrowserWindow
@@ -215,6 +215,10 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       // different identity — drop it so the next stream re-mints under this
       // one. (After a plain refresh this costs one cheap re-mint.)
       clearAsrToken()
+      // …and immediately pre-mint under the NEW identity so the very next
+      // dictation's streaming path starts with a cached grant instead of
+      // paying mint latency inside the recording window. Fire-and-forget.
+      void prewarmAsrToken()
       // Warm the personal dictionary + snippets cache now that we can make
       // RLS-authorized reads. Fire-and-forget — never blocks the auth reply.
       void refreshUserContext()

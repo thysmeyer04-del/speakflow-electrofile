@@ -20,6 +20,7 @@
 import log from 'electron-log/main'
 import { getAuthToken } from './ipc'
 import { isProxyUrlAllowed } from './security'
+import { getSettings } from './settings'
 import {
   getProxyBaseUrl,
   fetchWithTimeout,
@@ -70,6 +71,51 @@ let cached: { token: string; expiresAt: number } | null = null
  *  by the next one (and after a plain refresh, re-minting is one cheap call). */
 export function clearAsrToken(): void {
   cached = null
+}
+
+// ── Proactive pre-mint loop ─────────────────────────────────────────────────
+// Field data (2026-07-16, first live session): minting INSIDE the dictation
+// cost 2.3s cold + ~1s WS connect, so a 3s dictation ended before streaming
+// was ready and every short dictation fell back to batch. The fix is to make
+// getAsrToken() a guaranteed cache hit at hotkey-press: re-mint in the
+// background whenever the cached grant is near expiry. The loop is cheap
+// (one HTTPS call per ~4 min, only while signed in AND streaming enabled)
+// and doubles as the /asr-token lambda keep-warm.
+const PREWARM_INTERVAL_MS = 45_000
+// Re-mint when less than this much life remains (well above the reuse margin
+// so the hot path never sees a stale token).
+const PREWARM_MIN_REMAINING_MS = 60_000
+let prewarmTimer: NodeJS.Timeout | null = null
+let prewarmInFlight = false
+
+/** One-shot background pre-mint. Safe to call anytime: no-ops unless
+ *  streaming is enabled, a JWT exists, and the cache is empty/near-expiry. */
+export async function prewarmAsrToken(): Promise<void> {
+  if (prewarmInFlight) return
+  if (getSettings().streamingEngine !== 'deepgram') return
+  if (!getAuthToken()) return
+  if (cached && cached.expiresAt - Date.now() > PREWARM_MIN_REMAINING_MS) return
+  prewarmInFlight = true
+  try {
+    await getAsrToken()
+    log.info('[asr-token] pre-warmed grant (background)')
+  } catch (err) {
+    // Quota/config errors here are expected states, not failures — the next
+    // dictation surfaces them properly if still true. Log-only.
+    log.info(`[asr-token] pre-warm skipped: ${(err as Error).message}`)
+  } finally {
+    prewarmInFlight = false
+  }
+}
+
+/** Start the background pre-mint loop (idempotent; unref'd so it never keeps
+ *  the process alive). Called once from main.ts after app ready. */
+export function startAsrTokenPrewarm(): void {
+  if (prewarmTimer) return
+  prewarmTimer = setInterval(() => void prewarmAsrToken(), PREWARM_INTERVAL_MS)
+  prewarmTimer.unref()
+  // Kick one immediately so the first dictation after launch is covered.
+  void prewarmAsrToken()
 }
 
 export async function getAsrToken(): Promise<string> {

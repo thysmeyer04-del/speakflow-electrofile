@@ -26,6 +26,7 @@ import { getSettings } from './settings'
 import { initRecorder, destroyRecorder, setLevelTargetWindow, warmupRecorderMic } from './recorder'
 import { warmupLocalWhisper } from './local-whisper'
 import { startProxyKeepAlive } from './transcribe'
+import { startAsrTokenPrewarm } from './asr-token'
 import { shutdownRecording } from './recording-controller'
 import { isQuitting, markQuitting } from './quit-state'
 import { configureSecurity, isExternalUrlAllowed, isOriginTrusted } from './security'
@@ -489,6 +490,9 @@ app.whenReady().then(async () => {
   // Cloud mode: keep the transcription proxy hot so the first dictation
   // after an idle period doesn't pay a serverless cold start.
   startProxyKeepAlive()
+  // Streaming grants are pre-minted in the background so hotkey-press never
+  // pays mint latency (2.3s cold, observed in the field) inside the dictation.
+  startAsrTokenPrewarm()
   registerHotkey(getSettings().hotkey)
   initCommandsStore()
   registerCommandHotkeys(getCommands())
