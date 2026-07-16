@@ -43,6 +43,8 @@ interface TranscriptionPayload {
 const ALLOWED_CHOICE_SETTINGS: Record<string, Set<string>> = {
   transcriptionMode: new Set(['cloud', 'local']),
   transcriptionProvider: new Set(['groq', 'deepgram']),
+  // True Streaming engine (2026-07): opt-in live transcription.
+  streamingEngine: new Set(['off', 'deepgram']),
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -84,6 +86,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       | 'launchAtLogin'
       | 'enableSmartFormatting'
       | 'stripDisfluencies'
+      | 'asrShadowCompare'
       | 'streamingTranscription',
     value: boolean,
   ): Promise<SettingsResult> => {
@@ -94,6 +97,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'launchAtLogin',
       'enableSmartFormatting',
       'stripDisfluencies',
+      'asrShadowCompare',
       'streamingTranscription',
     ])
     if (!allowed.has(key)) return { ok: false, error: 'invalid-key' }

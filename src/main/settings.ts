@@ -21,6 +21,17 @@ export interface AppSettings {
   // HuggingFace model id for local mode. Whisper sizes trade speed for
   // accuracy: Xenova/whisper-tiny < base < small < medium.
   localWhisperModel: string
+  // True Streaming (2026-07): live word-by-word transcription over a
+  // Deepgram Nova-3 WebSocket owned by the main process. 'off' by default —
+  // the batch pipeline is the proven path, and every streaming failure falls
+  // back to it seamlessly, so streaming is pure opt-in until shadow-compare
+  // data (below) proves transcript parity. English + cloud mode only.
+  streamingEngine: 'off' | 'deepgram'
+  // Diagnostics for the streaming rollout: after a stream-path dictation
+  // injects, ALSO run the batch /dictate on the same (still fully recorded)
+  // blob in the background and log a word-level diff ratio. Never affects
+  // what the user sees; costs one extra proxy round-trip per dictation.
+  asrShadowCompare: boolean
   // NOTE: streamingTranscription was removed with the segment-on-pause
   // streaming feature (Fast Batch, 2026-07). Old deployed dashboards still
   // send the toggle over IPC — ipc.ts accepts it as a no-op. Any stale
@@ -41,6 +52,8 @@ const defaults: AppSettings = {
   transcriptionMode: 'cloud',
   transcriptionProvider: 'groq',
   localWhisperModel: 'Xenova/whisper-medium',
+  streamingEngine: 'off',
+  asrShadowCompare: false,
 }
 
 const store = new Store<AppSettings>({

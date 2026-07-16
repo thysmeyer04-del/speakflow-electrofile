@@ -129,6 +129,9 @@ export type ToggleKey =
   | 'launchAtLogin'
   | 'enableSmartFormatting'
   | 'stripDisfluencies'
+  // True Streaming diagnostics: after a stream-path dictation, re-run the
+  // batch engine on the same blob in the background and log a diff ratio.
+  | 'asrShadowCompare'
   // Legacy: the streamingTranscription setting was removed along with
   // segment-on-pause streaming (Fast Batch, 2026-07), but old DEPLOYED
   // dashboards still render the toggle and send this key over IPC. It stays
@@ -145,6 +148,7 @@ export function validateToggleKey(input: unknown): ToggleKey | null {
     'launchAtLogin',
     'enableSmartFormatting',
     'stripDisfluencies',
+    'asrShadowCompare',
     'streamingTranscription', // accepted-but-ignored — see ToggleKey note
   ])
   return (allowed as Set<string>).has(input) ? (input as ToggleKey) : null
@@ -156,10 +160,14 @@ export function validateToggleKey(input: unknown): ToggleKey | null {
 export type ChoiceSetting =
   | { key: 'transcriptionMode'; value: 'cloud' | 'local' }
   | { key: 'transcriptionProvider'; value: 'groq' | 'deepgram' }
+  | { key: 'streamingEngine'; value: 'off' | 'deepgram' }
 
 const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
   transcriptionMode: new Set(['cloud', 'local']),
   transcriptionProvider: new Set(['groq', 'deepgram']),
+  // True Streaming rollout knob. 'off' by default — streaming is opt-in until
+  // shadow-compare data proves parity with the batch pipeline.
+  streamingEngine: new Set(['off', 'deepgram']),
 }
 
 export function validateChoiceSetting(
@@ -280,6 +288,23 @@ export function isProxyUrlAllowed(url: string): boolean {
     const parsed = new URL(url)
     if (parsed.protocol !== 'https:') return false
     return ALLOWED_PROXY_HOSTS.has(parsed.hostname.toLowerCase())
+  } catch {
+    return false
+  }
+}
+
+// ── ASR streaming WebSocket allowlist ───────────────────────────────────────
+// The live-transcription socket carries raw microphone audio plus a Deepgram
+// grant token. Exact-host, wss-only: the URL is built in-process from
+// constants, so anything else reaching this check means a bug or tampering —
+// refuse rather than stream audio to an unexpected endpoint.
+const ASR_WS_HOST = 'api.deepgram.com'
+
+export function isAsrWsUrlAllowed(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'wss:') return false
+    return parsed.hostname.toLowerCase() === ASR_WS_HOST
   } catch {
     return false
   }

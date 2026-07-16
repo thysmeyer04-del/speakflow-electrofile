@@ -88,11 +88,12 @@ declare global {
         | 'launchAtLogin'
         | 'enableSmartFormatting'
         | 'stripDisfluencies'
+        | 'asrShadowCompare'
         | 'streamingTranscription',
       value: boolean,
     ) => Promise<{ ok: boolean; error?: string }>
     setChoiceSetting: (
-      key: 'transcriptionMode' | 'transcriptionProvider',
+      key: 'transcriptionMode' | 'transcriptionProvider' | 'streamingEngine',
       value: string,
     ) => Promise<{ ok: boolean; error?: string }>
     getSettings: () => Promise<Record<string, unknown>>

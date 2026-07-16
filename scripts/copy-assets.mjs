@@ -12,6 +12,10 @@ const root = path.resolve(__dirname, '..')
 const pairs = [
   { src: 'src/recorder/recorder.html', dst: 'dist/recorder/recorder.html' },
   { src: 'src/overlay/overlay.html',   dst: 'dist/overlay/overlay.html' },
+  // AudioWorklet module for True Streaming: plain JS (worklet scopes can't be
+  // produced by this tsc build), loaded at runtime relative to recorder.html
+  // via audioWorklet.addModule('pcm-worklet.js') — must sit beside it in dist.
+  { src: 'src/recorder/pcm-worklet.js', dst: 'dist/recorder/pcm-worklet.js' },
 ]
 
 await fs.mkdir(path.join(root, 'dist/recorder'), { recursive: true })

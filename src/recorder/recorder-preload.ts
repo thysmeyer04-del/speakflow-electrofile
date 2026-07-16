@@ -2,9 +2,19 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 type Unsub = () => void
 
+// Live-PCM frame ceiling — mirrors MAX_PCM_FRAME_BYTES in main/recorder.ts
+// (defence in depth; main re-validates). A real frame is 1,600 bytes.
+const MAX_PCM_FRAME_BYTES = 8_192
+
+interface StartPayload {
+  microphoneId: string
+  needPcm?: boolean
+  streamPcm?: boolean
+}
+
 contextBridge.exposeInMainWorld('recorderAPI', {
-  onStart: (cb: (payload: { microphoneId: string; needPcm?: boolean }) => void): Unsub => {
-    const wrapped = (_e: unknown, p: { microphoneId: string; needPcm?: boolean }) => cb(p)
+  onStart: (cb: (payload: StartPayload) => void): Unsub => {
+    const wrapped = (_e: unknown, p: StartPayload) => cb(p)
     ipcRenderer.on('recorder:start', wrapped)
     return () => ipcRenderer.removeListener('recorder:start', wrapped)
   },
@@ -44,4 +54,17 @@ contextBridge.exposeInMainWorld('recorderAPI', {
   // Fire-and-forget level updates for the overlay waveform. Payload is a small
   // array of 0..1 floats (one per bar). Validation lives in main/recorder.ts.
   sendLevels: (levels: number[]) => ipcRenderer.send('recorder:levels', levels),
+  // True Streaming: one 50 ms int16 PCM frame from the AudioWorklet tap.
+  // Fire-and-forget — a dropped frame only trims the live preview; the
+  // MediaRecorder blob still carries every sample for the batch fallback.
+  sendPcmFrame: (buf: ArrayBuffer) => {
+    if (!(buf instanceof ArrayBuffer)) return
+    if (buf.byteLength === 0 || buf.byteLength > MAX_PCM_FRAME_BYTES) return
+    ipcRenderer.send('recorder:pcm-frame', buf)
+  },
+  // Renderer-side declaration that the 16 kHz worklet graph could not be
+  // built this session (device refused the rate, module load failed, …).
+  // Main tears down the ASR socket and lets the batch path carry the clip.
+  reportPcmUnavailable: (reason: string) =>
+    ipcRenderer.send('recorder:pcm-unavailable', String(reason).slice(0, 200)),
 })

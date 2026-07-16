@@ -27,12 +27,23 @@
 //     the compressed blob back here only when local inference actually needs
 //     samples.
 //
+//   Live PCM tap (True Streaming, 2026-07): when the start payload carries
+//   streamPcm:true, a SECOND AudioContext pinned to 16 kHz runs an
+//   AudioWorklet ('pcm16-frames', staged as pcm-worklet.js beside this file)
+//   that ships 50 ms int16 frames to main via 'recorder:pcm-frame'. Main
+//   forwards them to a Deepgram WebSocket it owns. If the tap can't be built
+//   (device refuses 16 kHz, worklet load fails) the renderer reports
+//   'recorder:pcm-unavailable' and the session continues batch-only — the
+//   MediaRecorder below ALWAYS runs regardless of streamPcm, so streaming
+//   failures can never lose audio.
+//
 // Segment-on-pause streaming was REMOVED (Fast Batch, 2026-07): partial
 // segments never fired in any of 37 logged production sessions (the pause
 // detector's preconditions were effectively unreachable with real mics), and
 // Groq bills a 10 s minimum per uploaded segment, so each cut would have
 // multiplied cost for zero latency win. The adaptive-noise-floor idea from
-// that code lives on below in the speech-seconds tracker.
+// that code lives on below in the speech-seconds tracker. True Streaming
+// (above) is a different beast: one persistent socket, no per-segment billing.
 
 // Types for window.recorderAPI live in src/types/recorder-api.d.ts so this
 // file stays a plain script (no module wrappers) — it's loaded via <script>
@@ -116,6 +127,23 @@ const SPEECH_FRAME_MAX_CREDIT_MS = 250
 // decode entirely — it was pure waste on the stop→paste hot path.
 let needPcmEnabled = false
 
+// ── Live PCM tap (True Streaming) ───────────────────────────────────────────
+// Separate AudioContext from the gain/level ones: it must be pinned to
+// 16 kHz (Deepgram linear16 contract) while the others run at device rate.
+let pcmAudioCtx: AudioContext | null = null
+let pcmSource: MediaStreamAudioSourceNode | null = null
+let pcmGain: GainNode | null = null
+let pcmMute: GainNode | null = null
+let pcmWorklet: AudioWorkletNode | null = null
+// Monotonic guard: addModule() is async, and a stop can land mid-setup. Each
+// setup captures its id and bails after every await if teardown (which bumps
+// the counter) happened underneath it.
+let pcmSession = 0
+// Teardown grace: the 'flush' port message and the tail frame it produces
+// are asynchronous hops (main thread → audio thread → main thread). Closing
+// the context in the same tick would eat the tail — give it a beat.
+const PCM_FLUSH_GRACE_MS = 100
+
 let maxDurationTimer: number | null = null
 let recordingStartedAt = 0
 // Set whenever finalizeMediaRecorder is in flight so a concurrent stop
@@ -166,7 +194,7 @@ if (!window.recorderAPI) {
 
   window.recorderAPI.onStart(async (payload) => {
     console.log('[recorder.ts] received start', payload)
-    await start(payload.microphoneId, payload.needPcm === true)
+    await start(payload.microphoneId, payload.needPcm === true, payload.streamPcm === true)
   })
 
   window.recorderAPI.onStop(async () => {
@@ -217,7 +245,7 @@ async function warmupMicStream(microphoneId: string): Promise<void> {
   }
 }
 
-async function start(microphoneId: string, needPcm = false): Promise<void> {
+async function start(microphoneId: string, needPcm = false, streamPcm = false): Promise<void> {
   if (localState === 'starting' || localState === 'recording') {
     // Only legitimately-active states reject. Everything else is treated as
     // a wedge — see below.
@@ -363,6 +391,114 @@ async function start(microphoneId: string, needPcm = false): Promise<void> {
   }, MAX_DURATION_MS)
 
   window.recorderAPI.reportStarted()
+
+  // Live PCM tap AFTER the start ACK, fire-and-forget: worklet setup takes
+  // tens of ms and must never delay main's 'recording' transition. Frames
+  // that miss the socket's opening moments are main's problem to buffer —
+  // and any setup failure only means this session streams nothing.
+  if (streamPcm && mediaStream) {
+    void startPcmStream(mediaStream)
+  }
+}
+
+// ── Live PCM tap: 16 kHz worklet graph for True Streaming ──────────────────
+// mediaStream → MediaStreamSource → GainNode(1.4x, same boost the recording
+// gets so Deepgram hears what Whisper would) → AudioWorkletNode
+// ('pcm16-frames') → muted gain → destination. The muted sink matters:
+// Chromium only pulls (and therefore only calls process() on) graph branches
+// that terminate in a rendered output; gain 0 keeps the tap silent.
+async function startPcmStream(stream: MediaStream): Promise<void> {
+  const mySession = ++pcmSession
+  let ctx: AudioContext | null = null
+  try {
+    // decode-rate pinning: a 16 kHz context makes Chromium do the resampling
+    // from the device rate for us, so the worklet's samples are wire-ready.
+    ctx = new AudioContext({ sampleRate: 16_000 })
+    if (Math.round(ctx.sampleRate) !== 16_000) {
+      // Device/UA refused the rate (rare — Chromium normally honors it).
+      // Skip streaming for this session; NEVER fail the recording over it.
+      console.warn(`[recorder] pcm tap unavailable: context rate ${ctx.sampleRate}`)
+      window.recorderAPI.reportPcmUnavailable?.(`sample-rate:${ctx.sampleRate}`)
+      ctx.close().catch(() => undefined)
+      return
+    }
+    // Resolved relative to recorder.html's URL (dist/recorder/), where
+    // copy-assets.mjs stages the module beside this script.
+    await ctx.audioWorklet.addModule('pcm-worklet.js')
+    if (mySession !== pcmSession || localState !== 'recording') {
+      // Stop/teardown raced the async module load — abandon quietly.
+      ctx.close().catch(() => undefined)
+      return
+    }
+    const source = ctx.createMediaStreamSource(stream)
+    const gain = ctx.createGain()
+    gain.gain.value = 1.4
+    const worklet = new AudioWorkletNode(ctx, 'pcm16-frames', {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [1],
+    })
+    const mute = ctx.createGain()
+    mute.gain.value = 0
+    worklet.port.onmessage = (event: MessageEvent) => {
+      const frame = event.data as Int16Array
+      if (frame instanceof Int16Array && frame.length > 0) {
+        try {
+          // The worklet transferred the buffer, so it's exactly this frame's
+          // bytes — no offset/length bookkeeping needed.
+          window.recorderAPI.sendPcmFrame?.(frame.buffer as ArrayBuffer)
+        } catch {
+          // Frame loss only trims the live preview — never break recording.
+        }
+      }
+    }
+    source.connect(gain)
+    gain.connect(worklet)
+    worklet.connect(mute)
+    mute.connect(ctx.destination)
+    pcmAudioCtx = ctx
+    pcmSource = source
+    pcmGain = gain
+    pcmWorklet = worklet
+    pcmMute = mute
+    console.log('[recorder] pcm tap live (16 kHz worklet)')
+  } catch (err) {
+    console.warn('[recorder] pcm tap init failed — session is batch-only', err)
+    try {
+      window.recorderAPI.reportPcmUnavailable?.(`init-failed: ${(err as Error).message}`)
+    } catch {
+      // ignore — main will fall back on its own finalize timeout
+    }
+    if (ctx) ctx.close().catch(() => undefined)
+  }
+}
+
+function stopPcmStream(): void {
+  pcmSession++ // cancels any in-flight startPcmStream setup
+  const ctx = pcmAudioCtx
+  const worklet = pcmWorklet
+  const source = pcmSource
+  const gain = pcmGain
+  const mute = pcmMute
+  pcmAudioCtx = null
+  pcmWorklet = null
+  pcmSource = null
+  pcmGain = null
+  pcmMute = null
+  if (!ctx && !worklet) return
+  // Order matters: cut the source first (no new samples), THEN ask the
+  // worklet to flush its partial tail frame, THEN close after a grace period
+  // long enough for the two async port hops to complete. onmessage stays
+  // attached so the tail still reaches main (where a finalized ASR session
+  // simply drops it — the MediaRecorder blob has the same audio).
+  try { source?.disconnect() } catch { /* ignore */ }
+  try { gain?.disconnect() } catch { /* ignore */ }
+  try { worklet?.port.postMessage('flush') } catch { /* ignore */ }
+  window.setTimeout(() => {
+    try { worklet?.disconnect() } catch { /* ignore */ }
+    try { mute?.disconnect() } catch { /* ignore */ }
+    if (ctx) ctx.close().catch(() => undefined)
+  }, PCM_FLUSH_GRACE_MS)
 }
 
 // One MediaRecorder per session (streaming's mid-session replacement
@@ -658,6 +794,10 @@ async function cleanup(): Promise<void> {
     maxDurationTimer = null
   }
   stopLevelMonitor()
+  // Live PCM tap teardown (flush + deferred close) — must run on EVERY
+  // cleanup path (user stop, autoStop, error recovery, wedge reset) or a
+  // leaked 16 kHz context would keep the audio pipeline warm forever.
+  stopPcmStream()
   if (mediaRecorder) {
     try {
       if (mediaRecorder.state !== 'inactive') mediaRecorder.stop()

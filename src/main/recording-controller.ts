@@ -15,9 +15,13 @@ import {
   stopRecorderSession,
   onRecorderCrash,
   onAutoStop,
+  setPcmFrameHandler,
+  setPcmUnavailableHandler,
 } from './recorder'
 import { transcribeAudio, getProxyBaseUrl } from './transcribe'
 import { dictateViaProxy, isAuthOrQuotaError } from './dictate'
+import { startAsrStream, AsrSession } from './asr-stream'
+import { asrErrorCode, reportStreamingUsage } from './asr-token'
 import { isSilenceArtifact, ARTIFACT_MAX_SPEECH_MS } from './whisper-artifacts'
 import { syncToKnowledgeBase } from './supabase'
 import { getAuthToken } from './ipc'
@@ -65,13 +69,34 @@ export function getPendingCommandId(): string | null {
   return pendingCommandId
 }
 
-// NOTE on removed streaming: segment-on-pause transcription (partial
+// NOTE on streaming history: segment-on-pause transcription (partial
 // segments transcribed while the user was still talking) was deleted in the
 // Fast Batch work — partials fired in 0 of 37 logged sessions, and Groq
 // bills a 10 s minimum per uploaded segment. The 'partial-transcript'
-// broadcast channel and the overlay's setPartial() renderer are KEPT: a
-// future true-streaming implementation will reuse them; the channel simply
-// never fires for now.
+// broadcast channel and the overlay's setPartial() renderer were KEPT, and
+// True Streaming (2026-07) now feeds them: a Deepgram Nova-3 WebSocket owned
+// by asr-stream.ts receives live PCM from the recorder window and pushes
+// interim words to the overlay while the user talks.
+//
+// ── True Streaming state machine (per recording session) ───────────────────
+//   doStart (eligible)  → recorder gets streamPcm:true AND the ASR socket is
+//                         opened in parallel (never awaited on the hot path).
+//                         PCM frames arriving before 'open' are backlogged
+//                         and burst-fed once the socket resolves, so the
+//                         stream transcript still covers the first words.
+//   doStop              → session.finalize() runs IN PARALLEL with the
+//                         recorder blob collection. Non-empty flush result →
+//                         path='stream': skip /dictate entirely, feed the
+//                         transcript into the SAME collapse → filler-strip →
+//                         empty-guard → shouldFormat/formatTranscript →
+//                         sanityCheck → snippets → inject post-pipeline.
+//   any failure         → (mint/connect/pcm-unavailable/finalize-timeout/
+//                         empty flush/socket death) log 'asr fallback
+//                         reason=…' and let the batch pipeline process the
+//                         MediaRecorder blob, which recorded the ENTIRE clip
+//                         in parallel — streaming can never lose audio.
+//   invalidation        → recorder crash / sign-out / shutdown bump sessionId
+//                         and abort the socket via teardownAsrStream().
 
 // ── Hallucination guard thresholds (work item E) ───────────────────────────
 // A clip with less than this much measured speech-level audio is dropped
@@ -82,6 +107,109 @@ export function getPendingCommandId(): string | null {
 // hiss", this speech-seconds gate catches "one door slam in a silent room".
 const MIN_SPEECH_MS = 400
 
+// ── True Streaming session state ────────────────────────────────────────────
+// Live Deepgram session for the CURRENT recording, or null. Set only after
+// the socket opens; doStop consumes it; every invalidation path clears it.
+let asrSession: AsrSession | null = null
+// True while the socket is still connecting — frames arriving in that window
+// go to the backlog below instead of the floor, so the stream transcript
+// isn't missing the user's first words (connect + token mint can take
+// 300-1000 ms and people start talking immediately).
+let asrPendingSetup = false
+let asrBacklog: Buffer[] = []
+// 400 frames × 50 ms = 20 s of backlog. If the socket hasn't opened by then
+// the connection is hopeless — drop streaming for the session rather than
+// hoarding audio in RAM (the batch blob has it all anyway).
+const ASR_BACKLOG_MAX_FRAMES = 400
+
+/** Abort/clear all streaming state. Safe to call at any time from any path —
+ *  abort() on an already-finalized session is a no-op, and clearing the PCM
+ *  handlers just means future frames drop harmlessly on the floor. */
+function teardownAsrStream(reason: string): void {
+  if (asrSession || asrPendingSetup) {
+    log.info(`[asr] stream teardown (${reason})`)
+  }
+  if (asrSession) {
+    try {
+      asrSession.abort()
+    } catch (err) {
+      log.warn('[asr] abort threw', err)
+    }
+  }
+  asrSession = null
+  asrPendingSetup = false
+  asrBacklog = []
+  setPcmFrameHandler(null)
+  setPcmUnavailableHandler(null)
+}
+
+/** Kick off the ASR socket + PCM plumbing for one session. Deliberately NOT
+ *  awaited by doStart: streaming must never delay 'recording-started', and
+ *  every outcome (open, mint failure, connect failure) is handled through
+ *  session-guarded continuations below. */
+function beginAsrStream(mySession: number, t0: number): void {
+  asrBacklog = []
+  asrPendingSetup = true
+
+  setPcmFrameHandler((frame) => {
+    if (mySession !== sessionId) return // stale session's frames — drop
+    if (asrSession) {
+      asrSession.sendFrame(frame)
+      return
+    }
+    if (!asrPendingSetup) return // stream already declared dead — drop
+    if (asrBacklog.length >= ASR_BACKLOG_MAX_FRAMES) {
+      log.info('[timing] asr fallback reason=connect-backlog-overflow')
+      teardownAsrStream('backlog-overflow')
+      return
+    }
+    asrBacklog.push(frame)
+  })
+
+  setPcmUnavailableHandler((reason) => {
+    if (mySession !== sessionId) return
+    // The recorder window can't produce live PCM this session — a socket
+    // with no audio is pointless, kill it (or the pending setup).
+    log.info(`[timing] asr fallback reason=pcm-unavailable detail=${reason}`)
+    teardownAsrStream('pcm-unavailable')
+  })
+
+  void startAsrStream({
+    language: 'en',
+    onInterim: (text) => {
+      // Guarded per interim: a socket that outlives its session (crash,
+      // sign-out) must not paint stale words into a new session's overlay.
+      if (mySession !== sessionId) return
+      broadcast('partial-transcript', text)
+    },
+  })
+    .then((session) => {
+      if (mySession !== sessionId || !asrPendingSetup) {
+        // Session ended / was torn down while we were connecting.
+        session.abort()
+        return
+      }
+      asrSession = session
+      asrPendingSetup = false
+      // Burst-feed everything captured while connecting. Deepgram decodes
+      // faster than real time, so it catches up within a few hundred ms.
+      for (const frame of asrBacklog) session.sendFrame(frame)
+      asrBacklog = []
+      log.info(`[timing] asr session live at +${Date.now() - t0}ms`)
+    })
+    .catch((err) => {
+      if (mySession !== sessionId) return
+      // Includes quota (402 at mint): stay silent here — the batch path
+      // enforces the same quota and surfaces the same message when it runs,
+      // so the user gets exactly one consistent error.
+      log.info(
+        `[timing] asr fallback reason=${asrErrorCode(err) ?? 'setup-failed'} ` +
+          `detail=${(err as Error).message}`,
+      )
+      teardownAsrStream('setup-failed')
+    })
+}
+
 /** Start a dictation whose transcript will be transformed by `commandId`'s
  *  prompt (e.g. spoken rough notes → composed email) before pasting. */
 export function startCommandRecording(commandId: string): Promise<void> {
@@ -90,7 +218,9 @@ export function startCommandRecording(commandId: string): Promise<void> {
       broadcast('recording-busy', state)
       return
     }
-    await doStart()
+    // forCommand=true keeps streaming OFF: a command dictation's formatting
+    // IS the command prompt, so the stream path's format flow doesn't apply.
+    await doStart(true)
     // Only arm the command if the recorder actually started (doStart resets
     // pendingCommandId, so set it after). getRecordingState() rather than a
     // direct read: TS narrows `state` to 'idle' across the await otherwise.
@@ -136,6 +266,9 @@ onRecorderCrash((reason) => {
   if (state === 'idle') return
   log.error(`[recording] recorder crash: ${reason}`)
   sessionId++ // invalidate any in-flight session
+  // The PCM source just died with the renderer — close the Deepgram socket
+  // now instead of letting it idle out on the server's timeout.
+  teardownAsrStream('recorder-crash')
   void enqueue(async () => {
     broadcast('transcription-error', 'Recorder crashed — please try again.')
     broadcast('processing-complete')
@@ -206,13 +339,16 @@ export function stopRecording(): Promise<void> {
   })
 }
 
-async function doStart(): Promise<void> {
+async function doStart(forCommand = false): Promise<void> {
   const t0 = Date.now()
   // If a transform is mid-flight (LLM call resolving), abort it so its
   // delayed Ctrl+V doesn't fire into a now-active recording context.
   abortInFlightTransform()
   // Same for an in-flight smart-formatting pass on a prior transcription.
   abortInFlightFormat()
+  // Belt + braces: doStop always clears streaming state, but a leftover
+  // socket from an abnormal path must never receive a new session's audio.
+  teardownAsrStream('superseded-by-new-start')
   const mySession = ++sessionId
   // A plain F11 dictation must never inherit a command from a previous
   // session; startCommandRecording re-arms this after doStart returns.
@@ -249,14 +385,37 @@ async function doStart(): Promise<void> {
   // fallback re-requests PCM on demand ('recorder:decode-pcm').
   const transcriptionMode =
     process.env.SPEAKFLOW_TRANSCRIPTION_MODE || settings.transcriptionMode
+
+  // ── True Streaming eligibility ────────────────────────────────────────────
+  // Opt-in engine + cloud mode + a proxy to mint grants against + a live JWT
+  // + English (Nova-3 streaming is en-validated only; filler-strip is
+  // English-only too) + not a command dictation (its formatting IS the
+  // command prompt). Anything ineligible runs the exact pre-streaming flow.
+  const streamEligible =
+    settings.streamingEngine === 'deepgram' &&
+    transcriptionMode === 'cloud' &&
+    !!getProxyBaseUrl() &&
+    !!getAuthToken() &&
+    settings.language.startsWith('en') &&
+    !forCommand
+
+  // Open the Deepgram socket IN PARALLEL with the recorder start — never
+  // awaited: hotkey → 'recording-started' latency is sacred, and beginAsr-
+  // Stream handles every outcome through session-guarded continuations.
+  if (streamEligible) {
+    beginAsrStream(mySession, t0)
+  }
+
   try {
     await startRecorderSession({
       microphoneId: settings.microphone,
       needPcm: transcriptionMode === 'local',
+      streamPcm: streamEligible,
     })
   } catch (err) {
     const msg = (err as Error).message
     log.error('[recording] start failed', err)
+    teardownAsrStream('recorder-start-failed') // no recorder → no PCM → no stream
     broadcast('transcription-error', humanizeStartError(msg))
     focusTarget = null
     setState('idle')
@@ -288,6 +447,25 @@ async function doStop(): Promise<void> {
   const settings = getSettings()
   if (settings.dictationSounds) playSound('stop')
 
+  // ── True Streaming: flush Deepgram IN PARALLEL with the blob collection ──
+  // finalize() sends the Finalize control message immediately; its promise is
+  // pre-settled into a {text|failure} shape so Promise semantics can never
+  // let a stream failure reject past the batch path (allSettled-by-hand).
+  // The MediaRecorder blob below is ALWAYS collected regardless — it is the
+  // complete-audio fallback for every streaming failure mode.
+  const streamSession = asrSession
+  const tFinalize = Date.now()
+  const finalizeSettled: Promise<{ text: string | null; failure: string | null }> | null =
+    streamSession
+      ? streamSession.finalize().then(
+          (text) => ({ text, failure: null }),
+          (err: unknown) => ({
+            text: null,
+            failure: `${asrErrorCode(err) ?? 'unknown'} (${(err as Error).message})`,
+          }),
+        )
+      : null
+
   let audioBuffer: Buffer | null = null
   let audioPcm: Float32Array | null = null
   let speechMs: number | null = null
@@ -306,6 +484,7 @@ async function doStop(): Promise<void> {
     )
   } catch (err) {
     log.error('[recording] stop failed', err)
+    teardownAsrStream('recorder-stop-failed')
     if (mySession !== sessionId) return
     broadcast('transcription-error', 'Could not finalise the recording.')
     broadcast('processing-complete')
@@ -313,6 +492,27 @@ async function doStop(): Promise<void> {
     setState('idle')
     return
   }
+
+  // Collect the parallel flush. Bounded by finalize()'s own 2 s internal
+  // timeout, and mostly overlapped with the blob wait above, so the stream
+  // path's stop→text cost is ~the finalize RTT (~300 ms), not additive.
+  let streamText: string | null = null
+  let streamMs = 0
+  if (finalizeSettled) {
+    const settled = await finalizeSettled
+    streamMs = Date.now() - tFinalize
+    if (settled.failure) {
+      log.info(`[timing] asr fallback reason=finalize-failed detail=${settled.failure}`)
+    } else if (!settled.text || !settled.text.trim()) {
+      // Socket lived but heard nothing usable — batch gets the final say.
+      log.info('[timing] asr fallback reason=empty-stream-transcript')
+    } else {
+      streamText = settled.text
+    }
+  }
+  // The session is spent either way (finalize closes the socket); release
+  // the PCM handlers/backlog before processing begins.
+  teardownAsrStream('stopped')
 
   if (mySession !== sessionId) {
     log.info('[recording] doStop abandoned post-blob — session invalidated')
@@ -338,6 +538,8 @@ async function doStop(): Promise<void> {
     peakLevel,
     stopStartedAt: t0,
     stopToBlobMs,
+    streamText,
+    streamMs,
   })
 }
 
@@ -376,6 +578,13 @@ interface StopStats {
   // Date.now() at doStop entry — anchor for the summary's total.
   stopStartedAt: number
   stopToBlobMs: number
+  // True Streaming: the finalized Deepgram transcript, or null when the
+  // session didn't stream / the flush failed / it came back empty — in which
+  // case processAudio transcribes the blob exactly as before streaming existed.
+  streamText: string | null
+  // How long doStop waited on the flush — becomes 'transcribe' in the summary
+  // when the stream path wins.
+  streamMs: number
 }
 
 async function processAudio(
@@ -390,7 +599,7 @@ async function processAudio(
   // so latency distributions can be rebuilt from user logs with a single
   // grep for '[timing] summary'. total = doStop entry → inject resolved (or
   // the failure point when the pipeline never reached inject).
-  let path: 'dictate' | 'legacy' | 'local' = 'legacy'
+  let path: 'dictate' | 'legacy' | 'local' | 'stream' = 'legacy'
   let transcribeMs = 0
   let formatMs: number | null = null // null renders as 'skip'
   let injectMs = 0
@@ -444,10 +653,28 @@ async function processAudio(
     const useDictate =
       transcriptionMode === 'cloud' && provider === 'groq' && !!proxyBase && !command
 
+    // True Streaming result from doStop's parallel finalize. Command guard is
+    // belt + braces — doStart already refuses streaming for command sessions,
+    // but a command must NEVER consume a stream transcript: its transform
+    // pipeline expects to own all formatting.
+    const streamText =
+      !command && stats.streamText && stats.streamText.trim() ? stats.streamText.trim() : null
+
     let rawText: string | null = null
     let serverFormatted: string | undefined
 
-    if (useDictate) {
+    if (streamText) {
+      // Stream path: the transcript is already here — no upload, no proxy
+      // round-trip. From this point it flows through the IDENTICAL post-
+      // pipeline as a legacy transcript: collapse → filler-strip → empty
+      // guard → shouldFormat/formatTranscript (+ sanityCheck) → snippets →
+      // inject. serverFormatted stays undefined on purpose so the local
+      // format branch below applies its usual skip-gate (Deepgram's
+      // smart_format already punctuated; short clips skip the LLM pass).
+      path = 'stream'
+      rawText = streamText
+      transcribeMs = stats.streamMs
+    } else if (useDictate) {
       path = 'dictate'
       const tDictate = Date.now()
       try {
@@ -680,6 +907,24 @@ async function processAudio(
           }
         })
       }
+
+      if (path === 'stream') {
+        // Usage accounting: /dictate meters words server-side as a side
+        // effect of the upload, but the stream path never uploads — self-
+        // report so weekly quotas keep counting streamed dictations.
+        // Fire-and-forget; a lost beacon never touches the user.
+        reportStreamingUsage({
+          audioSeconds: stats.durationSeconds,
+          words: rawTrimmed.split(/\s+/).filter(Boolean).length,
+        })
+        // Shadow compare (rollout diagnostics): re-run the batch engine on
+        // the same blob in the background and log a word-level diff ratio —
+        // the data that decides whether streamingEngine can default on.
+        // Runs strictly AFTER inject; never affects what the user got.
+        if (liveSettings.asrShadowCompare && streamText) {
+          scheduleShadowCompare(buffer, streamText, lang, stats.speechMs)
+        }
+      }
     }
   } catch (err) {
     log.error('[recording] transcription failed', err)
@@ -714,6 +959,10 @@ export function abortInFlightRecording(reason: string): void {
   log.info(`[recording] abort requested: ${reason}`)
   sessionId++
   abortInFlightFormat()
+  // Sign-out must kill the live audio socket immediately: the grant token
+  // belongs to the departing identity and mic audio must stop leaving the
+  // machine the moment the session is invalidated.
+  teardownAsrStream(`abort: ${reason}`)
   void enqueue(async () => {
     broadcast('recording-stopped')
     broadcast('processing-complete')
@@ -721,6 +970,67 @@ export function abortInFlightRecording(reason: string): void {
     pendingCommandId = null
     setState('idle')
   })
+}
+
+// ── Shadow compare (streaming rollout diagnostics) ──────────────────────────
+// Grades the stream transcript against the proven batch engine on the SAME
+// audio, entirely in the background, entirely log-only. format:false because
+// the comparison is raw-vs-raw — paying the format LLM for a diff nobody
+// pastes would double the cost of every shadowed dictation.
+function scheduleShadowCompare(
+  audio: Buffer,
+  streamRaw: string,
+  language: string | undefined,
+  speechMs: number | null,
+): void {
+  setImmediate(() => {
+    dictateViaProxy(audio, {
+      language,
+      format: false,
+      stripDisfluencies: false,
+      dictionary: [],
+      speechMs,
+    })
+      .then((res) => {
+        const diff = wordDiffRatio(streamRaw, res.raw)
+        log.info(
+          `[asr-shadow] diffPct=${(diff * 100).toFixed(1)} ` +
+            `streamLen=${streamRaw.length} batchLen=${res.raw.length}`,
+        )
+      })
+      .catch((err) =>
+        log.warn('[asr-shadow] batch compare failed (diagnostics only)', err),
+      )
+  })
+}
+
+// Word-level dissimilarity: 1 - (2·LCS / (|a|+|b|)) over normalized word
+// arrays — 0 = identical, 1 = nothing in common. Words are lowercased and
+// stripped of punctuation before comparing, because smart_format (stream) and
+// raw Whisper (batch) punctuate differently and that noise isn't accuracy.
+// O(n·m) DP capped at 1,500 words per side (~2 ms worst case, off hot path).
+function wordDiffRatio(a: string, b: string): number {
+  const norm = (s: string): string[] =>
+    s
+      .toLowerCase()
+      .split(/\s+/)
+      .map((w) => w.replace(/[^a-z0-9']/g, ''))
+      .filter(Boolean)
+      .slice(0, 1500)
+  const wa = norm(a)
+  const wb = norm(b)
+  if (wa.length === 0 && wb.length === 0) return 0
+  if (wa.length === 0 || wb.length === 0) return 1
+  // Two-row DP keeps memory at O(m) instead of O(n·m).
+  let prev = new Array<number>(wb.length + 1).fill(0)
+  for (let i = 1; i <= wa.length; i++) {
+    const cur = new Array<number>(wb.length + 1).fill(0)
+    for (let j = 1; j <= wb.length; j++) {
+      cur[j] = wa[i - 1] === wb[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1])
+    }
+    prev = cur
+  }
+  return 1 - (2 * prev[wb.length]) / (wa.length + wb.length)
 }
 
 // ── User-facing error messages ─────────────────────────────────────────────
@@ -760,6 +1070,7 @@ export async function shutdownRecording(): Promise<void> {
   log.info('[recording] shutdown requested while ' + state)
   sessionId++ // invalidate any in-flight session
   abortInFlightFormat()
+  teardownAsrStream('shutdown')
   try {
     if (state === 'recording') {
       await Promise.race([

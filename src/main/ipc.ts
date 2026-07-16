@@ -31,6 +31,7 @@ import {
   validateAuthToken,
 } from './security'
 import { refreshUserContext, clearUserContext } from './user-context'
+import { clearAsrToken } from './asr-token'
 
 interface SetupArgs {
   mainWindow: BrowserWindow
@@ -160,8 +161,8 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
   )
 
   // String-enum settings (engine controls). Strictly allowlisted in
-  // security.ts — only transcriptionMode and transcriptionProvider, and only
-  // their known values, ever reach electron-store.
+  // security.ts — only transcriptionMode, transcriptionProvider and
+  // streamingEngine, and only their known values, ever reach electron-store.
   gatedHandle<{ key: unknown; value: unknown }, { ok: boolean; error?: string }>(
     'settings:set-choice',
     (_event, raw) => {
@@ -171,8 +172,13 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       // Narrow per key so setSetting gets a correlated key/value pair.
       if (validated.key === 'transcriptionMode') {
         setSetting('transcriptionMode', validated.value)
-      } else {
+      } else if (validated.key === 'transcriptionProvider') {
         setSetting('transcriptionProvider', validated.value)
+      } else {
+        // True Streaming engine toggle — applies from the NEXT dictation
+        // (doStart reads settings live); a recording in progress finishes on
+        // whatever path it started with.
+        setSetting('streamingEngine', validated.value)
       }
       return { ok: true }
     },
@@ -185,6 +191,9 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       if (!result.ok) {
         log.warn(`Auth token rejected: ${result.reason}`)
         clearAuthTokenCache()
+        // getAsrToken serves its cache BEFORE consulting getAuthToken — a
+        // cleared JWT must always take the cached streaming grant with it.
+        clearAsrToken()
         return { ok: false, error: result.reason }
       }
       cachedAuthToken = (raw as string).trim()
@@ -202,6 +211,10 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       } catch (err) {
         log.warn('flushStorageData after auth:set-token failed', err)
       }
+      // A Deepgram grant minted under the PREVIOUS token may belong to a
+      // different identity — drop it so the next stream re-mints under this
+      // one. (After a plain refresh this costs one cheap re-mint.)
+      clearAsrToken()
       // Warm the personal dictionary + snippets cache now that we can make
       // RLS-authorized reads. Fire-and-forget — never blocks the auth reply.
       void refreshUserContext()
@@ -210,11 +223,14 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
   )
   gatedOn('auth:clear-token', () => {
     clearAuthTokenCache()
+    // The signed-out user's streaming grant must die with their JWT.
+    clearAsrToken()
     // Drop the signed-out user's dictionary/snippets so they can't leak
     // into another account's session.
     clearUserContext()
     // Also abort any recording/transcription in flight so a sign-out can't
     // leave a stale request continuing with the just-cleared token.
+    // (This also aborts a live ASR socket via the controller's teardown.)
     abortInFlightRecording('auth-cleared')
   })
 

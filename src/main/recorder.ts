@@ -13,7 +13,11 @@ const DECODE_PCM_TIMEOUT_MS = 15_000
 
 // needPcm: recorder decodes the blob to 16 kHz PCM at stop time ONLY when the
 // session will actually feed on-device Whisper (local transcription mode).
-interface StartPayload { microphoneId: string; needPcm?: boolean }
+// streamPcm: recorder ALSO taps the mic through an AudioWorklet and ships
+// live 50 ms int16 PCM frames up for the True Streaming (Deepgram) path.
+// The MediaRecorder keeps recording regardless — streaming is an overlay on
+// the batch pipeline, never a replacement.
+interface StartPayload { microphoneId: string; needPcm?: boolean; streamPcm?: boolean }
 interface BlobPayload {
   buffer: ArrayBuffer
   mimeType: string
@@ -42,6 +46,29 @@ let crashHandlers: Array<(reason: string) => void> = []
 let autoStopHandlers: Array<() => void> = []
 // Where to forward live audio levels. Set once at startup by main.ts.
 let levelTargetWindow: BrowserWindow | null = null
+
+// ── True Streaming PCM plumbing ─────────────────────────────────────────────
+// Single registered callback (not a handler array like crash/autoStop):
+// exactly one recording session can own the PCM tap at a time, and the
+// recording-controller swaps the callback per session with a closure that
+// carries its session id. Null = drop frames on the floor (no active stream).
+let pcmFrameHandler: ((frame: Buffer) => void) | null = null
+let pcmUnavailableHandler: ((reason: string) => void) | null = null
+// A 50 ms frame @16 kHz int16 is exactly 1,600 bytes; cap well above that so
+// a misbehaving renderer can't shovel megabytes per message through IPC.
+const MAX_PCM_FRAME_BYTES = 8_192
+
+/** Set (or clear, with null) the per-session consumer of live PCM frames. */
+export function setPcmFrameHandler(cb: ((frame: Buffer) => void) | null): void {
+  pcmFrameHandler = cb
+}
+
+/** Set (or clear) the callback for the renderer declaring it cannot stream
+ *  PCM this session (16 kHz context refused, worklet load failed, …). The
+ *  recording itself continues — only the streaming overlay is off. */
+export function setPcmUnavailableHandler(cb: ((reason: string) => void) | null): void {
+  pcmUnavailableHandler = cb
+}
 
 // Pending on-demand PCM decode round-trips, keyed by request id. Resolved
 // with null on timeout / crash / malformed reply — never rejected, so the
@@ -368,6 +395,35 @@ function registerHandlers() {
     autoStopHandlers.forEach((h) => {
       try { h() } catch (err) { log.warn('autoStop handler threw', err) }
     })
+  })
+
+  // Live PCM frames for the True Streaming path. Hot channel (~20 Hz while
+  // dictating) so validation is cheap and rejection is silent: a dropped
+  // frame only degrades the live preview — the MediaRecorder blob still has
+  // every sample. Same trust model as every recorder channel.
+  ipcMain.on('recorder:pcm-frame', (event, payload: unknown) => {
+    if (!isFromRecorder(event)) return
+    if (!pcmFrameHandler) return // no active stream session — drop
+    if (!(payload instanceof ArrayBuffer)) return
+    if (payload.byteLength === 0 || payload.byteLength > MAX_PCM_FRAME_BYTES) return
+    try {
+      pcmFrameHandler(Buffer.from(payload))
+    } catch (err) {
+      log.warn('[recorder] pcm frame handler threw', err)
+    }
+  })
+
+  // Renderer could not build the 16 kHz worklet graph — the streaming overlay
+  // is off for this session, recording continues on the batch path.
+  ipcMain.on('recorder:pcm-unavailable', (event, reason: unknown) => {
+    if (!isFromRecorder(event)) return
+    const sanitized = typeof reason === 'string' ? reason.slice(0, 200) : 'unknown'
+    log.warn(`[recorder] pcm streaming unavailable: ${sanitized}`)
+    try {
+      pcmUnavailableHandler?.(sanitized)
+    } catch (err) {
+      log.warn('[recorder] pcm-unavailable handler threw', err)
+    }
   })
 
   // Live audio levels: forwarded straight to the overlay window. Validate the
