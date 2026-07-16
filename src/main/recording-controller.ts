@@ -37,7 +37,7 @@ import {
   abortInFlightFormat,
   detectContextCategory,
 } from './format-transcript'
-import { getCommand } from './commands-store'
+import { getCommand, toneInstruction } from './commands-store'
 import { transformText } from './transform-llm'
 import { getDictionaryWords, expandSnippets } from './user-context'
 
@@ -793,7 +793,11 @@ async function processAudio(
       if (command) {
         broadcast('transform-starting')
         try {
-          const transformed = await transformText(command.prompt, rawTrimmed, command.model)
+          const transformed = await transformText(
+            command.prompt + toneInstruction(command.tone),
+            rawTrimmed,
+            command.model,
+          )
           if (mySession !== sessionId) {
             log.info('[recording] command result discarded — session invalidated')
             return

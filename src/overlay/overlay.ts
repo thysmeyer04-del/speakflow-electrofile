@@ -141,7 +141,9 @@ if (api) {
   api.onTransformStarting?.(() => {
     document.body.dataset.mode = 'transforming'
     document.body.setAttribute('data-recording', '')
-    setStatus('Rewriting…')
+    // "Transforming…" (was "Rewriting…"): matches what users expect the
+    // command hotkeys to say (Thys, 2026-07-17) and Wispr's wording.
+    setStatus('Transforming…')
     stopIdleAnim()
   })
 

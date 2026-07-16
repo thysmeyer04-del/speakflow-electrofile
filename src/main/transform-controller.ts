@@ -1,12 +1,15 @@
 // Orchestrator for highlight → transform → paste.
 //
-// Flow (Win+Alt+N pressed):
+// Flow (Ctrl+Shift+N pressed):
 //   1. Refuse if F11 recording is in flight (single-flight policy).
 //   2. Snapshot the user's current clipboard (text + html + rtf, OR image).
-//   3. Simulate Ctrl+C (Cmd+C on darwin) to grab the highlighted selection.
-//   4. Read the clipboard; if it didn't change → "highlight first" error.
+//   3. Write a unique SENTINEL to the clipboard, clear stray modifiers,
+//      simulate Ctrl+C (Cmd+C on darwin) to grab the highlighted selection.
+//   4. Poll the clipboard: changed away from the sentinel → that's the
+//      selection; still the sentinel after retry → no selection → restore
+//      clipboard and start a command dictation instead ("speak an email").
 //   5. Show overlay pill ("Transforming…").
-//   6. POST to Groq with the command's system prompt.
+//   6. POST to Groq with the command's system prompt (+ tone).
 //   7. Write the result to clipboard, Ctrl+V (replaces still-selected text).
 //   8. Restore the original clipboard.
 //   9. Hide overlay; broadcast transcription-complete for the dashboard feed.
@@ -16,7 +19,7 @@
 
 import { clipboard, BrowserWindow, NativeImage } from 'electron'
 import log from 'electron-log/main'
-import { getCommand } from './commands-store'
+import { getCommand, toneInstruction } from './commands-store'
 import { transformText } from './transform-llm'
 import {
   getRecordingState,
@@ -24,7 +27,7 @@ import {
   startCommandRecording,
   stopRecording,
 } from './recording-controller'
-import { captureFocusTarget } from './inject'
+import { captureFocusTarget, clearStrayModifiers } from './inject'
 
 type NutKeyboard = typeof import('@nut-tree-fork/nut-js')['keyboard']
 type NutKey = typeof import('@nut-tree-fork/nut-js')['Key']
@@ -55,29 +58,35 @@ function broadcast(channel: string, payload?: unknown): void {
   })
 }
 
-const COPY_SETTLE_MS = 150
 const PASTE_SETTLE_MS = 120
 
-// The command hotkey (Ctrl+Shift+N) is usually still physically held when the
-// handler fires. If we send Ctrl+C now, the still-held Shift turns it into
-// Ctrl+Shift+C in the target app (devtools in browsers, nothing in most apps)
-// — the copy silently fails and a real selection looks like "no selection".
-// Synthetically releasing the modifiers makes the OS treat them as up even
-// while the fingers are still on them.
-async function releaseHotkeyModifiers(): Promise<void> {
-  if (!nutKeyboard || !nutKey) return
-  const mods = [
-    nutKey.LeftShift, nutKey.RightShift,
-    nutKey.LeftControl, nutKey.RightControl,
-    nutKey.LeftAlt, nutKey.RightAlt,
-    nutKey.LeftSuper, nutKey.RightSuper,
-  ]
-  for (const m of mods) {
-    try {
-      await nutKeyboard.releaseKey(m)
-    } catch {
-      // releasing an already-up key can throw on some platforms — ignore
-    }
+// ── Selection detection (v0.6.0 rewrite) ────────────────────────────────────
+// The old detector did ONE clipboard read 150 ms after the synthetic Ctrl+C
+// and compared it to the pre-copy clipboard. Three real-world failures
+// (observed as "pressed Ctrl+Shift+1 with a selection → app started
+// Listening", 2026-07-16):
+//   1. Only a 30 ms modifier settle — the still-physically-held Ctrl+Shift
+//      turned the copy into Ctrl+Shift+C (DevTools in browsers, no copy).
+//      → now uses inject.ts's clearStrayModifiers (all 8 modifiers + 60 ms),
+//        the same routine the paste path has trusted for months.
+//   2. Slow Chromium/Electron targets missed the fixed 150 ms window.
+//      → now a 25 ms poll up to 400 ms, with ONE retry Ctrl+C after that.
+//   3. A selection identical to the old clipboard read as "no selection".
+//      → now a unique SENTINEL is written first; ANY change away from the
+//        sentinel is a successful copy — even re-copying identical text.
+const COPY_POLL_INTERVAL_MS = 25
+const COPY_POLL_TIMEOUT_MS = 400
+const COPY_RETRY_TIMEOUT_MS = 250
+
+/** Poll the clipboard until it no longer holds the sentinel (→ copied text)
+ *  or the timeout lapses (→ no selection / copy failed). */
+async function pollClipboardChange(sentinel: string, timeoutMs: number): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const now = clipboard.readText()
+    if (now !== sentinel) return now
+    if (Date.now() >= deadline) return null
+    await sleep(COPY_POLL_INTERVAL_MS)
   }
 }
 
@@ -149,31 +158,50 @@ async function doRunTransform(commandId: string): Promise<void> {
     `[transform] command="${cmd.name}" target=${focusTarget?.title ?? '(unknown)'}`,
   )
 
-  // Step 1: Send Ctrl+C (Cmd+C on Mac) to grab the selection. Force-release
-  // the still-held hotkey modifiers first or the copy arrives as Ctrl+Shift+C.
-  await releaseHotkeyModifiers()
-  await sleep(30)
+  // Step 1: Grab the selection via synthetic Ctrl+C (Cmd+C on Mac).
+  // Sentinel first: whatever the clipboard holds afterward that ISN'T the
+  // sentinel is the copied selection — detection no longer depends on the
+  // selection differing from the user's previous clipboard content.
+  const sentinel = `​[speakflow:probe:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}]`
+  clipboard.writeText(sentinel)
+
+  // Release the still-physically-held hotkey modifiers with the SAME routine
+  // the paste path uses (all 8 modifiers + 60 ms settle). The old local
+  // variant settled only 30 ms and real selections read as "no selection".
+  await clearStrayModifiers()
   const modifier =
     process.platform === 'darwin' ? nutKey.LeftSuper : nutKey.LeftControl
-  try {
-    await nutKeyboard.pressKey(modifier, nutKey.C)
-    await sleep(20)
-    await nutKeyboard.releaseKey(modifier, nutKey.C)
-  } catch (err) {
-    log.error('[transform] copy keystroke failed', err)
-    broadcast('transcription-error', 'Could not grab the selection.')
-    return
+
+  const sendCopy = async (): Promise<boolean> => {
+    try {
+      await nutKeyboard!.pressKey(modifier, nutKey!.C)
+      await sleep(20)
+      await nutKeyboard!.releaseKey(modifier, nutKey!.C)
+      return true
+    } catch (err) {
+      log.error('[transform] copy keystroke failed', err)
+      return false
+    }
   }
 
-  await sleep(COPY_SETTLE_MS)
-  const selected = clipboard.readText()
+  let selected: string | null = null
+  if (await sendCopy()) {
+    selected = await pollClipboardChange(sentinel, COPY_POLL_TIMEOUT_MS)
+    if (selected === null) {
+      // Slow target may have swallowed the first chord — one retry.
+      selected = (await sendCopy())
+        ? await pollClipboardChange(sentinel, COPY_RETRY_TIMEOUT_MS)
+        : null
+    }
+  }
 
-  // Empty / unchanged → nothing was highlighted. Instead of erroring, start
-  // a command dictation: speak, press the hotkey again, and the transcript
-  // is transformed by this command's prompt before pasting.
-  if (!selected || selected === originalText) {
+  // No change (timeout) or a copy that produced empty text (e.g. an image
+  // selection) → treat as "nothing highlighted": restore the user's
+  // clipboard (the sentinel is on it!) and start a command dictation —
+  // speak, press the hotkey again, transcript runs through this command.
+  if (!selected || !selected.trim()) {
+    restoreClipboard(originalText, originalHtml, originalRtf, originalImage)
     log.info(`[transform] no selection — starting "${cmd.name}" dictation`)
-    // Original clipboard wasn't actually changed; no restore needed.
     await startCommandRecording(cmd.id)
     return
   }
@@ -186,7 +214,7 @@ async function doRunTransform(commandId: string): Promise<void> {
   currentAbort = new AbortController()
   try {
     transformed = await transformText(
-      cmd.prompt,
+      cmd.prompt + toneInstruction(cmd.tone),
       selected,
       cmd.model,
       currentAbort.signal,

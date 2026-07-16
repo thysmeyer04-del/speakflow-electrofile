@@ -13,7 +13,13 @@ import { getProxyBaseUrl } from './transcribe'
 import { isProxyUrlAllowed } from './security'
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const DEFAULT_MODEL = 'llama-3.1-8b-instant'
+// Transform commands default to Groq's 2026 flagship writer (Thys, 2026-07-17:
+// email/prompt quality over speed here — transforms are hotkey-triggered, not
+// on the dictation hot path, so ~1-2 s is fine). Formatting is NOT affected:
+// format-transcript.ts passes its own 8b model explicitly. Per-command
+// `model` still overrides; env knob for emergencies/A-B. Swapping the whole
+// product to another provider later = change this constant + server allowlist.
+const DEFAULT_MODEL = process.env.SPEAKFLOW_TRANSFORM_MODEL || 'openai/gpt-oss-120b'
 const REQUEST_TIMEOUT_MS = 30_000
 
 export async function transformText(

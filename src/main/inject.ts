@@ -406,9 +406,14 @@ async function injectViaClipboard(text: string, marks: InjectMarks): Promise<Inj
  * Ctrl+Shift+Space) doesn't combine with the keystrokes we're about to
  * synthesize. Best-effort: each release is guarded, and we settle briefly so
  * the OS processes the key-ups before the subsequent type()/Ctrl+V.
+ *
+ * Exported: transform-controller's synthetic Ctrl+C needs the exact same
+ * treatment (its local 30 ms variant let a still-held Shift turn the copy
+ * into Ctrl+Shift+C — the root cause of "selection not detected", 2026-07-17).
+ * Self-loads nut so an external caller works even before the first inject.
  */
-async function clearStrayModifiers(): Promise<void> {
-  if (!nutKeyboard || !nutKey) return
+export async function clearStrayModifiers(): Promise<void> {
+  if (!loadNut() || !nutKeyboard || !nutKey) return
   const modifiers = [
     nutKey.LeftControl,
     nutKey.RightControl,
