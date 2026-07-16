@@ -137,6 +137,13 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       const value = raw.value
       if (!key) return { ok: false, error: 'invalid-key' }
       if (typeof value !== 'boolean') return { ok: false, error: 'invalid-value' }
+      if (key === 'streamingTranscription') {
+        // Segment-on-pause streaming was removed (Fast Batch, 2026-07): it
+        // never produced a partial in production and Groq bills ≥10 s per
+        // uploaded segment. Old deployed dashboards still send this toggle —
+        // acknowledge it so they render success, but persist nothing.
+        return { ok: true }
+      }
       setSetting(key, value)
       if (key === 'launchAtLogin') {
         try {

@@ -5,6 +5,7 @@ import { isProxyUrlAllowed } from './security'
 import { getSettings } from './settings'
 import { transcribeLocal, isLocalModelCached } from './local-whisper'
 import { getWhisperPrompt } from './user-context'
+import { decodePcmViaRecorder } from './recorder'
 
 const PRODUCTION_PROXY = 'https://speakflow-marketing.vercel.app/api'
 
@@ -20,20 +21,34 @@ export function getProxyBaseUrl(): string | undefined {
 // cold-start to the FIRST dictation after a quiet period — the single
 // biggest avoidable latency spike in the packaged app. A GET returns 405
 // from inside the lambda, which is exactly enough to keep it hot.
+//
+// Each route is its OWN lambda on Vercel, so warming /transcribe does
+// nothing for /dictate or /transform — all three are pinged every cycle.
+// /dictate first (the primary Fast Batch path), the other two staggered a
+// few seconds later so we never burst three TLS handshakes at once.
 const KEEPALIVE_INTERVAL_MS = 4 * 60_000
+const KEEPALIVE_STAGGER_MS = 2_500
 let keepAliveTimer: NodeJS.Timeout | null = null
 
 export function startProxyKeepAlive(): void {
   const base = getProxyBaseUrl()
   if (!base || keepAliveTimer) return
-  const ping = (): void => {
-    fetch(base.replace(/\/+$/, '') + '/transcribe', { method: 'GET' }).catch(() => undefined)
+  const root = base.replace(/\/+$/, '')
+  const ping = (route: string): void => {
+    fetch(root + route, { method: 'GET' }).catch(() => undefined)
   }
-  ping()
-  keepAliveTimer = setInterval(ping, KEEPALIVE_INTERVAL_MS)
+  const cycle = (): void => {
+    ping('/dictate')
+    const t1 = setTimeout(() => ping('/transcribe'), KEEPALIVE_STAGGER_MS)
+    t1.unref?.()
+    const t2 = setTimeout(() => ping('/transform'), KEEPALIVE_STAGGER_MS * 2)
+    t2.unref?.()
+  }
+  cycle()
+  keepAliveTimer = setInterval(cycle, KEEPALIVE_INTERVAL_MS)
   // Don't let the keep-alive keep the process alive at quit.
   keepAliveTimer.unref?.()
-  log.info('[transcribe] proxy keep-alive started')
+  log.info('[transcribe] proxy keep-alive started (dictate + transcribe + transform)')
 }
 
 const GROQ_TRANSCRIPTIONS_URL = 'https://api.groq.com/openai/v1/audio/transcriptions'
@@ -54,6 +69,24 @@ interface TranscribeOptions {
   language?: string
   // 16 kHz mono PCM from the recorder — enables the on-device Whisper path.
   pcm?: Float32Array | null
+  // Speech-seconds measured by the recorder's level monitor. Drives the
+  // dictionary-prompt safety gate (see whisperPromptForClip). null/undefined
+  // = no reading available → fail open.
+  speechMs?: number | null
+}
+
+// ── Whisper prompt safety (hallucination guard, shared with dictate.ts) ────
+// The personal-dictionary prompt biases Whisper toward the user's spellings —
+// great on real dictations, ACTIVELY HARMFUL on marginal clips: on near-
+// silent audio Whisper will happily "transcribe" the prompt words themselves.
+// Only bias when the clip demonstrably contains sustained speech; otherwise
+// fall back to the single-space prompt (non-empty, which suppresses the
+// classic "Thanks for watching." silence hallucinations, but content-free).
+export const DICTIONARY_PROMPT_MIN_SPEECH_MS = 1_500
+
+export function whisperPromptForClip(speechMs: number | null | undefined): string {
+  const allowDictionary = speechMs == null || speechMs >= DICTIONARY_PROMPT_MIN_SPEECH_MS
+  return (allowDictionary ? getWhisperPrompt() : '') || ' '
 }
 
 export async function transcribeAudio(
@@ -90,9 +123,20 @@ export async function transcribeAudio(
     // already on disk, transcribe on-device instead of failing the dictation.
     const msg = (err as Error).message
     const networkFail = msg.includes('Could not reach') || msg.toLowerCase().includes('timeout')
-    if (networkFail && opts.pcm && opts.pcm.length > 0 && isLocalModelCached(localModel)) {
-      log.warn('[transcribe] cloud unreachable — falling back to local whisper')
-      return transcribeLocal(opts.pcm, localModel, { language: opts.language })
+    if (networkFail && isLocalModelCached(localModel)) {
+      // Cloud sessions no longer ship PCM eagerly (needPcm gating in the
+      // recorder), so this fallback usually has to ask the recorder window
+      // to decode the blob on demand. Fail-open: a null decode just means we
+      // surface the original network error instead of transcribing locally.
+      let pcm = opts.pcm && opts.pcm.length > 0 ? opts.pcm : null
+      if (!pcm) {
+        pcm = await decodePcmViaRecorder(audio)
+      }
+      if (pcm && pcm.length > 0) {
+        log.warn('[transcribe] cloud unreachable — falling back to local whisper')
+        return transcribeLocal(pcm, localModel, { language: opts.language })
+      }
+      log.warn('[transcribe] cloud unreachable and no PCM available — cannot fall back to local')
     }
     throw err
   }
@@ -135,14 +179,16 @@ async function transcribeViaCloud(
   return transcribeViaGroq(audio, opts)
 }
 
-function buildAudioForm(buffer: Buffer, filename: string): FormData {
+// Exported: dictate.ts builds the /dictate multipart body on top of this.
+export function buildAudioForm(buffer: Buffer, filename: string): FormData {
   const blob = new Blob([new Uint8Array(buffer)], { type: 'audio/webm' })
   const form = new FormData()
   form.append('file', blob, filename)
   return form
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+// Exported for dictate.ts — one timeout/abort implementation for all proxy calls.
+export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -168,8 +214,9 @@ async function transcribeViaGroq(
   // A non-empty prompt suppresses Whisper's "Thank you." / "Thanks for watching."
   // hallucinations that occur when it receives silent or low-energy audio.
   // When the user has a personal dictionary, their words become the prompt —
-  // this biases Whisper toward their spellings (names, jargon, brands).
-  form.append('prompt', getWhisperPrompt() || ' ')
+  // this biases Whisper toward their spellings (names, jargon, brands) — but
+  // ONLY on clips with enough measured speech (see whisperPromptForClip).
+  form.append('prompt', whisperPromptForClip(opts.speechMs))
   if (opts.language) form.append('language', opts.language)
 
   let response: Response
@@ -253,9 +300,10 @@ async function transcribeViaProxy(
   const form = buildAudioForm(buffer, 'audio.webm')
   if (opts.language) form.append('language', opts.language)
   // Personal-dictionary spelling bias — the proxy forwards the prompt field
-  // to Whisper when present.
-  const prompt = getWhisperPrompt()
-  if (prompt) form.append('prompt', prompt)
+  // to Whisper. Always sent: on short/low-speech clips whisperPromptForClip
+  // forces the single-space prompt instead of the dictionary (hallucination
+  // guard), which is still better than no prompt at all.
+  form.append('prompt', whisperPromptForClip(opts.speechMs))
 
   const url =
     baseUrl.replace(/\/+$/, '') +
@@ -293,7 +341,8 @@ async function transcribeViaProxy(
   return data.text ?? ''
 }
 
-async function safeReadBody(response: Response): Promise<string> {
+// Exported for dictate.ts.
+export async function safeReadBody(response: Response): Promise<string> {
   try {
     return (await response.text()).slice(0, 1024)
   } catch {
@@ -301,7 +350,9 @@ async function safeReadBody(response: Response): Promise<string> {
   }
 }
 
-function userMessageForStatus(status: number): string {
+// Exported for dictate.ts — /dictate maps HTTP statuses to the exact same
+// user-facing messages as /transcribe (incl. the 402 quota wording).
+export function userMessageForStatus(status: number): string {
   if (status === 401) return 'Authentication failed. Sign in again.'
   if (status === 402) return 'Weekly free limit reached — upgrade to Pro in your Speakflow dashboard'
   if (status === 403) return 'Your plan limit was reached. Upgrade to continue.'

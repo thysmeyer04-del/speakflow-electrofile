@@ -7,28 +7,31 @@ import log from 'electron-log/main'
 const READY_TIMEOUT_MS = 8_000
 const START_TIMEOUT_MS = 5_000
 const STOP_TIMEOUT_MS = 10_000
+// On-demand PCM decode is only exercised by the rare cloud-unreachable →
+// local-Whisper fallback; a hung decode must not hang that fallback forever.
+const DECODE_PCM_TIMEOUT_MS = 15_000
 
-interface StartPayload { microphoneId: string; streaming?: boolean }
-interface BlobPayload { buffer: ArrayBuffer; mimeType: string; pcm?: ArrayBuffer | null }
-interface PartialSegmentPayload {
-  index: number
+// needPcm: recorder decodes the blob to 16 kHz PCM at stop time ONLY when the
+// session will actually feed on-device Whisper (local transcription mode).
+interface StartPayload { microphoneId: string; needPcm?: boolean }
+interface BlobPayload {
   buffer: ArrayBuffer
   mimeType: string
   pcm?: ArrayBuffer | null
-}
-
-// A pause-delimited slice of an in-progress recording (streaming mode).
-export interface PartialSegment {
-  index: number
-  audio: Buffer
-  pcm: Float32Array | null
+  speechMs?: number | null
+  peakLevel?: number | null
 }
 
 export interface RecorderResult {
   audio: Buffer
   // 16 kHz mono Float32 PCM decoded by the renderer — input for on-device
-  // Whisper. Null when decode failed or the clip was dropped (silence/short).
+  // Whisper. Null when decode failed, was skipped (cloud mode), or the clip
+  // was dropped (silence/short).
   pcm: Float32Array | null
+  // Speech-energy stats from the renderer's level monitor. null = the level
+  // monitor never ran, so callers MUST fail open (no speech gating).
+  speechMs: number | null
+  peakLevel: number | null
 }
 
 let recorderWindow: BrowserWindow | null = null
@@ -37,9 +40,18 @@ let readyResolved = false
 let expectingClose = false
 let crashHandlers: Array<(reason: string) => void> = []
 let autoStopHandlers: Array<() => void> = []
-let partialSegmentHandlers: Array<(seg: PartialSegment) => void> = []
 // Where to forward live audio levels. Set once at startup by main.ts.
 let levelTargetWindow: BrowserWindow | null = null
+
+// Pending on-demand PCM decode round-trips, keyed by request id. Resolved
+// with null on timeout / crash / malformed reply — never rejected, so the
+// local-fallback caller can simply treat null as "no PCM available".
+interface PendingDecode {
+  resolve: (pcm: Float32Array | null) => void
+  timer: NodeJS.Timeout
+}
+let decodeSeq = 0
+const pendingDecodes = new Map<number, PendingDecode>()
 
 interface PendingStart {
   resolve: () => void
@@ -128,6 +140,7 @@ export function initRecorder(): void {
 export function destroyRecorder(): void {
   expectingClose = true
   rejectPending('shutdown')
+  flushPendingDecodes()
   if (recorderWindow && !recorderWindow.isDestroyed()) {
     recorderWindow.destroy()
   }
@@ -151,13 +164,6 @@ export function onAutoStop(cb: () => void): () => void {
   autoStopHandlers.push(cb)
   return () => {
     autoStopHandlers = autoStopHandlers.filter((h) => h !== cb)
-  }
-}
-
-export function onPartialSegment(cb: (seg: PartialSegment) => void): () => void {
-  partialSegmentHandlers.push(cb)
-  return () => {
-    partialSegmentHandlers = partialSegmentHandlers.filter((h) => h !== cb)
   }
 }
 
@@ -228,6 +234,47 @@ export async function stopRecorderSession(): Promise<RecorderResult> {
   })
 }
 
+/** On-demand decode of a compressed clip to 16 kHz mono PCM, performed by the
+ *  recorder window (main has no Web Audio). Fail-open by design: resolves
+ *  null on missing window, timeout, crash, or decode failure — the caller
+ *  (cloud-unreachable → local Whisper fallback in transcribe.ts) treats null
+ *  as "local path unavailable" and surfaces the original cloud error. */
+export function decodePcmViaRecorder(audio: Buffer): Promise<Float32Array | null> {
+  if (!recorderWindow || recorderWindow.isDestroyed() || audio.byteLength === 0) {
+    return Promise.resolve(null)
+  }
+  const id = ++decodeSeq
+  return new Promise<Float32Array | null>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingDecodes.delete(id)
+      log.warn(`[recorder] decode-pcm ${id} timed out after ${DECODE_PCM_TIMEOUT_MS}ms`)
+      resolve(null)
+    }, DECODE_PCM_TIMEOUT_MS)
+    pendingDecodes.set(id, { resolve, timer })
+    try {
+      // Copy out of the Buffer pool: a pooled Buffer's backing ArrayBuffer is
+      // shared with unrelated data, so slice to exactly this clip's bytes
+      // before handing it to the structured-clone IPC serializer.
+      const payload = audio.buffer.slice(audio.byteOffset, audio.byteOffset + audio.byteLength)
+      recorderWindow!.webContents.send('recorder:decode-pcm', { id, buffer: payload })
+    } catch (err) {
+      clearTimeout(timer)
+      pendingDecodes.delete(id)
+      log.warn('[recorder] decode-pcm send failed', err)
+      resolve(null)
+    }
+  })
+}
+
+/** Resolve (with null) every in-flight decode — crash/shutdown path. */
+function flushPendingDecodes(): void {
+  for (const [, p] of pendingDecodes) {
+    clearTimeout(p.timer)
+    p.resolve(null)
+  }
+  pendingDecodes.clear()
+}
+
 // ── IPC ────────────────────────────────────────────────────────────────────
 let handlersRegistered = false
 function registerHandlers() {
@@ -277,7 +324,12 @@ function registerHandlers() {
             ? new Float32Array(payload.pcm)
             : null
         clearTimeout(stop.timer)
-        stop.resolve({ audio: buf, pcm })
+        stop.resolve({
+          audio: buf,
+          pcm,
+          speechMs: sanitizeStat(payload.speechMs),
+          peakLevel: sanitizeStat(payload.peakLevel, 1),
+        })
         pendingStop = null
         return { ok: true }
       } catch (err) {
@@ -289,28 +341,26 @@ function registerHandlers() {
     },
   )
 
-  ipcMain.on('recorder:partial-segment', (event, payload: PartialSegmentPayload) => {
+  // Reply leg of the on-demand PCM decode round-trip. Same trust model as
+  // every other recorder channel: only the recorder window's sender id is
+  // accepted, and the payload is validated before touching the pending map.
+  ipcMain.on('recorder:decode-pcm-result', (event, payload: { id?: unknown; pcm?: unknown }) => {
     if (!isFromRecorder(event)) return
-    if (!payload || typeof payload.index !== 'number' || !Number.isInteger(payload.index)) return
-    if (payload.index < 0 || payload.index > 10_000) return
-    if (!(payload.buffer instanceof ArrayBuffer) || payload.buffer.byteLength === 0) return
-    let seg: PartialSegment
+    if (!payload || typeof payload.id !== 'number' || !Number.isInteger(payload.id)) return
+    const pending = pendingDecodes.get(payload.id)
+    if (!pending) return // timed out or duplicate reply — already settled
+    pendingDecodes.delete(payload.id)
+    clearTimeout(pending.timer)
     try {
-      seg = {
-        index: payload.index,
-        audio: Buffer.from(payload.buffer),
-        pcm:
-          payload.pcm instanceof ArrayBuffer && payload.pcm.byteLength > 0
-            ? new Float32Array(payload.pcm)
-            : null,
-      }
+      pending.resolve(
+        payload.pcm instanceof ArrayBuffer && payload.pcm.byteLength > 0
+          ? new Float32Array(payload.pcm)
+          : null,
+      )
     } catch (err) {
-      log.warn('[recorder] partial-segment decode failed', err)
-      return
+      log.warn('[recorder] decode-pcm result parse failed', err)
+      pending.resolve(null)
     }
-    partialSegmentHandlers.forEach((h) => {
-      try { h(seg) } catch (err) { log.warn('partialSegment handler threw', err) }
-    })
   })
 
   ipcMain.on('recorder:auto-stop', (event) => {
@@ -348,6 +398,14 @@ function isFromRecorder(event: { sender: { id: number } }): boolean {
   )
 }
 
+/** Renderer-supplied stats are untrusted numbers: NaN/Infinity/negatives are
+ *  normalized to null ("no reading"), and an optional max clamps peakLevel
+ *  into the 0..1 range the level pipeline is defined over. */
+function sanitizeStat(value: unknown, max?: number): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null
+  return max !== undefined && value > max ? max : value
+}
+
 function rejectPending(reason: string): void {
   if (pendingStart) {
     clearTimeout(pendingStart.timer)
@@ -364,6 +422,9 @@ function rejectPending(reason: string): void {
 function handleCrash(reason: string): void {
   log.error(`[recorder] crash: ${reason}`)
   rejectPending(reason)
+  // In-flight decode requests can never be answered by a dead window —
+  // resolve them null now instead of letting each wait out its 15 s timer.
+  flushPendingDecodes()
   crashHandlers.forEach((cb) => {
     try {
       cb(reason)

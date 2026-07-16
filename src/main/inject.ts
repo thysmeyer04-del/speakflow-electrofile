@@ -45,16 +45,38 @@ function loadNut(): boolean {
   }
 }
 
-// 120 ms gives ~3× headroom over typical Windows clipboard write-back
-// latency. Was 260 ms — that was overly conservative and dominated the
-// post-paste perceived delay.
-const PASTE_SETTLE_MS = 120
+// ── Timing tunables (Fast Batch, work item F) ──────────────────────────────
+// All env-overridable so a machine where a target app drops pastes (slow
+// RDP session, ancient Delphi apps with lazy clipboard readers) can be
+// loosened without a rebuild.
+function envMs(name: string, fallback: number): number {
+  const raw = Number(process.env[name])
+  return Number.isFinite(raw) && raw >= 0 ? raw : fallback
+}
+// Delay between clipboard.writeText and the Ctrl+V keystroke. Electron's
+// writeText is synchronous on Windows by the time it returns; this settle
+// only covers clipboard-viewer chains / OLE delayed-render stragglers.
+// 20 ms (was 50) held up in testing.
+const CLIPBOARD_SETTLE_MS = envMs('SPEAKFLOW_INJECT_CLIPBOARD_SETTLE_MS', 20)
+// Hold time between Ctrl+V key-down and key-up. 15 ms (was 30) — apps read
+// the paste on WM_KEYDOWN; the hold only needs to outlive input coalescing.
+const KEY_GAP_MS = envMs('SPEAKFLOW_INJECT_KEY_GAP_MS', 15)
+// How long OUR text must stay on the clipboard after Ctrl+V before we
+// restore the user's previous clipboard — the target app reads the clipboard
+// when ITS message loop processes the paste, typically 10-80 ms after
+// key-up. 120 ms gives ~3× headroom over typical Windows write-back latency
+// (was 260 ms once — overly conservative). Since the fast-path restructure
+// this settle runs DETACHED (see injectViaClipboard) and no longer adds to
+// perceived stop→paste latency at all.
+const PASTE_SETTLE_MS = envMs('SPEAKFLOW_INJECT_PASTE_SETTLE_MS', 120)
 const KEYSTROKE_LIMIT = 100
 // After releasing stray modifier keys, give the OS a beat to register the
 // key-up events before we synthesize type()/Ctrl+V. Without this, the paste
 // can still be interpreted with the modifier active. 60 ms is a safe margin
 // on loaded systems (a native GetAsyncKeyState poll would be more precise but
-// needs a native addon — overkill here). Negligible vs the transcription RTT.
+// needs a native addon — overkill here). Since the fast-path restructure this
+// overlaps the focus capture (Promise.all in doInject), so its cost is
+// max(capture, release) rather than the sum.
 const MODIFIER_RELEASE_SETTLE_MS = 60
 
 // Process-wide mutex — clipboard injection cannot interleave.
@@ -166,6 +188,21 @@ export async function captureFocusTarget(): Promise<WindowSnapshot | null> {
   }
 }
 
+// What doInject hands back: the caller-visible result plus (clipboard path
+// only) the detached settle/restore tail that must finish before the NEXT
+// injection may run.
+interface InjectOutcome {
+  result: InjectionResult
+  settleTail?: Promise<void>
+}
+
+// Stage timings threaded from doInject into the clipboard path so the single
+// '[timing] inject …' line carries the whole story.
+interface InjectMarks {
+  captureMs: number
+  modifiersMs: number
+}
+
 export async function injectText(
   text: string,
   expectedTarget: WindowSnapshot | null,
@@ -183,8 +220,21 @@ export async function injectText(
 
   injectionInFlight = injectionInFlight.then(async () => {
     try {
-      const r = await doInject(text, expectedTarget)
-      resolveOuter(r)
+      const { result, settleTail } = await doInject(text, expectedTarget)
+      // Fast path: resolve the caller the moment the paste outcome is known —
+      // for the clipboard path that is right after Ctrl+V key-up, ~120 ms
+      // earlier than waiting for settle+restore. RACE RATIONALE for keeping
+      // the tail INSIDE this mutex chain rather than truly fire-and-forget:
+      // the target app reads the clipboard asynchronously after our key-up.
+      // If a second injection (rapid back-to-back dictations) wrote its text
+      // to the clipboard during this window, the FIRST paste could land the
+      // SECOND dictation's text — silent data corruption. So the next queued
+      // injection awaits this tail via injectionInFlight; only the current
+      // caller is released early.
+      resolveOuter(result)
+      if (settleTail) {
+        await settleTail.catch((err) => log.warn('inject settle tail failed', err))
+      }
     } catch (err) {
       rejectOuter(err as Error)
     }
@@ -196,11 +246,11 @@ export async function injectText(
 async function doInject(
   text: string,
   expectedTarget: WindowSnapshot | null,
-): Promise<InjectionResult> {
+): Promise<InjectOutcome> {
   const nutReady = loadNut()
   if (!nutReady) {
     clipboard.writeText(text)
-    return { ok: false, method: 'clipboard-only', error: 'no-keyboard-backend' }
+    return { result: { ok: false, method: 'clipboard-only', error: 'no-keyboard-backend' } }
   }
 
   // We DON'T abort if focus changed since the user pressed the hotkey.
@@ -211,16 +261,38 @@ async function doInject(
   // BUT: refuse to type into Speakflow itself — that would inject text into
   // our own dashboard. Also fail-closed if we can't identify the current
   // window AT ALL (and we never had an original target either).
-  const current = await captureFocusTarget()
+  //
+  // Fast path (work item F): the focus capture and the stray-modifier
+  // release run CONCURRENTLY. They are independent OS operations — reading
+  // the foreground window's identity doesn't consume input events, and
+  // synthesizing modifier key-UPs can't change which window is foreground.
+  // Serial cost was capture + (release + 60 ms settle); now it's
+  // max(capture, release+settle). The only behavioral delta: modifiers get
+  // released even when the checks below then refuse to paste — harmless,
+  // we're only releasing keys the user is mid-way through letting go of
+  // (their recording hotkey).
+  const tParallel = Date.now()
+  let captureMs = 0
+  let modifiersMs = 0
+  const [current] = await Promise.all([
+    captureFocusTarget().then((snap) => {
+      captureMs = Date.now() - tParallel
+      return snap
+    }),
+    clearStrayModifiers().then(() => {
+      modifiersMs = Date.now() - tParallel
+    }),
+  ])
+
   if (isLikelyOwnWindow(current)) {
     log.warn('Refusing to paste — Speakflow itself has focus.')
     clipboard.writeText(text)
-    return { ok: false, method: 'clipboard-only', error: 'self-window-focused' }
+    return { result: { ok: false, method: 'clipboard-only', error: 'self-window-focused' } }
   }
   if (!current && !expectedTarget) {
     log.warn('Refusing to paste — could not identify any target window.')
     clipboard.writeText(text)
-    return { ok: false, method: 'clipboard-only', error: 'no-target' }
+    return { result: { ok: false, method: 'clipboard-only', error: 'no-target' } }
   }
   if (current && expectedTarget && current.title !== expectedTarget.title) {
     log.info(
@@ -228,25 +300,25 @@ async function doInject(
     )
   }
 
-  // The recording hotkey may include modifiers (e.g. Ctrl+Shift+Space). If the
-  // user is still holding them when we synthesize keystrokes, every typed char
-  // becomes Ctrl+Shift+<char> (and Ctrl+V becomes Ctrl+Shift+V) — so nothing
-  // lands. Proactively release stray modifiers first.
-  await clearStrayModifiers()
-
   if (text.length <= KEYSTROKE_LIMIT && isPureAscii(text)) {
     try {
+      const tType = Date.now()
       await nutKeyboard!.type(text)
-      return { ok: true, method: 'keystroke' }
+      // Keystroke path has no clipboard/paste/settle stages — log its own
+      // variant of the timing line so every injection still emits exactly one.
+      log.info(
+        `[timing] inject capture=${captureMs} modifiers=${modifiersMs} keystroke=${Date.now() - tType} method=keystroke`,
+      )
+      return { result: { ok: true, method: 'keystroke' } }
     } catch (err) {
       log.warn('Keystroke injection failed, falling back to clipboard', err)
     }
   }
 
-  return injectViaClipboard(text)
+  return injectViaClipboard(text, { captureMs, modifiersMs })
 }
 
-async function injectViaClipboard(text: string): Promise<InjectionResult> {
+async function injectViaClipboard(text: string, marks: InjectMarks): Promise<InjectOutcome> {
   // Snapshot previous clipboard so we can restore it after paste settles.
   // readImage() can be slow (5-50 ms) when the user has a large screenshot —
   // only call it when no text-ish format is present, since text/html/rtf
@@ -261,45 +333,66 @@ async function injectViaClipboard(text: string): Promise<InjectionResult> {
     (clipboard as unknown as { readRTF?: () => string }).readRTF?.() ?? ''
   const previousImage = hasTextish ? null : clipboard.readImage()
 
+  const tClipboard = Date.now()
   clipboard.writeText(text)
-  await sleep(50)
+  await sleep(CLIPBOARD_SETTLE_MS)
+  const clipboardMs = Date.now() - tClipboard
 
+  const tPaste = Date.now()
   let pasteOk = false
   if (nutKeyboard && nutKey) {
     try {
       const modifier =
         process.platform === 'darwin' ? nutKey.LeftSuper : nutKey.LeftControl
       await nutKeyboard.pressKey(modifier, nutKey.V)
-      await sleep(30)
+      await sleep(KEY_GAP_MS)
       await nutKeyboard.releaseKey(modifier, nutKey.V)
       pasteOk = true
     } catch (err) {
       log.error('Paste keystroke failed', err)
     }
   }
+  const pasteMs = Date.now() - tPaste
 
-  await sleep(PASTE_SETTLE_MS)
-
-  // Restore as best we can. Compose multi-format when applicable so RTF/HTML
-  // clipboards survive.
-  try {
-    const compose: { text?: string; html?: string; rtf?: string } = {}
-    if (previousText) compose.text = previousText
-    if (previousHtml) compose.html = previousHtml
-    if (previousRtf) compose.rtf = previousRtf
-    if (Object.keys(compose).length > 0) {
-      clipboard.write(compose)
-    } else if (previousImage && !previousImage.isEmpty()) {
-      clipboard.writeImage(previousImage)
+  // Detached settle + clipboard restore. The paste outcome is fully decided
+  // at this point — the settle exists only to keep OUR text on the clipboard
+  // until the target app has read it (its message loop consumes the Ctrl+V
+  // asynchronously), and the restore is pure cleanup. Neither should hold up
+  // the caller's stop→paste latency, so the promise is returned to
+  // injectText, which resolves the caller first and awaits this tail second
+  // — still inside the injectionInFlight mutex (see the race rationale
+  // there). The '[timing] inject' line is emitted at the END of the tail so
+  // all five stage numbers are real, not projected.
+  const settleTail = (async () => {
+    const tSettle = Date.now()
+    await sleep(PASTE_SETTLE_MS)
+    // Restore as best we can. Compose multi-format when applicable so
+    // RTF/HTML clipboards survive.
+    try {
+      const compose: { text?: string; html?: string; rtf?: string } = {}
+      if (previousText) compose.text = previousText
+      if (previousHtml) compose.html = previousHtml
+      if (previousRtf) compose.rtf = previousRtf
+      if (Object.keys(compose).length > 0) {
+        clipboard.write(compose)
+      } else if (previousImage && !previousImage.isEmpty()) {
+        clipboard.writeImage(previousImage)
+      }
+    } catch (err) {
+      log.warn('Clipboard restore failed', err)
     }
-  } catch (err) {
-    log.warn('Clipboard restore failed', err)
-  }
+    log.info(
+      `[timing] inject capture=${marks.captureMs} modifiers=${marks.modifiersMs} ` +
+        `clipboard=${clipboardMs} paste=${pasteMs} settle=${Date.now() - tSettle}`,
+    )
+  })()
 
-  if (!pasteOk) {
-    return { ok: false, method: 'clipboard', error: 'paste-failed' }
+  return {
+    result: pasteOk
+      ? { ok: true, method: 'clipboard' }
+      : { ok: false, method: 'clipboard', error: 'paste-failed' },
+    settleTail,
   }
-  return { ok: true, method: 'clipboard' }
 }
 
 /**

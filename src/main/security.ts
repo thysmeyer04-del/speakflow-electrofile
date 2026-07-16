@@ -129,6 +129,11 @@ export type ToggleKey =
   | 'launchAtLogin'
   | 'enableSmartFormatting'
   | 'stripDisfluencies'
+  // Legacy: the streamingTranscription setting was removed along with
+  // segment-on-pause streaming (Fast Batch, 2026-07), but old DEPLOYED
+  // dashboards still render the toggle and send this key over IPC. It stays
+  // in the allowlist so those dashboards get { ok: true } instead of an
+  // error banner; ipc.ts treats it as an accepted no-op (nothing is stored).
   | 'streamingTranscription'
 
 export function validateToggleKey(input: unknown): ToggleKey | null {
@@ -140,7 +145,7 @@ export function validateToggleKey(input: unknown): ToggleKey | null {
     'launchAtLogin',
     'enableSmartFormatting',
     'stripDisfluencies',
-    'streamingTranscription',
+    'streamingTranscription', // accepted-but-ignored — see ToggleKey note
   ])
   return (allowed as Set<string>).has(input) ? (input as ToggleKey) : null
 }

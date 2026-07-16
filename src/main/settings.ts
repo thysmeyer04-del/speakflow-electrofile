@@ -21,9 +21,10 @@ export interface AppSettings {
   // HuggingFace model id for local mode. Whisper sizes trade speed for
   // accuracy: Xenova/whisper-tiny < base < small < medium.
   localWhisperModel: string
-  // Transcribe speech-pause-delimited segments in the background WHILE the
-  // user is still talking, so stop-to-paste latency is only the final tail.
-  streamingTranscription: boolean
+  // NOTE: streamingTranscription was removed with the segment-on-pause
+  // streaming feature (Fast Batch, 2026-07). Old deployed dashboards still
+  // send the toggle over IPC — ipc.ts accepts it as a no-op. Any stale
+  // persisted value in electron-store is simply ignored.
 }
 
 const defaults: AppSettings = {
@@ -40,7 +41,6 @@ const defaults: AppSettings = {
   transcriptionMode: 'cloud',
   transcriptionProvider: 'groq',
   localWhisperModel: 'Xenova/whisper-medium',
-  streamingTranscription: true,
 }
 
 const store = new Store<AppSettings>({

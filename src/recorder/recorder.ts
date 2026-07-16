@@ -1,7 +1,7 @@
 // Hidden renderer window that owns getUserMedia + MediaRecorder.
 //
 // Protocol with main:
-//   main → 'recorder:start' { microphoneId }
+//   main → 'recorder:start' { microphoneId, needPcm }
 //   renderer → 'recorder:started' (ACK once MediaRecorder.start() is OK)
 //   renderer → 'recorder:failed' <reason> (any failure during start)
 //
@@ -13,7 +13,26 @@
 //
 //   User stop:
 //   main → 'recorder:stop'
-//   renderer → 'recorder:audio-blob' (or empty buffer if too short)
+//   renderer → 'recorder:audio-blob' (or empty buffer if too short). The
+//     payload also carries speechMs/peakLevel — the level monitor's speech
+//     energy stats — which main's hallucination guard uses to drop silent
+//     clips before they ever reach Whisper.
+//
+//   On-demand PCM decode (main can't run Web Audio):
+//   main → 'recorder:decode-pcm' { id, buffer }
+//   renderer → 'recorder:decode-pcm-result' { id, pcm|null }
+//     Used by the cloud-unreachable → local-Whisper fallback: in cloud mode
+//     we no longer decode PCM eagerly at stop time (it cost 200-600 ms on the
+//     hot path for a payload the cloud path never reads), so main round-trips
+//     the compressed blob back here only when local inference actually needs
+//     samples.
+//
+// Segment-on-pause streaming was REMOVED (Fast Batch, 2026-07): partial
+// segments never fired in any of 37 logged production sessions (the pause
+// detector's preconditions were effectively unreachable with real mics), and
+// Groq bills a 10 s minimum per uploaded segment, so each cut would have
+// multiplied cost for zero latency win. The adaptive-noise-floor idea from
+// that code lives on below in the speech-seconds tracker.
 
 // Types for window.recorderAPI live in src/types/recorder-api.d.ts so this
 // file stays a plain script (no module wrappers) — it's loaded via <script>
@@ -55,43 +74,47 @@ const LEVEL_FFT_SIZE = 64
 // Throttle level emission. RAF would push 60Hz; 30Hz is plenty for the eye and
 // halves the IPC chatter.
 const LEVEL_EMIT_MIN_MS = 33
-let bufferedBlob: { buffer: ArrayBuffer; mimeType: string; pcm: ArrayBuffer | null } | null = null
 
-// ── Streaming segmentation ───────────────────────────────────────────────
-// When enabled, the recording is cut at natural speech pauses: the current
-// MediaRecorder is flushed, its audio is shipped to main as a "partial
-// segment" (transcribed in the background while the user keeps talking), and
-// a fresh MediaRecorder starts immediately on the same warm stream. The
-// stop-to-paste latency then only covers the final tail segment.
-let streamingEnabled = false
-let segmentIndex = 0
-let segmentStartAt = 0
-// Loudest level seen in the CURRENT segment — a segment is only cut if it
-// actually contains speech, so silent sessions never produce partials and
-// the whole-session silence gate below stays authoritative.
-let segmentPeakLevel = 0
-let silentSinceTs: number | null = null
+interface BufferedAudio {
+  buffer: ArrayBuffer
+  mimeType: string
+  pcm: ArrayBuffer | null
+  // Speech-energy stats for main's hallucination guard. null = the level
+  // monitor never produced a reading this session (AudioContext unavailable),
+  // in which case main MUST fail open — see sessionSpeechStats().
+  speechMs: number | null
+  peakLevel: number | null
+}
+let bufferedBlob: BufferedAudio | null = null
+
+// ── Speech-seconds tracking (feeds main's hallucination guard) ────────────
+// The level monitor (~30 Hz) integrates how much of the session actually
+// contained speech-level audio. Main uses the total to (a) drop clips with
+// <400 ms of speech before they reach Whisper — silent-room clips make
+// Whisper invent whole sentences — and (b) suppress the dictionary-bias
+// prompt on very short clips, where the prompt AMPLIFIES hallucinations
+// (Whisper happily "hears" the prompt words inside noise).
+//
 // Adaptive noise floor: real mics (AGC + room noise + the sqrt perceptual
-// curve in downsampleToBars) idle well above the old fixed 0.06 threshold,
-// which meant a pause was NEVER detected and streaming silently degraded to
-// single-shot transcription. Track the quietest recent level instead and
-// call "silence" anything near it.
+// curve in downsampleToBars) idle well above any usable fixed threshold —
+// observed idle floors up to ~0.7 in the field. Track the quietest recent
+// level instead and count as "speech" only frames comfortably above it:
+// level > max(floor * SPEECH_FLOOR_MULT, SPEECH_LEVEL_MIN).
 let noiseFloorLevel = 1
-let segLogFrameCounter = 0
-let pendingSegmentCut: Promise<void> | null = null
-// The stream/mime the active MediaRecorder was built with — needed to spin
-// up the replacement recorder mid-session.
-let activeRecorderStream: MediaStream | null = null
-let activeMimeType: string | undefined
-// A segment must have at least this much audio before a pause can cut it.
-const SEGMENT_MIN_MS = 4_000
-// How long the level must stay quiet before we treat it as a pause.
-const SEGMENT_SILENCE_MS = 600
-// Minimum silence threshold for segmentation; the effective threshold is
-// adaptive: max(this, noiseFloor * 1.4 + 0.05).
-const SEGMENT_SILENCE_LEVEL = 0.08
-// Hard ceiling (10 min at one cut every ~4 s) — runaway-loop backstop.
-const SEGMENT_MAX_COUNT = 150
+let sessionSpeechMs = 0
+// performance.now() of the previous processed level frame. Speech time is
+// integrated from real inter-frame deltas — not a nominal frame length — so
+// a throttled RAF in the hidden window can't inflate the count.
+let lastLevelFrameTs = 0
+const SPEECH_LEVEL_MIN = 0.08
+const SPEECH_FLOOR_MULT = 1.3
+// One stretched frame gap (GC pause, window deprioritized) must not credit
+// seconds of "speech" in a single tick — cap the per-frame delta.
+const SPEECH_FRAME_MAX_CREDIT_MS = 250
+// Only decode the blob to 16 kHz PCM at stop time when main said it will
+// actually consume it (local transcription mode). Cloud mode skips the
+// decode entirely — it was pure waste on the stop→paste hot path.
+let needPcmEnabled = false
 
 let maxDurationTimer: number | null = null
 let recordingStartedAt = 0
@@ -143,12 +166,28 @@ if (!window.recorderAPI) {
 
   window.recorderAPI.onStart(async (payload) => {
     console.log('[recorder.ts] received start', payload)
-    await start(payload.microphoneId, payload.streaming === true)
+    await start(payload.microphoneId, payload.needPcm === true)
   })
 
   window.recorderAPI.onStop(async () => {
     console.log('[recorder.ts] received stop')
     await handleMainStop()
+  })
+
+  // On-demand PCM decode for main's cloud-unreachable → local-Whisper
+  // fallback (cloud sessions no longer decode eagerly at stop time). Always
+  // reply — even with null — so main's pending promise settles immediately
+  // instead of waiting out its timeout.
+  window.recorderAPI.onDecodePcm?.(async (payload) => {
+    let pcm: ArrayBuffer | null = null
+    try {
+      if (payload && payload.buffer instanceof ArrayBuffer && payload.buffer.byteLength > 0) {
+        pcm = await decodeToPcm16k(payload.buffer)
+      }
+    } catch {
+      pcm = null // decodeToPcm16k already fails soft; this is belt+braces
+    }
+    window.recorderAPI.sendDecodedPcm?.({ id: payload.id, pcm })
   })
 }
 
@@ -178,7 +217,7 @@ async function warmupMicStream(microphoneId: string): Promise<void> {
   }
 }
 
-async function start(microphoneId: string, streaming = false): Promise<void> {
+async function start(microphoneId: string, needPcm = false): Promise<void> {
   if (localState === 'starting' || localState === 'recording') {
     // Only legitimately-active states reject. Everything else is treated as
     // a wedge — see below.
@@ -295,16 +334,11 @@ async function start(microphoneId: string, streaming = false): Promise<void> {
 
   attachRecorderHandlers(mediaRecorder)
 
-  // Streaming segmentation session state.
-  streamingEnabled = streaming
-  activeRecorderStream = recorderStream
-  activeMimeType = mimeType
-  segmentIndex = 0
-  segmentStartAt = Date.now()
-  segmentPeakLevel = 0
-  silentSinceTs = null
+  // Per-session speech-energy state.
+  needPcmEnabled = needPcm
   noiseFloorLevel = 1
-  segLogFrameCounter = 0
+  sessionSpeechMs = 0
+  lastLevelFrameTs = 0
 
   sessionPeakLevel = 0
   levelFrameCount = 0
@@ -331,8 +365,9 @@ async function start(microphoneId: string, streaming = false): Promise<void> {
   window.recorderAPI.reportStarted()
 }
 
-// Shared by the session's first MediaRecorder and every streaming-segment
-// replacement recorder.
+// One MediaRecorder per session (streaming's mid-session replacement
+// recorders are gone) — kept as a function so the error-recovery wiring
+// stays in one place.
 function attachRecorderHandlers(rec: MediaRecorder): void {
   rec.ondataavailable = (e) => {
     if (e.data && e.data.size > 0) chunks.push(e.data)
@@ -367,113 +402,37 @@ function attachRecorderHandlers(rec: MediaRecorder): void {
   }
 }
 
-// Called ~30Hz from the level monitor. Detects a sustained speech pause and
-// cuts the current audio into a partial segment that main can transcribe
-// while the user keeps talking.
-function maybeCutSegment(frameLevel: number): void {
-  if (!streamingEnabled) return
-  if (localState !== 'recording') {
-    silentSinceTs = null
-    return
-  }
-
+// Called ~30 Hz from the level monitor with the loudest bar of the frame.
+// Maintains the adaptive noise floor and integrates speech-seconds for the
+// hallucination guard (see the state block up top for the full rationale).
+function trackSpeechEnergy(frameLevel: number, frameTs: number): void {
   // Adapt the noise floor: drop instantly to quieter levels; drift up ONLY
   // from near-floor frames, so sustained speech can't drag the floor into
-  // speech range (observed in the field: floor 0.72 → threshold 1.06 → every
-  // frame counted as "silence" and segments got cut mid-speech on a timer).
+  // speech range (observed in the field with the old symmetric drift: floor
+  // 0.72 → threshold above every frame → all speech misclassified).
   if (frameLevel < noiseFloorLevel) {
     noiseFloorLevel = frameLevel
   } else if (frameLevel < noiseFloorLevel * 1.8) {
     noiseFloorLevel = Math.min(1, noiseFloorLevel * 0.99 + frameLevel * 0.01)
   }
-  // Hard cap keeps the threshold safely below speech levels (~0.9-1.0).
-  const silenceThreshold = Math.min(
-    0.55,
-    Math.max(SEGMENT_SILENCE_LEVEL, noiseFloorLevel * 1.3 + 0.04),
-  )
 
-  // Visibility while tuning: one line every ~5s of recording.
-  if (++segLogFrameCounter % 150 === 0) {
-    console.log(
-      `[seg] level=${frameLevel.toFixed(3)} floor=${noiseFloorLevel.toFixed(3)} thr=${silenceThreshold.toFixed(3)} segAge=${Date.now() - segmentStartAt}ms cuts=${segmentIndex}`,
-    )
-  }
-
-  if (pendingSegmentCut || pendingFinalize || pendingFlush || errorRecovery) return
-  if (segmentIndex >= SEGMENT_MAX_COUNT) return
-  const now = Date.now()
-  if (now - segmentStartAt < SEGMENT_MIN_MS) {
-    silentSinceTs = null
-    return
-  }
-  if (frameLevel >= silenceThreshold) {
-    silentSinceTs = null
-    return
-  }
-  // Never cut a segment that contains no speech — keep accumulating instead,
-  // so fully-silent sessions still hit the whole-session silence gate.
-  if (segmentPeakLevel < SILENCE_PEAK_THRESHOLD) return
-  if (silentSinceTs === null) {
-    silentSinceTs = now
-    return
-  }
-  if (now - silentSinceTs < SEGMENT_SILENCE_MS) return
-  silentSinceTs = null
-  pendingSegmentCut = cutSegment()
-    .catch((err) => console.warn('[recorder] segment cut failed', err))
-    .finally(() => {
-      pendingSegmentCut = null
-    })
+  const speechThreshold = Math.max(noiseFloorLevel * SPEECH_FLOOR_MULT, SPEECH_LEVEL_MIN)
+  // Integrate real elapsed time between frames (capped) rather than assuming
+  // the nominal 33 ms cadence — RAF in a hidden window is not metronomic.
+  const deltaMs =
+    lastLevelFrameTs > 0
+      ? Math.min(frameTs - lastLevelFrameTs, SPEECH_FRAME_MAX_CREDIT_MS)
+      : LEVEL_EMIT_MIN_MS
+  lastLevelFrameTs = frameTs
+  if (frameLevel > speechThreshold) sessionSpeechMs += deltaMs
 }
 
-async function cutSegment(): Promise<void> {
-  const rec = mediaRecorder
-  const stream = activeRecorderStream
-  if (!rec || rec.state === 'inactive' || !stream) return
-
-  // Flush the current recorder so its chunks are complete.
-  await new Promise<void>((resolve) => {
-    rec.onstop = () => resolve()
-    try {
-      rec.stop()
-    } catch {
-      resolve()
-    }
-  })
-
-  // A user stop / error may have raced us — leave everything for finalize.
-  if (localState !== 'recording') return
-
-  const segChunks = chunks
-  chunks = []
-
-  // Restart immediately — the gap lands inside the silence we just detected.
-  try {
-    mediaRecorder = new MediaRecorder(
-      stream,
-      activeMimeType ? { mimeType: activeMimeType } : undefined,
-    )
-    attachRecorderHandlers(mediaRecorder)
-    mediaRecorder.start(50)
-  } catch (err) {
-    // Can't restart: put the audio back so finalize still delivers it, and
-    // surface a recorder failure so main reconciles the session.
-    chunks = segChunks
-    window.recorderAPI.reportFailed(`segment-restart: ${(err as Error).message}`)
-    return
-  }
-
-  const index = segmentIndex++
-  segmentStartAt = Date.now()
-  segmentPeakLevel = 0
-
-  const mime = segChunks[0]?.type || activeMimeType || 'audio/webm'
-  const blob = new Blob(segChunks, { type: mime })
-  if (blob.size === 0) return
-  const buffer = await blob.arrayBuffer()
-  const pcm = await decodeToPcm16k(buffer)
-  console.log(`[recorder] segment ${index} cut (${blob.size}B) — sent for background transcription`)
-  window.recorderAPI.sendPartialSegment?.({ index, buffer, mimeType: mime, pcm })
+/** Speech stats shipped with the audio blob. null when the level monitor
+ *  never ran (no AudioContext) — main fails OPEN on null, otherwise the
+ *  speech gate would eat every clip on such machines. */
+function sessionSpeechStats(): { speechMs: number | null; peakLevel: number | null } {
+  if (levelFrameCount === 0) return { speechMs: null, peakLevel: null }
+  return { speechMs: Math.round(sessionSpeechMs), peakLevel: sessionPeakLevel }
 }
 
 // Idempotent: if a finalize is already in flight, a second caller awaits the
@@ -545,23 +504,23 @@ async function handleMainStop(): Promise<void> {
     return
   }
   // idle, starting, stopping, or flushed: nothing to send. Reply empty.
-  await sendBlobSafe(new ArrayBuffer(0), 'audio/webm')
+  await sendBlobSafe({
+    buffer: new ArrayBuffer(0),
+    mimeType: 'audio/webm',
+    pcm: null,
+    speechMs: null,
+    peakLevel: null,
+  })
 }
 
 async function finalizeMediaRecorder(): Promise<void> {
-  // A segment cut mid-flight owns the MediaRecorder handoff — wait for it so
-  // we finalize the replacement recorder, not the one it already stopped.
-  if (pendingSegmentCut) {
-    await pendingSegmentCut.catch(() => undefined)
-  }
-
   if (maxDurationTimer) {
     clearTimeout(maxDurationTimer)
     maxDurationTimer = null
   }
 
   if (!mediaRecorder) {
-    bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm', pcm: null }
+    bufferedBlob = emptyBufferedAudio()
     return
   }
 
@@ -578,22 +537,14 @@ async function finalizeMediaRecorder(): Promise<void> {
   const blob = new Blob(chunks, { type: chunks[0]?.type || 'audio/webm' })
   await cleanup()
 
-  // Gates apply to the WHOLE session, so when streaming already shipped
-  // partial segments the tail must always go through — a sub-800ms or silent
-  // tail after minutes of speech is normal, not an accidental press.
-  const hasPartialSegments = segmentIndex > 0
-  const tooShort =
-    !hasPartialSegments && Date.now() - recordingStartedAt < MIN_RECORDING_MS
+  const tooShort = Date.now() - recordingStartedAt < MIN_RECORDING_MS
   // Silence gate: drop a clip whose loudest moment never crossed the speech
   // floor. Sending silence to Whisper produces phantom words. Fail open if the
   // level monitor never produced a reading (levelFrameCount === 0).
-  const silent =
-    !hasPartialSegments &&
-    levelFrameCount > 0 &&
-    sessionPeakLevel < SILENCE_PEAK_THRESHOLD
-  console.log(`[recorder] session peak-level ${sessionPeakLevel.toFixed(3)} over ${levelFrameCount} frames (silence<${SILENCE_PEAK_THRESHOLD}=${silent}), tooShort=${tooShort}, partials=${segmentIndex}`)
+  const silent = levelFrameCount > 0 && sessionPeakLevel < SILENCE_PEAK_THRESHOLD
+  console.log(`[recorder] session peak-level ${sessionPeakLevel.toFixed(3)} speech=${Math.round(sessionSpeechMs)}ms over ${levelFrameCount} frames (silence<${SILENCE_PEAK_THRESHOLD}=${silent}), tooShort=${tooShort}`)
   if (tooShort || blob.size === 0 || silent) {
-    bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm', pcm: null }
+    bufferedBlob = emptyBufferedAudio()
     return
   }
 
@@ -602,12 +553,28 @@ async function finalizeMediaRecorder(): Promise<void> {
     bufferedBlob = {
       buffer,
       mimeType: blob.type || 'audio/webm',
-      // Fail-open: local transcription needs PCM, cloud only needs the blob.
-      pcm: await decodeToPcm16k(buffer),
+      // PCM is ONLY consumed by on-device Whisper. Cloud sessions skip the
+      // decode (it cost 200-600 ms on the stop hot path for nothing); the
+      // rare cloud-unreachable → local fallback re-requests it on demand via
+      // 'recorder:decode-pcm'. Still fail-open (null) if the decode dies.
+      pcm: needPcmEnabled ? await decodeToPcm16k(buffer) : null,
+      ...sessionSpeechStats(),
     }
   } catch (err) {
     window.recorderAPI.reportFailed(`buffer-failed: ${(err as Error).message}`)
-    bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm', pcm: null }
+    bufferedBlob = emptyBufferedAudio()
+  }
+}
+
+/** Empty payload that still carries the session's speech stats — main drops
+ *  empty buffers before the stats matter, but keeping them accurate costs
+ *  nothing and helps log forensics. */
+function emptyBufferedAudio(): BufferedAudio {
+  return {
+    buffer: new ArrayBuffer(0),
+    mimeType: 'audio/webm',
+    pcm: null,
+    ...sessionSpeechStats(),
   }
 }
 
@@ -646,12 +613,12 @@ async function flushBuffered(): Promise<void> {
   pendingFlush = (async () => {
     try {
       if (!bufferedBlob) {
-        bufferedBlob = { buffer: new ArrayBuffer(0), mimeType: 'audio/webm', pcm: null }
+        bufferedBlob = emptyBufferedAudio()
       }
-      const { buffer, mimeType, pcm } = bufferedBlob
+      const payload = bufferedBlob
       bufferedBlob = null
       localState = 'flushed'
-      await sendBlobSafe(buffer, mimeType, pcm)
+      await sendBlobSafe(payload)
       localState = 'idle'
     } finally {
       pendingFlush = null
@@ -660,13 +627,9 @@ async function flushBuffered(): Promise<void> {
   return pendingFlush
 }
 
-async function sendBlobSafe(
-  buffer: ArrayBuffer,
-  mimeType: string,
-  pcm: ArrayBuffer | null = null,
-): Promise<void> {
+async function sendBlobSafe(payload: BufferedAudio): Promise<void> {
   try {
-    await window.recorderAPI.sendBlob({ buffer, mimeType, pcm })
+    await window.recorderAPI.sendBlob(payload)
   } catch (err) {
     window.recorderAPI.reportFailed(`send-failed: ${(err as Error).message}`)
   }
@@ -695,11 +658,6 @@ async function cleanup(): Promise<void> {
     maxDurationTimer = null
   }
   stopLevelMonitor()
-  // Streaming refs die with the session; segmentIndex intentionally survives
-  // until the next start() — finalize's gates read it after cleanup().
-  activeRecorderStream = null
-  activeMimeType = undefined
-  silentSinceTs = null
   if (mediaRecorder) {
     try {
       if (mediaRecorder.state !== 'inactive') mediaRecorder.stop()
@@ -761,8 +719,7 @@ function startLevelMonitor(): void {
         if (levels[i] > sessionPeakLevel) sessionPeakLevel = levels[i]
         if (levels[i] > frameLevel) frameLevel = levels[i]
       }
-      if (frameLevel > segmentPeakLevel) segmentPeakLevel = frameLevel
-      maybeCutSegment(frameLevel)
+      trackSpeechEnergy(frameLevel, now)
       try {
         window.recorderAPI.sendLevels?.(levels)
       } catch {

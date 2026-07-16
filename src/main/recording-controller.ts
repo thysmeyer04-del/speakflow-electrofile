@@ -15,9 +15,10 @@ import {
   stopRecorderSession,
   onRecorderCrash,
   onAutoStop,
-  onPartialSegment,
 } from './recorder'
-import { transcribeAudio } from './transcribe'
+import { transcribeAudio, getProxyBaseUrl } from './transcribe'
+import { dictateViaProxy, isAuthOrQuotaError } from './dictate'
+import { isSilenceArtifact, ARTIFACT_MAX_SPEECH_MS } from './whisper-artifacts'
 import { syncToKnowledgeBase } from './supabase'
 import { getAuthToken } from './ipc'
 import { injectText, captureFocusTarget, WindowSnapshot } from './inject'
@@ -64,104 +65,22 @@ export function getPendingCommandId(): string | null {
   return pendingCommandId
 }
 
-// ── Streaming transcription ────────────────────────────────────────────────
-// While the user is still talking, the recorder ships pause-delimited audio
-// segments; each is transcribed here in the background. At stop time only
-// the final tail still needs transcribing, then all texts join in order.
-interface SegmentJob {
-  audio: Buffer
-  pcm: Float32Array | null
-  promise: Promise<string>
-  failed: boolean
-}
-let segments: Array<SegmentJob | undefined> = []
-// Language captured at doStart so background segment jobs and the tail all
-// use the same setting even if the user changes it mid-recording.
-let sessionLanguage: string | undefined
-// Accumulated partial texts (indexed by segment) for the live overlay
-// preview. Guarded by sessionId: a slow segment result from a PREVIOUS
-// session must never surface in the overlay of the current one.
-let partialTexts: Array<string | undefined> = []
+// NOTE on removed streaming: segment-on-pause transcription (partial
+// segments transcribed while the user was still talking) was deleted in the
+// Fast Batch work — partials fired in 0 of 37 logged sessions, and Groq
+// bills a 10 s minimum per uploaded segment. The 'partial-transcript'
+// broadcast channel and the overlay's setPartial() renderer are KEPT: a
+// future true-streaming implementation will reuse them; the channel simply
+// never fires for now.
 
-onPartialSegment(({ index, audio, pcm }) => {
-  if (state !== 'recording' && state !== 'stopping') {
-    log.warn(`[recording] partial segment ${index} ignored (state=${state})`)
-    return
-  }
-  const mySession = sessionId
-  const job: SegmentJob = { audio, pcm, failed: false, promise: Promise.resolve('') }
-  job.promise = transcribeAudio(audio, { language: sessionLanguage, pcm })
-    .then((text) => {
-      // Live preview: push the accumulated transcript-so-far to the overlay
-      // while the user is still talking. Only while this session still owns
-      // the mic — after stop the final pipeline takes over.
-      if (mySession === sessionId && (state === 'recording' || state === 'stopping')) {
-        partialTexts[index] = text
-        const joined = partialTexts
-          .map((p) => (p ?? '').trim())
-          .filter(Boolean)
-          .join(' ')
-        if (joined) broadcast('partial-transcript', joined)
-      }
-      return text
-    })
-    .catch((err) => {
-      log.warn(`[recording] segment ${index} failed — will retry at stop`, err)
-      job.failed = true
-      return ''
-    })
-  segments[index] = job
-  log.info(`[recording] segment ${index} (${audio.byteLength}B) transcribing in background`)
-})
-
-/** Transcribe the session's audio: single-shot when no partials were
- *  streamed, otherwise await the background jobs and join in order. */
-async function transcribeSessionAudio(
-  finalBuffer: Buffer,
-  finalPcm: Float32Array | null,
-  lang: string | undefined,
-): Promise<string> {
-  const partials = segments
-  segments = []
-  if (partials.length === 0) {
-    return transcribeAudio(finalBuffer, { language: lang, pcm: finalPcm })
-  }
-
-  const t0 = Date.now()
-  // Kick the tail off in parallel with any still-running partials.
-  const tailPromise =
-    finalBuffer.byteLength > 0
-      ? transcribeAudio(finalBuffer, { language: lang, pcm: finalPcm })
-      : Promise.resolve('')
-
-  const parts: string[] = []
-  let salvageError: Error | null = null
-  for (let i = 0; i < partials.length; i++) {
-    const job = partials[i]
-    if (!job) continue
-    let text = await job.promise
-    if (job.failed) {
-      try {
-        text = await transcribeAudio(job.audio, { language: lang, pcm: job.pcm })
-      } catch (err) {
-        // Keep the rest of the dictation — losing one segment beats losing all.
-        salvageError = err as Error
-        text = ''
-        log.error(`[recording] segment ${i} failed permanently — skipping`, err)
-      }
-    }
-    parts.push(text)
-  }
-  parts.push(await tailPromise)
-
-  const joined = parts.map((p) => p.trim()).filter(Boolean).join(' ')
-  log.info(`[timing] streaming join: ${partials.length} partial(s) + tail ready in ${Date.now() - t0}ms after stop`)
-  if (salvageError) {
-    if (!joined) throw salvageError
-    broadcast('transcription-error', 'A part of the dictation could not be transcribed.')
-  }
-  return joined
-}
+// ── Hallucination guard thresholds (work item E) ───────────────────────────
+// A clip with less than this much measured speech-level audio is dropped
+// client-side before any network call: Whisper reliably invents sentences
+// (and occasionally profanity — reported in the field) on silent-room clips,
+// and Groq bills a 10 s minimum for the privilege. The renderer's whole-clip
+// PEAK gate stays as belt+braces — the peak gate catches "never louder than
+// hiss", this speech-seconds gate catches "one door slam in a silent room".
+const MIN_SPEECH_MS = 400
 
 /** Start a dictation whose transcript will be transformed by `commandId`'s
  *  prompt (e.g. spoken rough notes → composed email) before pasting. */
@@ -222,8 +141,6 @@ onRecorderCrash((reason) => {
     broadcast('processing-complete')
     focusTarget = null
     pendingCommandId = null
-    segments = []
-    partialTexts = []
     setState('idle')
   })
 })
@@ -300,12 +217,9 @@ async function doStart(): Promise<void> {
   // A plain F11 dictation must never inherit a command from a previous
   // session; startCommandRecording re-arms this after doStart returns.
   pendingCommandId = null
-  segments = []
-  partialTexts = []
   setState('starting')
 
   const settings = getSettings()
-  sessionLanguage = settings.language === 'auto' ? undefined : settings.language
   // Tell the overlay to appear immediately — don't wait for the recorder
   // ACK. The overlay will show "Starting…" until 'recording-started' fires.
   // Suppress entirely if the user disabled the overlay in settings.
@@ -327,10 +241,18 @@ async function doStart(): Promise<void> {
 
   // Note: startRecorderSession lazy-inits the recorder window if it isn't
   // already up, so we don't reject on isRecorderHealthy() === false here.
+  //
+  // needPcm mirrors transcribe.ts's mode resolution (env override wins over
+  // the setting): the recorder only spends 200-600 ms decoding the blob to
+  // 16 kHz PCM at stop time when on-device Whisper will actually consume it.
+  // Cloud sessions skip the decode; the rare cloud-unreachable → local
+  // fallback re-requests PCM on demand ('recorder:decode-pcm').
+  const transcriptionMode =
+    process.env.SPEAKFLOW_TRANSCRIPTION_MODE || settings.transcriptionMode
   try {
     await startRecorderSession({
       microphoneId: settings.microphone,
-      streaming: settings.streamingTranscription,
+      needPcm: transcriptionMode === 'local',
     })
   } catch (err) {
     const msg = (err as Error).message
@@ -368,11 +290,20 @@ async function doStop(): Promise<void> {
 
   let audioBuffer: Buffer | null = null
   let audioPcm: Float32Array | null = null
+  let speechMs: number | null = null
+  let peakLevel: number | null = null
+  let stopToBlobMs = 0
   try {
     const result = await stopRecorderSession()
     audioBuffer = result.audio
     audioPcm = result.pcm
-    log.info(`[timing] audio blob received at +${Date.now() - t0}ms (${audioBuffer?.byteLength ?? 0} bytes, pcm=${audioPcm ? audioPcm.length : 0} samples)`)
+    speechMs = result.speechMs
+    peakLevel = result.peakLevel
+    stopToBlobMs = Date.now() - t0
+    log.info(
+      `[timing] audio blob received at +${stopToBlobMs}ms (${audioBuffer?.byteLength ?? 0} bytes, ` +
+        `pcm=${audioPcm ? audioPcm.length : 0} samples, speechMs=${speechMs ?? 'n/a'}, peak=${peakLevel?.toFixed(3) ?? 'n/a'})`,
+    )
   } catch (err) {
     log.error('[recording] stop failed', err)
     if (mySession !== sessionId) return
@@ -392,22 +323,22 @@ async function doStop(): Promise<void> {
   broadcast('processing-started')
   log.info(`[timing] processing-started at +${Date.now() - t0}ms`)
 
-  // Empty tail is only a no-op when streaming didn't already deliver
-  // partial segments — otherwise those still carry the dictation.
-  if ((!audioBuffer || audioBuffer.byteLength === 0) && segments.length === 0) {
+  // Empty blob = the recorder's own gates dropped the clip (too short /
+  // whole-session silence) — nothing to process.
+  if (!audioBuffer || audioBuffer.byteLength === 0) {
     broadcast('processing-complete')
     focusTarget = null
     setState('idle')
     return
   }
 
-  await processAudio(
-    audioBuffer ?? Buffer.alloc(0),
-    audioPcm,
-    settings.language,
-    mySession,
+  await processAudio(audioBuffer, audioPcm, settings.language, mySession, {
     durationSeconds,
-  )
+    speechMs,
+    peakLevel,
+    stopStartedAt: t0,
+    stopToBlobMs,
+  })
 }
 
 // Collapse Whisper hallucination loops — e.g. "word word word word" or
@@ -434,38 +365,182 @@ function collapseRepetitions(text: string): string {
   return words.join(' ')
 }
 
+// Everything doStop measured/knows about the finished clip — one bag so the
+// processAudio signature doesn't sprawl.
+interface StopStats {
+  durationSeconds: number
+  // Speech-energy stats from the recorder's level monitor. null = monitor
+  // never ran (no AudioContext) → every gate keyed on them fails OPEN.
+  speechMs: number | null
+  peakLevel: number | null
+  // Date.now() at doStop entry — anchor for the summary's total.
+  stopStartedAt: number
+  stopToBlobMs: number
+}
+
 async function processAudio(
   buffer: Buffer,
   pcm: Float32Array | null,
   language: string,
   mySession: number,
-  durationSeconds: number,
+  stats: StopStats,
 ): Promise<void> {
+  // ── Per-session timing ledger (work item A) ──────────────────────────────
+  // Exactly ONE summary line per processed clip — success, failure, or drop —
+  // so latency distributions can be rebuilt from user logs with a single
+  // grep for '[timing] summary'. total = doStop entry → inject resolved (or
+  // the failure point when the pipeline never reached inject).
+  let path: 'dictate' | 'legacy' | 'local' = 'legacy'
+  let transcribeMs = 0
+  let formatMs: number | null = null // null renders as 'skip'
+  let injectMs = 0
+  let ok = false
+  let endedAt = 0
+
   try {
-    // Pass buffer directly — no disk round-trip. Previously we wrote a temp
-    // file then transcribe.ts stat+read it back, wasting ~30-50 ms.
+    // ── Speech-seconds gate (work item E) ───────────────────────────────────
+    // Runs BEFORE any network call: a clip with <400 ms of speech-level audio
+    // is noise, and sending it to Whisper both hallucinates ("invented
+    // sentences / swear words on silent-room clips") and bills 10 s minimum.
+    // Same user feedback as the empty-transcription path so the UX is one
+    // consistent "No speech detected". Fail open on null (no level reading).
+    if (stats.speechMs !== null && stats.speechMs < MIN_SPEECH_MS) {
+      log.info(
+        `[recording] speech gate dropped clip: speechMs=${stats.speechMs} < ${MIN_SPEECH_MS} ` +
+          `(peak=${stats.peakLevel?.toFixed(3) ?? 'n/a'}, ${buffer.byteLength}B) — proxy not called`,
+      )
+      broadcast('transcription-error', 'No speech detected — try speaking louder or closer to the mic')
+      return
+    }
+
+    // Read settings live so a mid-recording toggle is honored, and resolve
+    // everything the routing decision needs up front.
+    const liveSettings = getSettings()
     const lang = language === 'auto' ? undefined : language
-    const text = await transcribeSessionAudio(buffer, pcm, lang)
+    const targetSnapshot = focusTarget // captured at hotkey time; cleared by finally
+    // Claim the pending command before routing: command dictations must keep
+    // the classic transcribe→transform pipeline (their formatting IS the
+    // command prompt), so they never take the /dictate path.
+    const commandId = pendingCommandId
+    pendingCommandId = null
+    const command = commandId ? getCommand(commandId) : undefined
+
+    const transcriptionMode =
+      process.env.SPEAKFLOW_TRANSCRIPTION_MODE || liveSettings.transcriptionMode
+    const provider =
+      process.env.SPEAKFLOW_TRANSCRIPTION_PROVIDER || liveSettings.transcriptionProvider
+    const proxyBase = getProxyBaseUrl()
+    if (transcriptionMode === 'local') path = 'local'
+
+    // /dictate route (work item D): ONE proxy round-trip does Whisper + the
+    // server-side hallucination filter + formatting. Only for the plain
+    // cloud+Groq dictation flow:
+    //   - local mode keeps on-device Whisper (+ its own cloud fallback);
+    //   - Deepgram users keep the legacy path — /dictate is Groq-only per
+    //     the frozen contract, and silently switching their engine would be
+    //     worse than one extra round-trip;
+    //   - dev builds without a proxy keep the direct-Groq legacy path;
+    //   - command dictations keep transcribe→transformText untouched.
+    const useDictate =
+      transcriptionMode === 'cloud' && provider === 'groq' && !!proxyBase && !command
+
+    let rawText: string | null = null
+    let serverFormatted: string | undefined
+
+    if (useDictate) {
+      path = 'dictate'
+      const tDictate = Date.now()
+      try {
+        const res = await dictateViaProxy(buffer, {
+          language: lang,
+          format: liveSettings.enableSmartFormatting,
+          stripDisfluencies: liveSettings.stripDisfluencies,
+          appName: targetSnapshot?.processName ?? undefined,
+          windowTitle: targetSnapshot?.title ?? undefined,
+          dictionary: getDictionaryWords(),
+          speechMs: stats.speechMs,
+        })
+        const rtt = Date.now() - tDictate
+        // Single-RTT split for the summary: the server reports its format
+        // stage; everything else (network + auth + quota + body + Groq) is
+        // attributed to 'transcribe'. The full server breakdown is logged
+        // separately by dictate.ts ('[timing] dictate server ...').
+        const serverFormatMs = res.serverTimings?.formatMs ?? 0
+        transcribeMs += Math.max(0, rtt - serverFormatMs)
+        formatMs = serverFormatMs > 0 ? serverFormatMs : null
+        rawText = res.raw
+        if (!res.skipped) serverFormatted = res.formatted
+      } catch (err) {
+        // 401/402 surface to the user exactly as the legacy proxy path would
+        // — a legacy retry would hit the same auth/quota wall and re-upload
+        // the audio for nothing.
+        if (isAuthOrQuotaError(err)) throw err
+        const wasted = Date.now() - tDictate
+        transcribeMs += wasted
+        // ANY other failure (offline, DNS, 404 while the server route is
+        // still deploying, 413, 5xx, 503, timeout) → transparent fallback to
+        // the proven legacy pipeline. The user notices nothing but latency.
+        log.warn(
+          `[dictate] failed after ${wasted}ms — falling back to legacy path: ${(err as Error).message}`,
+        )
+        path = 'legacy'
+      }
+    }
+
+    if (rawText === null) {
+      // Legacy / local / command path — the pre-Fast-Batch pipeline.
+      // Pass buffer directly — no disk round-trip. Previously we wrote a temp
+      // file then transcribe.ts stat+read it back, wasting ~30-50 ms.
+      const tTranscribe = Date.now()
+      rawText = await transcribeAudio(buffer, {
+        language: lang,
+        pcm,
+        speechMs: stats.speechMs,
+      })
+      transcribeMs += Date.now() - tTranscribe
+    }
 
     if (mySession !== sessionId) {
       log.info('[recording] processAudio abandoned — session invalidated (sign-out or crash)')
       return
     }
 
-    if (!text || !text.trim()) {
+    // ── Silence-artifact blocklist (work item E) ─────────────────────────────
+    // Right after transcription, before any formatting, on BOTH paths: if the
+    // whole transcript is a classic Whisper silence hallucination ("Thanks
+    // for watching", "Dankie dat jy gekyk het", …) AND the clip carried
+    // under 1.5 s of measured speech, treat it as empty. The server filters
+    // these on the dictate path too — this client copy covers legacy/dev/
+    // local, and costs microseconds.
+    if (
+      rawText.trim() &&
+      stats.speechMs !== null &&
+      stats.speechMs < ARTIFACT_MAX_SPEECH_MS &&
+      isSilenceArtifact(rawText)
+    ) {
+      log.warn(
+        `[recording] silence-artifact transcript dropped (speechMs=${stats.speechMs}): ` +
+          `"${rawText.trim().slice(0, 80)}"`,
+      )
+      rawText = ''
+      serverFormatted = undefined
+    }
+
+    if (!rawText || !rawText.trim()) {
       // Whisper returned empty — only show feedback if the clip was substantial
       // (short accidental presses stay silent).
       if (buffer.byteLength > 15_000) {
         log.warn(`[recording] empty transcription for ${buffer.byteLength}B clip`)
         broadcast('transcription-error', 'No speech detected — try speaking louder or closer to the mic')
       }
-    } else if (text.trim()) {
-      // Re-read settings live so a mid-recording toggle is honored.
-      const liveSettings = getSettings()
-      let rawTrimmed = collapseRepetitions(text.trim())
-      // Instant filler removal (um/uh/ah) on EVERY clip — the LLM pass below
+    } else {
+      let rawTrimmed = collapseRepetitions(rawText.trim())
+      // Instant filler removal (um/uh/ah) on EVERY clip — the LLM pass
       // skips short dictations, so this is what keeps a 10-word sentence
-      // clean. English-only: "um" is a real word in other languages.
+      // clean. English-only: "um" is a real word in other languages. Applied
+      // to the RAW text on the dictate path too: it feeds the sanity check,
+      // the word count, and the fallback text if the server formatting is
+      // rejected below.
       if (liveSettings.stripDisfluencies && language.startsWith('en')) {
         rawTrimmed = stripFillerWords(rawTrimmed)
       }
@@ -474,9 +549,6 @@ async function processAudio(
       // Command dictation (Ctrl+Shift+N with nothing highlighted): run the
       // transcript through the command's prompt — e.g. spoken rough notes
       // become a composed email. Fail-open to the raw transcript.
-      const commandId = pendingCommandId
-      pendingCommandId = null
-      const command = commandId ? getCommand(commandId) : undefined
       if (command) {
         broadcast('transform-starting')
         try {
@@ -493,14 +565,30 @@ async function processAudio(
         }
       }
 
-      // Smart-formatting pass: a second LLM call structures the flat Whisper
-      // output into paragraphs / lists. Skipped for command dictations — the
-      // command's LLM output is already structured. Fail-open: any error or
-      // aborted call falls back to the raw text — the user must never lose
-      // their dictation here.
-      const targetSnapshot = focusTarget // captured before inject clears it
-
-      if (!command && liveSettings.enableSmartFormatting && shouldFormat(rawTrimmed)) {
+      if (!command && serverFormatted) {
+        // Dictate path, server formatted: reuse the SAME sanity gate as the
+        // local formatter — a server-side LLM can answer-instead-of-reformat
+        // just as easily as a local call. collapseRepetitions deliberately
+        // ran on raw only; if Whisper loop-hallucinated, the un-collapsed
+        // formatted text fails the length-ratio check here and we fall back
+        // to the collapsed raw. Fail-open to rawTrimmed, never re-format.
+        if (sanityCheck(rawTrimmed, serverFormatted)) {
+          trimmed = serverFormatted
+        } else {
+          log.warn('[format] server-formatted text failed sanity check — using raw transcript')
+        }
+      } else if (
+        !command &&
+        path !== 'dictate' &&
+        liveSettings.enableSmartFormatting &&
+        shouldFormat(rawTrimmed)
+      ) {
+        // Legacy/local path only. On the dictate path a server "skip" is
+        // final — re-running formatting locally would re-add the exact
+        // second LLM round-trip Fast Batch removed. Fail-open: any error or
+        // aborted call falls back to the raw text — the user must never
+        // lose their dictation here.
+        const tFormat = Date.now()
         try {
           const formatted = await formatTranscript(rawTrimmed, {
             stripDisfluencies: liveSettings.stripDisfluencies,
@@ -508,6 +596,7 @@ async function processAudio(
             appName: targetSnapshot?.processName ?? null,
             windowTitle: targetSnapshot?.title ?? null,
           })
+          formatMs = Date.now() - tFormat
           if (mySession !== sessionId) {
             log.info('[recording] format result discarded — session invalidated')
             return
@@ -518,6 +607,7 @@ async function processAudio(
             log.warn('[format] sanity check failed, using raw transcript')
           }
         } catch (err) {
+          formatMs = Date.now() - tFormat
           log.warn('[format] failed, falling back to raw', err)
         }
       }
@@ -529,6 +619,7 @@ async function processAudio(
       trimmed = expandSnippets(trimmed)
 
       // Inject FIRST so the paste isn't delayed by anything else.
+      const tInject = Date.now()
       let injectResult
       try {
         injectResult = await injectText(trimmed, targetSnapshot)
@@ -536,13 +627,16 @@ async function processAudio(
         log.error('[recording] injection threw', injectErr)
         injectResult = { ok: false, method: 'clipboard' as const, error: 'inject-threw' }
       }
+      injectMs = Date.now() - tInject
+      endedAt = Date.now() // summary total anchors here: inject resolved
+      ok = injectResult.ok
       if (mySession !== sessionId) {
         log.info('[recording] post-inject broadcast skipped — session invalidated')
         return
       }
       broadcast('transcription-complete', {
         text: trimmed,
-        durationSeconds,
+        durationSeconds: stats.durationSeconds,
         appName: targetSnapshot?.processName ?? null,
         windowTitle: targetSnapshot?.title ?? null,
         source: 'dictation',
@@ -582,6 +676,16 @@ async function processAudio(
       broadcast('transcription-error', humanizeTranscribeError(err as Error))
     }
   } finally {
+    // Work item A: the one-line-per-session latency summary. Emitted before
+    // the state reset so 'total' isn't inflated by listener work; endedAt
+    // falls back to now for failure/drop paths that never reached inject.
+    const totalMs = (endedAt || Date.now()) - stats.stopStartedAt
+    log.info(
+      `[timing] summary sid=${mySession} path=${path} lang=${language} ` +
+        `audio=${stats.durationSeconds}s bytes=${buffer.byteLength} ` +
+        `stopToBlob=${stats.stopToBlobMs} transcribe=${transcribeMs} ` +
+        `format=${formatMs ?? 'skip'} inject=${injectMs} total=${totalMs} ok=${ok}`,
+    )
     // Only mutate terminal state if we still own this session.
     if (mySession === sessionId) {
       broadcast('processing-complete')
@@ -604,8 +708,6 @@ export function abortInFlightRecording(reason: string): void {
     broadcast('processing-complete')
     focusTarget = null
     pendingCommandId = null
-    segments = []
-    partialTexts = []
     setState('idle')
   })
 }
@@ -657,8 +759,6 @@ export async function shutdownRecording(): Promise<void> {
   } finally {
     focusTarget = null
     pendingCommandId = null
-    segments = []
-    partialTexts = []
     setState('idle')
   }
 }
