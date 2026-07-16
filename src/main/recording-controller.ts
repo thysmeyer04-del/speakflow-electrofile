@@ -72,11 +72,12 @@ export function getPendingCommandId(): string | null {
 // NOTE on streaming history: segment-on-pause transcription (partial
 // segments transcribed while the user was still talking) was deleted in the
 // Fast Batch work — partials fired in 0 of 37 logged sessions, and Groq
-// bills a 10 s minimum per uploaded segment. The 'partial-transcript'
-// broadcast channel and the overlay's setPartial() renderer were KEPT, and
-// True Streaming (2026-07) now feeds them: a Deepgram Nova-3 WebSocket owned
-// by asr-stream.ts receives live PCM from the recorder window and pushes
-// interim words to the overlay while the user talks.
+// bills a 10 s minimum per uploaded segment. True Streaming (2026-07) now
+// runs a Deepgram Nova-3 WebSocket (asr-stream.ts) fed with live PCM from
+// the recorder window — but INVISIBLY: Thys rejected live words in the
+// overlay (2026-07-16), so the pill shows only Listening/Transcribing and
+// the finished text pastes. The 'partial-transcript' channel + overlay
+// setPartial() renderer are kept dormant for a possible future opt-in.
 //
 // ── True Streaming state machine (per recording session) ───────────────────
 //   doStart (eligible)  → recorder gets streamPcm:true AND the ASR socket is
@@ -176,12 +177,13 @@ function beginAsrStream(mySession: number, t0: number): void {
 
   void startAsrStream({
     language: 'en',
-    onInterim: (text) => {
-      // Guarded per interim: a socket that outlives its session (crash,
-      // sign-out) must not paint stale words into a new session's overlay.
-      if (mySession !== sessionId) return
-      broadcast('partial-transcript', text)
-    },
+    // Product decision (Thys, 2026-07-16): NO live words in the overlay —
+    // the pill shows only "Listening" / "Transcribing…" like Wispr Flow, and
+    // the text simply pastes. Streaming still runs underneath for the speed;
+    // interims are consumed only by asr-stream's own timing logs. The
+    // 'partial-transcript' channel + overlay renderer are kept dormant in
+    // case live words ever return as an opt-in setting.
+    onInterim: () => {},
   })
     .then((session) => {
       if (mySession !== sessionId || !asrPendingSetup) {
