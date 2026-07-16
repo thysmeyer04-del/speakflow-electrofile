@@ -119,6 +119,11 @@ async function mintAndConnect(opts: AsrStreamOptions): Promise<AsrSession> {
   url.searchParams.set('sample_rate', '16000')
   url.searchParams.set('channels', '1')
   url.searchParams.set('smart_format', 'true')
+  // Spoken punctuation at the engine ("period" → ".", "new paragraph" →
+  // break) — Wispr-parity with zero added latency. The LLM format pass has
+  // the same rule for the batch path, so both engines converge on one
+  // behavior; on this path the command usually never reaches the LLM at all.
+  url.searchParams.set('dictation', 'true')
   url.searchParams.set('interim_results', 'true')
   url.searchParams.set('language', opts.language)
   const wsUrl = url.toString()

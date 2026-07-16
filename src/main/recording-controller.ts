@@ -35,6 +35,7 @@ import {
   sanityCheck,
   stripFillerWords,
   abortInFlightFormat,
+  detectContextCategory,
 } from './format-transcript'
 import { getCommand } from './commands-store'
 import { transformText } from './transform-llm'
@@ -857,6 +858,19 @@ async function processAudio(
       // the LLM never sees/rewrites the expansion; before inject so the
       // pasted text is the expanded one.
       trimmed = expandSnippets(trimmed)
+
+      // Wispr-parity: a trailing period on a short single-line chat message
+      // reads as curt in Slack/WhatsApp/Teams — drop exactly one. "?" "!" and
+      // "..." are meaningful and stay. Deterministic (no LLM), messaging
+      // category only, so emails and documents keep their full stops.
+      if (
+        trimmed.length < 200 &&
+        !trimmed.includes('\n') &&
+        /[^.!?]\.$/.test(trimmed) &&
+        detectContextCategory(targetSnapshot?.processName, targetSnapshot?.title) === 'messaging'
+      ) {
+        trimmed = trimmed.slice(0, -1)
+      }
 
       // Inject FIRST so the paste isn't delayed by anything else.
       const tInject = Date.now()
