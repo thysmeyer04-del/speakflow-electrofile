@@ -544,6 +544,17 @@ async function processAudio(
       if (liveSettings.stripDisfluencies && language.startsWith('en')) {
         rawTrimmed = stripFillerWords(rawTrimmed)
       }
+
+      // Post-processing can legitimately EMPTY the transcript: Whisper loop-
+      // hallucinates "um um um…" on a noise clip → collapseRepetitions leaves
+      // "um" → stripFillerWords leaves "". Without this recheck the empty
+      // string reached the transform proxy (400 "userText required",
+      // observed 2026-07-16) and injectText. Same UX as an empty transcription.
+      if (!rawTrimmed) {
+        log.warn('[recording] transcript empty after collapse/filler-strip — treating as no speech')
+        broadcast('transcription-error', 'No speech detected — try speaking louder or closer to the mic')
+        return
+      }
       let trimmed = rawTrimmed
 
       // Command dictation (Ctrl+Shift+N with nothing highlighted): run the

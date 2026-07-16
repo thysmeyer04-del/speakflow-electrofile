@@ -69,7 +69,13 @@ const KEY_GAP_MS = envMs('SPEAKFLOW_INJECT_KEY_GAP_MS', 15)
 // this settle runs DETACHED (see injectViaClipboard) and no longer adds to
 // perceived stop→paste latency at all.
 const PASTE_SETTLE_MS = envMs('SPEAKFLOW_INJECT_PASTE_SETTLE_MS', 120)
-const KEYSTROKE_LIMIT = 100
+// Keystroke typing is DISABLED by default (limit 0): nut-js types character
+// by character, which users see as stuttery "very fast typing" for short
+// dictations while long ones paste atomically — inconsistent and slower than
+// the clipboard fast path. Wispr pastes everything. The keystroke path stays
+// as an env-enabled escape hatch for apps that block synthetic Ctrl+V
+// (some VMs/Citrix): set SPEAKFLOW_INJECT_KEYSTROKE_MAX=100 to restore it.
+const KEYSTROKE_LIMIT = envMs('SPEAKFLOW_INJECT_KEYSTROKE_MAX', 0)
 // After releasing stray modifier keys, give the OS a beat to register the
 // key-up events before we synthesize type()/Ctrl+V. Without this, the paste
 // can still be interpreted with the modifier active. 60 ms is a safe margin
@@ -300,7 +306,7 @@ async function doInject(
     )
   }
 
-  if (text.length <= KEYSTROKE_LIMIT && isPureAscii(text)) {
+  if (KEYSTROKE_LIMIT > 0 && text.length <= KEYSTROKE_LIMIT && isPureAscii(text)) {
     try {
       const tType = Date.now()
       await nutKeyboard!.type(text)
