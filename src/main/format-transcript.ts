@@ -178,6 +178,14 @@ function unwrapResponse(text: string): string {
   ) {
     out = out.slice(1, -1).trim()
   }
+  // Preamble leak: small models sometimes prepend "Here is the reformatted
+  // text:" despite the output-only rule — one leaked into a real paste
+  // (2026-07-16). Strip a single leading line of that shape. Mirrors the
+  // server-side unwrapModelOutput in /api/dictate.
+  out = out.replace(
+    /^(?:sure[,!.]?\s+)?here(?:'s| is| are)\s+(?:the|your|a)?\s*(?:reformatted|formatted|cleaned(?:[ -]up)?|corrected|polished|revised|edited|final|improved)?\s*(?:text|version|transcript|output|result)\s*:?\s*\n?/i,
+    '',
+  ).trim()
   return out
 }
 
