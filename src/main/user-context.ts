@@ -13,7 +13,8 @@
 
 import log from 'electron-log/main'
 import { getAuthToken } from './ipc'
-import { clientForUser } from './supabase'
+import { clientForUser, hasSupabaseConfig, ensureSupabaseConfig } from './supabase'
+import { getProxyBaseUrl } from './transcribe'
 import { COMMON_WORDS } from './common-words'
 
 export interface Snippet {
@@ -92,6 +93,10 @@ export function clearUserContext(): void {
  *  a token. Never throws — callers fire-and-forget. */
 export async function refreshUserContext(): Promise<void> {
   if (refreshInFlight) return
+  // Packaged builds ship no Supabase credentials (dotenv only ever finds a
+  // developer's .env), so fetch the public client config before giving up —
+  // without this the dictionary silently never loaded in ANY release.
+  if (!hasSupabaseConfig()) await ensureSupabaseConfig(getProxyBaseUrl())
   const client = clientForUser()
   if (!client) return // not signed in (or no Supabase creds) — keep quiet
   refreshInFlight = true

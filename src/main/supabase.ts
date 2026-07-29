@@ -23,23 +23,79 @@ dotenv.config()
 
 // Prefer the dashboard-style env names but fall back to the simpler ones so
 // either naming works in .env.
-const supabaseUrl =
+//
+// MUTABLE, and that matters. dotenv only ever finds a developer's local .env:
+// `.env*` is gitignored and is not in electron-builder's `files:` list, so
+// every PACKAGED build started with empty strings here. clientForUser() then
+// returned null forever and refreshUserContext() took its silent early-return
+// path on every tick — meaning the personal dictionary, snippets and
+// pronunciation aliases NEVER loaded in any shipped build (diagnosed
+// 2026-07-29 from a 5.5-hour log with zero [user-context] lines, while Thys
+// was asking why "Supabase" kept transcribing as "supervise"). Measured
+// impact of that dead path: proper-noun accuracy 5/24 vs 17/24.
+//
+// So when the env is empty we fetch the public client config from the
+// marketing API at startup (see ensureSupabaseConfig). The anon key is public
+// by design — the dashboard already ships it in its browser bundle, and RLS,
+// not key secrecy, is what protects user data.
+let supabaseUrl =
   process.env.SPEAKFLOW_SUPABASE_URL ||
   process.env.VITE_SUPABASE_URL ||
   process.env.SUPABASE_URL ||
   ''
-const supabaseAnonKey =
+let supabaseAnonKey =
   process.env.SPEAKFLOW_SUPABASE_ANON_KEY ||
   process.env.VITE_SUPABASE_ANON_KEY ||
   process.env.SUPABASE_ANON_KEY ||
   ''
 
 // A long-lived anon client — used only for the rare unauth read. Writes go
-// through clientForUser() which attaches the user JWT.
-const anonClient: SupabaseClient | null =
-  supabaseUrl && supabaseAnonKey
-    ? createClient(supabaseUrl, supabaseAnonKey, { realtime: REALTIME_TRANSPORT })
-    : null
+// through clientForUser() which attaches the user JWT. Built lazily so it can
+// come to life after ensureSupabaseConfig() fills the credentials in.
+let anonClient: SupabaseClient | null = null
+function rebuildAnonClient(): void {
+  anonClient =
+    supabaseUrl && supabaseAnonKey
+      ? createClient(supabaseUrl, supabaseAnonKey, { realtime: REALTIME_TRANSPORT })
+      : null
+}
+rebuildAnonClient()
+
+/** True once we have usable credentials from either source. */
+export function hasSupabaseConfig(): boolean {
+  return Boolean(supabaseUrl && supabaseAnonKey)
+}
+
+let configFetch: Promise<void> | null = null
+
+/** Fill in missing credentials from the marketing API's public /api/config.
+ *  No-op when the env already provided them (dev) or the proxy is unset.
+ *  Never throws — callers fire-and-forget; a failure just leaves the caches
+ *  empty exactly as before. */
+export function ensureSupabaseConfig(proxyBaseUrl: string | null | undefined): Promise<void> {
+  if (hasSupabaseConfig()) return Promise.resolve()
+  if (!proxyBaseUrl) return Promise.resolve()
+  if (configFetch) return configFetch
+
+  configFetch = (async () => {
+    try {
+      const url = proxyBaseUrl.replace(/\/+$/, '') + '/config'
+      const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
+      if (!res.ok) throw new Error(`config ${res.status}`)
+      const data = (await res.json()) as { supabaseUrl?: string; supabaseAnonKey?: string }
+      if (!data.supabaseUrl || !data.supabaseAnonKey) throw new Error('config incomplete')
+      supabaseUrl = data.supabaseUrl
+      supabaseAnonKey = data.supabaseAnonKey
+      rebuildAnonClient()
+      log.info('[supabase] client credentials loaded from the API — dictionary sync enabled')
+    } catch (err) {
+      // Retry on the next call rather than latching a failure forever.
+      configFetch = null
+      log.warn('[supabase] could not load client credentials', err)
+    }
+  })()
+  return configFetch
+}
 
 /** Authenticated client for the current user; falls back to null if no JWT.
  *  Exported so user-context (dictionary/snippets) fetches reuse the exact
@@ -102,4 +158,9 @@ export async function syncToKnowledgeBase(
 }
 
 // Expose the (rarely-used) anon client for reads that don't need auth.
-export { anonClient as supabase }
+// A function, not a re-exported binding: tsc compiles `export { anonClient }`
+// to a one-time `exports.supabase = anonClient` snapshot, which would hand
+// callers the null captured before ensureSupabaseConfig() ran.
+export function getAnonClient(): SupabaseClient | null {
+  return anonClient
+}
