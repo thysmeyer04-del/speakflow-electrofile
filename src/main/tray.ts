@@ -1,11 +1,14 @@
-import { Tray, Menu, app, BrowserWindow, nativeImage, NativeImage } from 'electron'
+import { Tray, Menu, app, BrowserWindow, nativeImage, NativeImage, dialog } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import log from 'electron-log/main'
 import { markQuitting } from './quit-state'
 import { toggleRecording } from './recording-controller'
+import { installPendingUpdate, checkForUpdatesNow, getPendingUpdateVersion } from './updater'
 
 let tray: Tray | null = null
+// Rebuilding the context menu needs the window reference captured at setup.
+let rebuildMenu: (() => void) | null = null
 
 // Minimal 16x16 solid-colour PNG fallback if the real icon is missing.
 const FALLBACK_PNG_BASE64 =
@@ -41,43 +44,90 @@ export function setupTray(mainWindow: BrowserWindow): void {
     mainWindow.focus()
   }
 
-  const menu = Menu.buildFromTemplate([
-    { label: 'Open Speakflow', click: showWindow },
-    { type: 'separator' },
-    {
-      label: 'Start / Stop Recording',
-      click: () => { void toggleRecording() },
-    },
-    { type: 'separator' },
-    {
-      label: 'Settings',
-      click: () => {
-        showWindow()
-        mainWindow.webContents.send('navigate-to', '/settings/general')
-      },
-    },
-    {
-      label: `Version ${app.getVersion()}`,
-      enabled: false,
-    },
-    { type: 'separator' },
-    {
-      label: 'Quit Speakflow',
-      click: () => {
-        markQuitting()
-        app.quit()
-      },
-    },
-  ])
+  // Menu is rebuilt whenever a downloaded update starts/stops waiting, so the
+  // "Restart to update" entry can appear without an app restart. Before
+  // v0.7.2 a pending update was announced by a single modal dialog and was
+  // invisible everywhere else — Thys sat on a stale build for 12 days.
+  rebuildMenu = () => {
+    if (!tray || tray.isDestroyed()) return
+    const pending = getPendingUpdateVersion()
 
-  tray.setContextMenu(menu)
+    const menu = Menu.buildFromTemplate([
+      ...(pending
+        ? [
+            {
+              label: `⬆  Restart to update to ${pending}`,
+              click: () => { installPendingUpdate() },
+            },
+            { type: 'separator' as const },
+          ]
+        : []),
+      { label: 'Open Speakflow', click: showWindow },
+      { type: 'separator' as const },
+      {
+        label: 'Start / Stop Recording',
+        click: () => { void toggleRecording() },
+      },
+      { type: 'separator' as const },
+      {
+        label: 'Settings',
+        click: () => {
+          showWindow()
+          mainWindow.webContents.send('navigate-to', '/settings/general')
+        },
+      },
+      {
+        label: `Version ${app.getVersion()}`,
+        enabled: false,
+      },
+      {
+        label: 'Check for updates…',
+        click: () => {
+          void checkForUpdatesNow().then((status) => {
+            log.info(`[tray] manual update check: ${status}`)
+            dialog.showMessageBox({
+              type: 'info',
+              title: 'Speakflow updates',
+              message: status,
+              buttons: ['OK'],
+            }).catch(() => { /* dialog dismissed — nothing to do */ })
+          })
+        },
+      },
+      { type: 'separator' as const },
+      {
+        label: 'Quit Speakflow',
+        click: () => {
+          markQuitting()
+          app.quit()
+        },
+      },
+    ])
+
+    tray.setContextMenu(menu)
+    tray.setToolTip(pending ? `Speakflow — update ${pending} ready` : 'Speakflow')
+  }
+
+  rebuildMenu()
   tray.on('double-click', showWindow)
+}
+
+/** Called by the updater when a version starts (or stops) waiting to install. */
+export function setTrayUpdatePending(version: string | null): void {
+  log.info(`[tray] update pending: ${version ?? 'none'}`)
+  rebuildMenu?.()
 }
 
 export function setTrayRecording(recording: boolean): void {
   if (!tray || tray.isDestroyed()) return
   tray.setImage(loadIcon(recording ? 'tray-icon-recording.png' : 'tray-icon.png'))
-  tray.setToolTip(recording ? 'Speakflow — Recording…' : 'Speakflow')
+  if (recording) {
+    tray.setToolTip('Speakflow — Recording…')
+    return
+  }
+  // Idle: keep advertising a waiting update rather than clobbering it.
+  const pending = getPendingUpdateVersion()
+  tray.setToolTip(pending ? `Speakflow — update ${pending} ready` : 'Speakflow')
 }
 
 // Verify the bundled fallback at boot so missing-asset issues surface early.

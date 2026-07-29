@@ -11,7 +11,7 @@ app.commandLine.appendSwitch('disable-gpu')
 app.commandLine.appendSwitch('no-sandbox')
 import path from 'path'
 import log from 'electron-log/main'
-import { setupTray, setTrayRecording, selfCheckTrayAssets } from './tray'
+import { setupTray, setTrayRecording, selfCheckTrayAssets, setTrayUpdatePending } from './tray'
 import { registerHotkey, unregisterHotkey, reassertHotkey } from './hotkey'
 import { initCommandsStore, getCommands } from './commands-store'
 import {
@@ -496,7 +496,9 @@ app.whenReady().then(async () => {
   registerHotkey(getSettings().hotkey)
   initCommandsStore()
   registerCommandHotkeys(getCommands())
-  setupAutoUpdater(mainWindow)
+  // onPendingChange keeps the tray entry in sync without updater.ts importing
+  // tray.ts (tray already imports updater — one direction only, no cycle).
+  setupAutoUpdater(mainWindow, { onPendingChange: setTrayUpdatePending })
 
   // Pre-warm nut-js so the first F11 doesn't pay a 3-second cold-init
   // penalty. Fire-and-forget; if it fails the first capture just falls
