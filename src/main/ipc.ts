@@ -42,9 +42,16 @@ interface SetupArgs {
 let cachedAuthToken: string | null = null
 let cachedTokenExpiresAt = 0
 
-// 60s safety margin — refuse tokens about to expire so a long-running call
-// (embedding compute + network) doesn't blow up half-way through with 401.
-const TOKEN_FRESHNESS_MARGIN_MS = 60_000
+// Safety margin — refuse tokens about to expire so a request doesn't blow up
+// half-way through with a 401.
+//
+// Was 60 s, cut to 5 s on 2026-07-29: the margin created a guaranteed DEAD
+// MINUTE before every hourly token rotation, in which getAuthToken() returned
+// null and every dictation died with "Sign in via the dashboard" — losing the
+// whole recording. Observed in the field: an 81-second dictation destroyed
+// this way. A transcription POST takes ~1-2 s, so 5 s of remaining validity
+// is ample, and Supabase rotates the token well before then anyway.
+const TOKEN_FRESHNESS_MARGIN_MS = 5_000
 
 export function getAuthToken(): string | null {
   if (!cachedAuthToken) return null
@@ -53,6 +60,10 @@ export function getAuthToken(): string | null {
       cachedAuthToken = null
       cachedTokenExpiresAt = 0
     }
+    log.warn(
+      '[auth] token within expiry margin — dictation will fall back/fail until the ' +
+        'dashboard pushes a refreshed session',
+    )
     return null
   }
   return cachedAuthToken
@@ -61,6 +72,32 @@ export function getAuthToken(): string | null {
 export function clearAuthTokenCache(): void {
   cachedAuthToken = null
   cachedTokenExpiresAt = 0
+}
+
+/**
+ * Wait briefly for a usable token to (re)appear before giving up on a
+ * dictation. The dashboard renderer refreshes the Supabase session on its own
+ * schedule and pushes the new JWT over `auth:set-token`; if a hotkey lands in
+ * the seconds around a rotation, the token is momentarily absent. Without this
+ * the recording is DESTROYED — the audio is already stopped and there is no
+ * retry path (a real 81-second dictation was lost this way, 2026-07-29).
+ *
+ * Returns as soon as a token exists, or null after maxWaitMs. Costs nothing on
+ * the normal path: the first check almost always hits.
+ */
+export async function ensureAuthToken(maxWaitMs = 3_000): Promise<string | null> {
+  const immediate = getAuthToken()
+  if (immediate) return immediate
+  const deadline = Date.now() + maxWaitMs
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 150))
+    const token = getAuthToken()
+    if (token) {
+      log.info('[auth] token reappeared while waiting — dictation continues')
+      return token
+    }
+  }
+  return null
 }
 
 function gatedOn<T>(channel: string, handler: (event: IpcMainEvent, payload: T) => void) {

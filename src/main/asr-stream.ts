@@ -80,16 +80,30 @@ export interface AsrStreamOptions {
 const MAX_KEYTERMS = 20
 const MAX_KEYTERM_LEN = 40
 
+/** What finalize() resolves with. `coveredMs` vs `audioSentMs` is the
+ *  TRUNCATION CHECK: Deepgram stamps every result with its position in the
+ *  audio timeline, so the end of the last transcribed segment tells us
+ *  exactly how much of what we sent actually became words. When the flush
+ *  settles early (a final lands with no from_finalize flag while Deepgram is
+ *  still decoding the tail — observed 2026-07-29: 68 chars streamed where
+ *  the batch engine heard 111) coverage falls short and the caller discards
+ *  the stream in favour of the complete MediaRecorder audio. */
+export interface AsrFinalizeResult {
+  text: string
+  coveredMs: number
+  audioSentMs: number
+}
+
 export interface AsrSession {
   /** Forward one 50 ms PCM frame. Silently dropped unless the socket is open
    *  and the session is still streaming — frames racing a finalize/abort are
    *  expected and harmless (the MediaRecorder has the same audio). */
   sendFrame(frame: Buffer): void
-  /** Flush Deepgram's tail and resolve the full transcript. Rejects with a
-   *  typed AsrError on timeout/socket death — the caller falls back to the
-   *  batch pipeline. The socket is closed either way; a session finalizes
-   *  at most once. */
-  finalize(timeoutMs?: number): Promise<string>
+  /** Flush Deepgram's tail and resolve the full transcript + coverage.
+   *  Rejects with a typed AsrError on timeout/socket death — the caller falls
+   *  back to the batch pipeline. The socket is closed either way; a session
+   *  finalizes at most once. */
+  finalize(timeoutMs?: number): Promise<AsrFinalizeResult>
   /** Immediate teardown (sign-out, session invalidated, superseded). Safe to
    *  call at any time, including after finalize settled. */
   abort(): void
@@ -99,8 +113,15 @@ interface DeepgramResults {
   type?: string
   is_final?: boolean
   from_finalize?: boolean
+  // Segment position in the audio timeline, SECONDS. Used for the coverage
+  // check that catches a truncated flush (see AsrFinalizeResult).
+  start?: number
+  duration?: number
   channel?: { alternatives?: Array<{ transcript?: string }> }
 }
+
+/** One PCM frame = 50 ms (recorder ships 800 samples @ 16 kHz). */
+const FRAME_MS = 50
 
 // ws hands text frames back as Buffer (or Buffer[] for fragmented messages);
 // normalize before JSON.parse.
@@ -173,11 +194,15 @@ async function mintAndConnect(opts: AsrStreamOptions): Promise<AsrSession> {
   let tFinalize = 0
   let firstResultLogged = false
   let framesSent = 0
+  // End of the last COMMITTED (is_final) segment, ms into the audio timeline.
+  let coveredMs = 0
   let keepAliveTimer: NodeJS.Timeout | null = null
   let finalizeTimer: NodeJS.Timeout | null = null
   let quietTimer: NodeJS.Timeout | null = null
-  let finalizeSettle: { resolve: (text: string) => void; reject: (err: Error) => void } | null =
-    null
+  let finalizeSettle: {
+    resolve: (result: AsrFinalizeResult) => void
+    reject: (err: Error) => void
+  } | null = null
 
   const joined = (): string => {
     const parts = finals.slice()
@@ -215,14 +240,16 @@ async function mintAndConnect(opts: AsrStreamOptions): Promise<AsrSession> {
   const settleResolve = (): void => {
     const settle = finalizeSettle
     finalizeSettle = null
+    const audioSentMs = framesSent * FRAME_MS
     log.info(
       `[timing] asr finalize-rtt ${Date.now() - tFinalize}ms ` +
-        `(finals=${finals.length}, framesSent=${framesSent})`,
+        `(finals=${finals.length}, framesSent=${framesSent}, ` +
+        `covered=${Math.round(coveredMs)}ms/${audioSentMs}ms)`,
     )
     const text = joined()
     teardown()
     closeGracefully()
-    settle?.resolve(text)
+    settle?.resolve({ text, coveredMs, audioSentMs })
   }
 
   const settleReject = (err: Error): void => {
@@ -270,6 +297,13 @@ async function mintAndConnect(opts: AsrStreamOptions): Promise<AsrSession> {
     if (msg.is_final) {
       if (transcript) finals.push(transcript)
       interim = '' // the final supersedes the running hypothesis
+      // How far into the audio Deepgram has now committed. Only finals count:
+      // an interim's span can be revised. Missing fields (older API shapes)
+      // simply leave coverage at 0, which the caller treats as "unknown" and
+      // does not penalise.
+      if (typeof msg.start === 'number' && typeof msg.duration === 'number') {
+        coveredMs = Math.max(coveredMs, (msg.start + msg.duration) * 1000)
+      }
     } else {
       interim = transcript
     }
@@ -312,7 +346,7 @@ async function mintAndConnect(opts: AsrStreamOptions): Promise<AsrSession> {
       }
     },
 
-    finalize(timeoutMs = FINALIZE_TIMEOUT_MS): Promise<string> {
+    finalize(timeoutMs = FINALIZE_TIMEOUT_MS): Promise<AsrFinalizeResult> {
       if (state !== 'streaming' || ws.readyState !== WebSocket.OPEN) {
         return Promise.reject(
           asrError('ws-error', `socket not open at finalize (state=${state})`),
@@ -320,7 +354,7 @@ async function mintAndConnect(opts: AsrStreamOptions): Promise<AsrSession> {
       }
       state = 'finalizing'
       tFinalize = Date.now()
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<AsrFinalizeResult>((resolve, reject) => {
         finalizeSettle = { resolve, reject }
         finalizeTimer = setTimeout(() => {
           settleReject(asrError('finalize-timeout', `no flush final within ${timeoutMs}ms`))

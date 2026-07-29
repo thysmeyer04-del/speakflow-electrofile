@@ -20,11 +20,11 @@ import {
 } from './recorder'
 import { transcribeAudio, getProxyBaseUrl } from './transcribe'
 import { dictateViaProxy, isAuthOrQuotaError } from './dictate'
-import { startAsrStream, AsrSession } from './asr-stream'
+import { startAsrStream, AsrSession, AsrFinalizeResult } from './asr-stream'
 import { asrErrorCode, reportStreamingUsage } from './asr-token'
 import { isSilenceArtifact, ARTIFACT_MAX_SPEECH_MS } from './whisper-artifacts'
 import { syncToKnowledgeBase } from './supabase'
-import { getAuthToken } from './ipc'
+import { getAuthToken, ensureAuthToken } from './ipc'
 import { injectText, captureFocusTarget, WindowSnapshot } from './inject'
 import { getSettings } from './settings'
 import { playSound } from './sound'
@@ -113,6 +113,26 @@ export function getPendingCommandId(): string | null {
 // PEAK gate stays as belt+braces — the peak gate catches "never louder than
 // hiss", this speech-seconds gate catches "one door slam in a silent room".
 const MIN_SPEECH_MS = 400
+
+// ── Stream truncation guard (v0.7.1) ───────────────────────────────────────
+// Deepgram stamps each committed segment with its span in the audio timeline,
+// so "how much of what we sent became words" is measurable, not guesswork.
+// Anything beyond this much un-transcribed tail means the flush settled early
+// and the last words are lost — discard the stream and let the complete
+// MediaRecorder audio go through the batch engine instead.
+//
+// 700 ms: trailing silence legitimately goes uncommitted (Deepgram ends the
+// segment at the last word, not at the last frame), and the hotkey release
+// itself always lands a beat after the final syllable. Below this we would
+// throw away good streams and pay batch latency for nothing.
+const STREAM_TAIL_TOLERANCE_MS = 700
+
+function isStreamTruncated(result: AsrFinalizeResult): boolean {
+  // coveredMs 0 = the API didn't report spans (older shape) — can't judge,
+  // so trust the transcript rather than forcing everyone onto the slow path.
+  if (result.coveredMs <= 0 || result.audioSentMs <= 0) return false
+  return result.audioSentMs - result.coveredMs > STREAM_TAIL_TOLERANCE_MS
+}
 
 // ── True Streaming session state ────────────────────────────────────────────
 // Live Deepgram session for the CURRENT recording, or null. Set only after
@@ -466,16 +486,18 @@ async function doStop(): Promise<void> {
   // complete-audio fallback for every streaming failure mode.
   const streamSession = asrSession
   const tFinalize = Date.now()
-  const finalizeSettled: Promise<{ text: string | null; failure: string | null }> | null =
-    streamSession
-      ? streamSession.finalize().then(
-          (text) => ({ text, failure: null }),
-          (err: unknown) => ({
-            text: null,
-            failure: `${asrErrorCode(err) ?? 'unknown'} (${(err as Error).message})`,
-          }),
-        )
-      : null
+  const finalizeSettled: Promise<{
+    result: AsrFinalizeResult | null
+    failure: string | null
+  }> | null = streamSession
+    ? streamSession.finalize().then(
+        (result) => ({ result, failure: null }),
+        (err: unknown) => ({
+          result: null,
+          failure: `${asrErrorCode(err) ?? 'unknown'} (${(err as Error).message})`,
+        }),
+      )
+    : null
 
   let audioBuffer: Buffer | null = null
   let audioPcm: Float32Array | null = null
@@ -514,11 +536,24 @@ async function doStop(): Promise<void> {
     streamMs = Date.now() - tFinalize
     if (settled.failure) {
       log.info(`[timing] asr fallback reason=finalize-failed detail=${settled.failure}`)
-    } else if (!settled.text || !settled.text.trim()) {
+    } else if (!settled.result || !settled.result.text.trim()) {
       // Socket lived but heard nothing usable — batch gets the final say.
       log.info('[timing] asr fallback reason=empty-stream-transcript')
+    } else if (isStreamTruncated(settled.result)) {
+      // Deepgram committed words for materially less audio than we sent: the
+      // flush settled while it was still decoding the tail, so the last words
+      // are MISSING. Reported by Thys as "sometimes it cuts out at the end"
+      // and confirmed 2026-07-29 (shadow diff 22.6%: 68 streamed chars vs 111
+      // heard by the batch engine on the same clip). The MediaRecorder audio
+      // below is complete — spend the extra ~1 s and get the whole sentence.
+      const { coveredMs, audioSentMs } = settled.result
+      log.warn(
+        `[timing] asr fallback reason=truncated-stream ` +
+          `covered=${Math.round(coveredMs)}ms sent=${audioSentMs}ms ` +
+          `missing=${Math.round(audioSentMs - coveredMs)}ms`,
+      )
     } else {
-      streamText = settled.text
+      streamText = settled.result.text
     }
   }
   // The session is spent either way (finalize closes the socket); release
@@ -670,6 +705,23 @@ async function processAudio(
     // pipeline expects to own all formatting.
     const streamText =
       !command && stats.streamText && stats.streamText.trim() ? stats.streamText.trim() : null
+
+    // Token rotation guard: every cloud path needs a JWT, and if the hotkey
+    // lands in the seconds around a Supabase refresh there momentarily isn't
+    // one — which used to destroy the whole recording ("Sign in via the
+    // dashboard", 81 s of speech lost, 2026-07-29). Wait a beat for the
+    // renderer to push the refreshed session before committing to that fate.
+    // Skipped on the stream path (already transcribed) and in local mode.
+    if (!streamText && transcriptionMode !== 'local' && proxyBase) {
+      const token = await ensureAuthToken()
+      if (!token) {
+        log.warn('[recording] no auth token after wait — dictation cannot be transcribed')
+      }
+      if (mySession !== sessionId) {
+        log.info('[recording] abandoned during auth wait — session invalidated')
+        return
+      }
+    }
 
     let rawText: string | null = null
     let serverFormatted: string | undefined
