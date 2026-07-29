@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Speakflow — microphone DSP A/B</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 28px 32px; font: 15px/1.55 system-ui, -apple-system, Segoe UI, sans-serif;
+    background: #0b1220; color: #e8eef8;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #8ea3c0; font-size: 13px; margin-bottom: 20px; }
+  .card { background: #121c2e; border: 1px solid #22314b; border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: #8ea3c0; margin: 0 0 10px; }
+  #script { font-size: 19px; line-height: 1.75; }
+  #script b { color: #ffd479; font-weight: 600; }
+  .row { display: flex; gap: 14px; align-items: center; }
+  .meter { flex: 1; }
+  .meter .label { font-size: 12px; color: #8ea3c0; display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .bar { height: 10px; background: #1d2942; border-radius: 5px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0%; transition: width .05s linear; }
+  #rawBar > div { background: #4ade80; }
+  #dspBar > div { background: #60a5fa; }
+  button {
+    font: 600 15px system-ui; padding: 12px 26px; border-radius: 10px; border: 0;
+    background: #2563eb; color: white; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.rec { background: #dc2626; }
+  #verdict { font-size: 14px; padding: 12px 14px; border-radius: 8px; margin-top: 12px; display: none; }
+  .ok { background: #052e1a; border: 1px solid #14532d; color: #86efac; }
+  .bad { background: #331111; border: 1px solid #7f1d1d; color: #fca5a5; }
+  #takes { font-size: 13px; color: #8ea3c0; margin-top: 12px; white-space: pre-line; }
+  code { background: #1d2942; padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Microphone DSP — paired A/B</h1>
+<div class="sub">Records the same speech twice at once: once raw, once through Chromium's voice-call processing.</div>
+
+<div class="card">
+  <h2>Step 1 — feasibility check</h2>
+  <button id="init">Open both microphone streams</button>
+  <div id="verdict"></div>
+  <div class="row" style="margin-top:14px">
+    <div class="meter"><div class="label"><span>RAW (no processing)</span><span id="rawVal">—</span></div><div class="bar" id="rawBar"><div></div></div></div>
+    <div class="meter"><div class="label"><span>DSP (processing on)</span><span id="dspVal">—</span></div><div class="bar" id="dspBar"><div></div></div></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Step 2 — read this aloud, normally, 3 times</h2>
+  <div id="script">
+    <b>Thys</b>, please confirm the <b>Electrofile</b> installation for <b>Klerksdorp</b> is booked for the twenty-fourth at zero eight thirty.
+    The revised quote is fourteen thousand five hundred rand, and the extra access point adds one thousand two hundred rand.
+    I have pushed the <b>Supabase</b> migration and the <b>Deepgram</b> streaming key to <b>Vercel</b> already.
+    <b>Sarah</b> from <b>Potchefstroom</b> asked whether we can bring the deadline forward to Friday afternoon.
+    Honestly, I think we should, because the team is available and the weather looks clear.
+    Please let me know before close of business today so that we can book the technicians and order the remaining hardware without paying the rush fee.
+  </div>
+</div>
+
+<div class="card">
+  <h2>Step 3 — record</h2>
+  <button id="rec" disabled>Start take 1</button>
+  <div id="takes"></div>
+</div>
+
+<script>
+const CONSTRAINTS_RAW = { echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+const CONSTRAINTS_DSP = { echoCancellation: true,  noiseSuppression: true,  autoGainControl: true  };
+
+let rawStream = null, dspStream = null;
+let recorders = null, take = 0, recording = false;
+const chunks = { raw: [], dsp: [] };
+const peaks = { raw: 0, dsp: 0 };
+
+const $ = (id) => document.getElementById(id);
+
+function meter(stream, which) {
+  const ctx = new AudioContext();
+  const src = ctx.createMediaStreamSource(stream);
+  const an = ctx.createAnalyser();
+  an.fftSize = 1024;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
+  (function tick() {
+    an.getFloatTimeDomainData(buf);
+    let sum = 0;
+    for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    const rms = Math.sqrt(sum / buf.length);
+    if (recording && rms > peaks[which]) peaks[which] = rms;
+    const pct = Math.min(100, rms * 400);
+    $(which + 'Bar').firstElementChild.style.width = pct + '%';
+    $(which + 'Val').textContent = rms.toFixed(4);
+    requestAnimationFrame(tick);
+  })();
+}
+
+$('init').onclick = async () => {
+  try {
+    rawStream = await navigator.mediaDevices.getUserMedia({ audio: { ...CONSTRAINTS_RAW, channelCount: 1 } });
+    dspStream = await navigator.mediaDevices.getUserMedia({ audio: { ...CONSTRAINTS_DSP, channelCount: 1 } });
+  } catch (e) {
+    const v = $('verdict');
+    v.style.display = 'block'; v.className = 'bad';
+    v.textContent = 'Could not open the microphone: ' + e.message;
+    return;
+  }
+
+  // The decisive check: Chromium reports what it ACTUALLY applied per track.
+  const rawS = rawStream.getAudioTracks()[0].getSettings();
+  const dspS = dspStream.getAudioTracks()[0].getSettings();
+  const differs =
+    rawS.echoCancellation !== dspS.echoCancellation ||
+    rawS.noiseSuppression !== dspS.noiseSuppression ||
+    rawS.autoGainControl !== dspS.autoGainControl;
+
+  const v = $('verdict');
+  v.style.display = 'block';
+  if (differs) {
+    v.className = 'ok';
+    v.textContent =
+      'PAIRED CAPTURE WORKS — the two streams really do differ.\n' +
+      `RAW: ec=${rawS.echoCancellation} ns=${rawS.noiseSuppression} agc=${rawS.autoGainControl}\n` +
+      `DSP: ec=${dspS.echoCancellation} ns=${dspS.noiseSuppression} agc=${dspS.autoGainControl}`;
+    v.style.whiteSpace = 'pre-line';
+    $('rec').disabled = false;
+  } else {
+    v.className = 'bad';
+    v.textContent =
+      'COLLAPSED — Chromium applied identical processing to both streams, so a paired test is impossible here. ' +
+      'Fall back to Design B (alternate the setting between takes). ' +
+      `Both report ec=${rawS.echoCancellation} ns=${rawS.noiseSuppression} agc=${rawS.autoGainControl}`;
+  }
+
+  meter(rawStream, 'raw');
+  meter(dspStream, 'dsp');
+  $('init').disabled = true;
+};
+
+$('rec').onclick = async () => {
+  if (!recording) {
+    take++;
+    chunks.raw = []; chunks.dsp = [];
+    peaks.raw = 0; peaks.dsp = 0;
+    recorders = {
+      raw: new MediaRecorder(rawStream, { mimeType: 'audio/webm;codecs=opus' }),
+      dsp: new MediaRecorder(dspStream, { mimeType: 'audio/webm;codecs=opus' }),
+    };
+    recorders.raw.ondataavailable = (e) => e.data.size && chunks.raw.push(e.data);
+    recorders.dsp.ondataavailable = (e) => e.data.size && chunks.dsp.push(e.data);
+    // Start both in the same tick so their timelines line up.
+    recorders.raw.start(); recorders.dsp.start();
+    recording = true;
+    $('rec').textContent = 'Stop take ' + take;
+    $('rec').className = 'rec';
+    return;
+  }
+
+  recording = false;
+  $('rec').disabled = true;
+  $('rec').textContent = 'Saving…';
+  $('rec').className = '';
+
+  const stopped = (r, key) => new Promise((res) => {
+    r.onstop = async () => {
+      const blob = new Blob(chunks[key], { type: 'audio/webm' });
+      res(await blob.arrayBuffer());
+    };
+    r.stop();
+  });
+  const [rawBuf, dspBuf] = await Promise.all([
+    stopped(recorders.raw, 'raw'),
+    stopped(recorders.dsp, 'dsp'),
+  ]);
+  await window.harness.saveTake(take, 'raw', rawBuf);
+  await window.harness.saveTake(take, 'dsp', dspBuf);
+
+  const drift = Math.abs(peaks.raw - peaks.dsp) / Math.max(peaks.raw, peaks.dsp, 1e-9);
+  $('takes').textContent +=
+    `Take ${take} saved — raw ${(rawBuf.byteLength / 1024).toFixed(0)} KB (peak ${peaks.raw.toFixed(4)}), ` +
+    `dsp ${(dspBuf.byteLength / 1024).toFixed(0)} KB (peak ${peaks.dsp.toFixed(4)}), ` +
+    `peak difference ${(drift * 100).toFixed(1)}%\n`;
+
+  $('rec').disabled = false;
+  $('rec').textContent = take >= 3 ? `Start take ${take + 1} (3 is enough)` : `Start take ${take + 1}`;
+};
+</script>
+</body>
+</html>
