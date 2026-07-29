@@ -1,6 +1,6 @@
 {
   "name": "speakflow-desktop",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Speakflow — voice-to-text desktop app powered by Groq Whisper",
   "main": "dist/main/main.js",
   "author": {

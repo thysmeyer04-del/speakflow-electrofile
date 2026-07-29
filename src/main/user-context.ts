@@ -13,7 +13,6 @@
 
 import log from 'electron-log/main'
 import { getAuthToken } from './ipc'
-import { clientForUser, hasSupabaseConfig, ensureSupabaseConfig } from './supabase'
 import { getProxyBaseUrl } from './transcribe'
 import { COMMON_WORDS } from './common-words'
 
@@ -93,56 +92,64 @@ export function clearUserContext(): void {
  *  a token. Never throws — callers fire-and-forget. */
 export async function refreshUserContext(): Promise<void> {
   if (refreshInFlight) return
-  // Packaged builds ship no Supabase credentials (dotenv only ever finds a
-  // developer's .env), so fetch the public client config before giving up —
-  // without this the dictionary silently never loaded in ANY release.
-  if (!hasSupabaseConfig()) await ensureSupabaseConfig(getProxyBaseUrl())
-  const client = clientForUser()
-  if (!client) return // not signed in (or no Supabase creds) — keep quiet
+  const token = getAuthToken()
+  if (!token) return // signed out — keep quiet
+
+  // Fetched over HTTP rather than straight from Supabase. The direct-query
+  // version needed SUPABASE_URL + anon key inside the packaged app, and they
+  // were never there: dotenv only resolves a developer's local .env, and
+  // `.env*` is gitignored and absent from electron-builder's `files:` list.
+  // So clientForUser() returned null on every tick and this cache stayed
+  // EMPTY in every shipped build — no dictionary, no snippets, no
+  // pronunciation aliases, therefore no Whisper prompt biasing and no
+  // Deepgram keyterms. Diagnosed 2026-07-29 from a 5.5-hour log containing
+  // zero [user-context] lines while "Supabase" kept transcribing as
+  // "supervise". Going through the proxy also means the desktop holds no
+  // database credentials at all.
+  const base = getProxyBaseUrl()
+  if (!base) return // dev without a proxy — nothing to fetch from
+
   refreshInFlight = true
   try {
-    const [wordsRes, snippetsRes, pronRes] = await Promise.all([
-      client
-        .from('dictionary_words')
-        .select('word')
-        .order('created_at', { ascending: false })
-        .limit(MAX_DICTIONARY_WORDS),
-      client.from('snippets').select('trigger_phrase, expansion'),
-      client
-        .from('pronunciations')
-        .select('spelling, aliases')
-        .order('created_at', { ascending: false })
-        .limit(MAX_PRONUNCIATIONS),
-    ])
-
-    if (wordsRes.error) {
-      log.warn('[user-context] dictionary fetch failed:', wordsRes.error.message)
-    } else {
-      dictionaryWords = (wordsRes.data ?? [])
-        .map((r) => (typeof r.word === 'string' ? r.word.trim() : ''))
-        .filter(Boolean)
+    const res = await fetch(base.replace(/\/+$/, '') + '/user-context', {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!res.ok) {
+      log.warn(`[user-context] fetch failed: ${res.status}`)
+      return
+    }
+    const data = (await res.json()) as {
+      dictionary?: unknown
+      snippets?: unknown
+      pronunciations?: unknown
     }
 
-    if (snippetsRes.error) {
-      log.warn('[user-context] snippets fetch failed:', snippetsRes.error.message)
-    } else {
-      snippets = (snippetsRes.data ?? [])
-        .map((r) => ({
-          trigger: typeof r.trigger_phrase === 'string' ? r.trigger_phrase.trim() : '',
-          expansion: typeof r.expansion === 'string' ? r.expansion : '',
+    if (Array.isArray(data.dictionary)) {
+      dictionaryWords = data.dictionary
+        .filter((w): w is string => typeof w === 'string')
+        .map((w) => w.trim())
+        .filter(Boolean)
+        .slice(0, MAX_DICTIONARY_WORDS)
+    }
+
+    if (Array.isArray(data.snippets)) {
+      snippets = data.snippets
+        .filter((s): s is Snippet => !!s && typeof s === 'object')
+        .map((s) => ({
+          trigger: typeof s.trigger === 'string' ? s.trigger.trim() : '',
+          expansion: typeof s.expansion === 'string' ? s.expansion : '',
         }))
         .filter((s) => s.trigger && s.expansion)
     }
 
-    if (pronRes.error) {
-      // Table may not exist yet on older DBs — quietly keep the empty cache.
-      log.warn('[user-context] pronunciations fetch failed:', pronRes.error.message)
-    } else {
-      pronunciations = (pronRes.data ?? [])
-        .map((r) => ({
-          spelling: typeof r.spelling === 'string' ? r.spelling.trim() : '',
-          aliases: Array.isArray(r.aliases)
-            ? r.aliases
+    if (Array.isArray(data.pronunciations)) {
+      pronunciations = data.pronunciations
+        .filter((p): p is Pronunciation => !!p && typeof p === 'object')
+        .map((p) => ({
+          spelling: typeof p.spelling === 'string' ? p.spelling.trim() : '',
+          aliases: Array.isArray(p.aliases)
+            ? p.aliases
                 .filter((a): a is string => typeof a === 'string')
                 .map((a) => a.trim())
                 .filter(Boolean)
@@ -150,6 +157,7 @@ export async function refreshUserContext(): Promise<void> {
             : [],
         }))
         .filter((p) => p.spelling)
+        .slice(0, MAX_PRONUNCIATIONS)
       rebuildAliasMatchers()
     }
 
