@@ -22,5 +22,7 @@
     "types": ["node"]
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "dist-electron"]
+  // Tests are compiled separately (tsconfig.test.json → dist-test) so no test
+  // code can reach dist/, which is what electron-builder packages.
+  "exclude": ["node_modules", "dist", "dist-electron", "dist-test", "src/**/*.test.ts"]
 }
