@@ -60,10 +60,14 @@ export function getPronunciationSpellings(): string[] {
  *  explicitly trained these — they must never age out of the budget as the
  *  dictionary grows), then most recent dictionary words. ≤25 words/200 chars.
  *  Empty string when there is nothing (caller falls back to ' '). */
-export function getWhisperPrompt(): string {
+export function buildWhisperPrompt(
+  dictionary: readonly string[],
+  pronunciationData: readonly Pronunciation[],
+): string {
   const seen = new Set<string>()
   const terms: string[] = []
-  for (const word of [...getPronunciationSpellings(), ...dictionaryWords]) {
+  const pronunciationSpellings = pronunciationData.map((entry) => entry.spelling)
+  for (const word of [...pronunciationSpellings, ...dictionary]) {
     const key = word.toLowerCase()
     if (seen.has(key)) continue
     seen.add(key)
@@ -78,6 +82,11 @@ export function getWhisperPrompt(): string {
     prompt = next
   }
   return prompt
+}
+
+/** Build the provider prompt from the current production cache. */
+export function getWhisperPrompt(): string {
+  return buildWhisperPrompt(dictionaryWords, pronunciations)
 }
 
 /** Clear caches (sign-out) so one user's words never leak into another's session. */

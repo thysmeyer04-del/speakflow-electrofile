@@ -139,13 +139,15 @@ export async function dictateViaProxy(
   if (opts.windowTitle) {
     form.append('windowTitle', opts.windowTitle.slice(0, MAX_WINDOW_TITLE_CHARS))
   }
-  const dictionary = buildDictionaryField(opts.dictionary)
+  const dictionary = buildDictateDictionaryField(opts.dictionary)
   if (dictionary) form.append('dictionary', dictionary)
   // Client-measured speech seconds → server-side blocklist gating: with
   // speechMs ≥ 1500 the server trusts the clip and skips its silence-artifact
-  // blocklist. Omitted when the level monitor produced no reading (null) —
+  // blocklist. Omitted when the level monitor produced no usable reading —
   // absence tells the server to keep the blocklist active, the safe default.
-  if (opts.speechMs !== null) {
+  // Finiteness is checked, not just null: an undefined or NaN reading used to
+  // be sent as the literal string "NaN", which the server cannot interpret.
+  if (typeof opts.speechMs === 'number' && Number.isFinite(opts.speechMs)) {
     form.append('speechMs', String(Math.round(opts.speechMs)))
   }
   // formatModel is normally OMITTED — the server default (8b-instant) is the
@@ -241,10 +243,11 @@ export async function dictateViaProxy(
  *  300 chars WITHOUT cutting a word in half. Note the prompt field and this
  *  field draw from the SAME user dictionary (via the caller passing
  *  getDictionaryWords()) but have different budgets and different safety
- *  gates — the prompt biases Whisper decoding (dangerous on silent clips,
- *  hence the speech gate), the dictionary feeds the server's formatter
- *  (spelling correction only, safe to always send). */
-function buildDictionaryField(words: string[]): string {
+ *  gates — the prompt biases Whisper decoding (dangerous on a silent clip,
+ *  hence the presence-of-speech gate), the dictionary feeds the server's
+ *  formatter (spelling correction only, safe to always send).
+ *  Exported for the provider-payload size tests. */
+export function buildDictateDictionaryField(words: string[]): string {
   let out = ''
   for (const word of words.slice(0, MAX_DICTIONARY_WORDS)) {
     const trimmed = word.trim()

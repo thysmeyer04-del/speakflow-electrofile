@@ -1,0 +1,11 @@
+{
+  // Same compiler settings as the app build, but it DOES include *.test.ts and
+  // emits to dist-test/. Keeping the output separate means the shipped dist/
+  // tree (what electron-builder packages) never contains test code.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-test"
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "dist-electron", "dist-test"]
+}

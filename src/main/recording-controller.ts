@@ -32,7 +32,7 @@ import { abortInFlightTransform } from './transform-controller'
 import {
   formatTranscript,
   shouldFormat,
-  sanityCheck,
+  decideFormattedText,
   stripFillerWords,
   abortInFlightFormat,
   detectContextCategory,
@@ -881,17 +881,21 @@ async function processAudio(
       }
 
       if (!command && serverFormatted) {
-        // Dictate path, server formatted: reuse the SAME sanity gate as the
-        // local formatter — a server-side LLM can answer-instead-of-reformat
-        // just as easily as a local call. collapseRepetitions deliberately
-        // ran on raw only; if Whisper loop-hallucinated, the un-collapsed
-        // formatted text fails the length-ratio check here and we fall back
-        // to the collapsed raw. Fail-open to rawTrimmed, never re-format.
-        if (sanityCheck(rawTrimmed, serverFormatted)) {
-          trimmed = serverFormatted
-        } else {
-          log.warn('[format] server-formatted text failed sanity check — using raw transcript')
-        }
+        // Dictate path, server formatted: the SAME shared decision helper as
+        // the local formatter below — a server-side LLM can answer-instead-of-
+        // reformat just as easily as a local call, and a changed invoice
+        // number or a dropped "not" must fall back to raw on either route.
+        // collapseRepetitions deliberately ran on raw only; if Whisper
+        // loop-hallucinated, the un-collapsed formatted text fails the
+        // length-ratio check inside and we fall back to the collapsed raw.
+        // Fail-open to rawTrimmed, never re-format.
+        const decision = decideFormattedText(
+          'server-formatted',
+          rawTrimmed,
+          serverFormatted,
+          getDictionaryWords(),
+        )
+        trimmed = decision.text
       } else if (
         !command &&
         path !== 'dictate' &&
@@ -916,11 +920,16 @@ async function processAudio(
             log.info('[recording] format result discarded — session invalidated')
             return
           }
-          if (sanityCheck(rawTrimmed, formatted)) {
-            trimmed = formatted
-          } else {
-            log.warn('[format] sanity check failed, using raw transcript')
-          }
+          // Same shared decision helper as the server-formatted route above:
+          // statistical sanity gate, then the deterministic preservation
+          // guard (numbers, emails, URLs, negations, dictionary terms).
+          const decision = decideFormattedText(
+            'local-format',
+            rawTrimmed,
+            formatted,
+            getDictionaryWords(),
+          )
+          trimmed = decision.text
         } catch (err) {
           formatMs = Date.now() - tFormat
           log.warn('[format] failed, falling back to raw', err)

@@ -91,17 +91,50 @@ interface TranscribeOptions {
 }
 
 // ── Whisper prompt safety (hallucination guard, shared with dictate.ts) ────
-// The personal-dictionary prompt biases Whisper toward the user's spellings —
-// great on real dictations, ACTIVELY HARMFUL on marginal clips: on near-
-// silent audio Whisper will happily "transcribe" the prompt words themselves.
-// Only bias when the clip demonstrably contains sustained speech; otherwise
-// fall back to the single-space prompt (non-empty, which suppresses the
-// classic "Thanks for watching." silence hallucinations, but content-free).
-export const DICTIONARY_PROMPT_MIN_SPEECH_MS = 1_500
+// The personal-dictionary prompt biases Whisper toward the user's spellings.
+// On genuinely SILENT audio Whisper will happily "transcribe" the prompt words
+// themselves, so the bias has to be withheld there.
+//
+// The gate used to be duration-based (≥1,500 ms of measured speech). That was
+// wrong: short utterances are exactly where the dictionary matters most — a
+// two-word "call NiaLabs" is 600 ms and gets no bias at all, so the trained
+// spelling never lands. Duration alone was never evidence of silence.
+//
+// The gate is now presence-of-speech, not length-of-speech: the personal
+// context goes out only once the recorder's level monitor has ESTABLISHED that
+// the clip contains speech. Any positive reading does that, however short — a
+// two-word "call NiaLabs" at 600 ms is exactly where the trained spelling
+// matters most.
+//
+// Fail-CLOSED on a missing measurement (corrected 2026-08-04). The old code
+// treated null/undefined/NaN as "no evidence of silence, so bias on", which
+// inverted the guard: the case where the monitor produced nothing is precisely
+// the case where we cannot tell speech from a silent room, and Whisper
+// transcribes the prompt words themselves on silent audio. So an absent,
+// broken or non-finite reading now gets the same content-free single space as
+// a measured-silent clip. Prompt size stays bounded by user-context (≤25
+// terms / ≤200 chars).
+export const DICTIONARY_PROMPT_MIN_SPEECH_MS = 1
 
-export function whisperPromptForClip(speechMs: number | null | undefined): string {
-  const allowDictionary = speechMs == null || speechMs >= DICTIONARY_PROMPT_MIN_SPEECH_MS
-  return (allowDictionary ? getWhisperPrompt() : '') || ' '
+/** True only when the level monitor returned a usable, positive speech
+ *  measurement. Anything else — 0, negative, NaN, ±Infinity, null, undefined,
+ *  or a non-number that slipped past the types — is "unavailable". */
+export function hasMeasuredSpeech(speechMs: unknown): speechMs is number {
+  return (
+    typeof speechMs === 'number' &&
+    Number.isFinite(speechMs) &&
+    speechMs >= DICTIONARY_PROMPT_MIN_SPEECH_MS
+  )
+}
+
+export function whisperPromptForClip(
+  speechMs: number | null | undefined,
+  promptOverride?: string,
+): string {
+  // No established speech (or no personal context at all) falls back to the
+  // single space: non-empty, so it still suppresses the classic "Thanks for
+  // watching." silence hallucination, but content-free.
+  return (hasMeasuredSpeech(speechMs) ? (promptOverride ?? getWhisperPrompt()) : '') || ' '
 }
 
 export async function transcribeAudio(
@@ -229,8 +262,9 @@ async function transcribeViaGroq(
   // A non-empty prompt suppresses Whisper's "Thank you." / "Thanks for watching."
   // hallucinations that occur when it receives silent or low-energy audio.
   // When the user has a personal dictionary, their words become the prompt —
-  // this biases Whisper toward their spellings (names, jargon, brands) — but
-  // ONLY on clips with enough measured speech (see whisperPromptForClip).
+  // this biases Whisper toward their spellings (names, jargon, brands) on
+  // every clip that contains measured speech, short ones included
+  // (see whisperPromptForClip).
   form.append('prompt', whisperPromptForClip(opts.speechMs))
   if (opts.language) form.append('language', opts.language)
 
@@ -315,9 +349,9 @@ async function transcribeViaProxy(
   const form = buildAudioForm(buffer, 'audio.webm')
   if (opts.language) form.append('language', opts.language)
   // Personal-dictionary spelling bias — the proxy forwards the prompt field
-  // to Whisper. Always sent: on short/low-speech clips whisperPromptForClip
-  // forces the single-space prompt instead of the dictionary (hallucination
-  // guard), which is still better than no prompt at all.
+  // to Whisper. Always sent: on a clip the level monitor scored as silent
+  // whisperPromptForClip forces the single-space prompt instead of the
+  // dictionary (hallucination guard), which is still better than no prompt.
   form.append('prompt', whisperPromptForClip(opts.speechMs))
   // Keyterm bias for the Deepgram proxy branch (v0.7.0, en-only server-side).
   // Old servers ignore the unknown field.
