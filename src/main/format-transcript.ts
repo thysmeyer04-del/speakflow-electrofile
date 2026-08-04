@@ -155,8 +155,15 @@ const CORRECTION_HINT = new RegExp(`\\b(?:${RETRACTION_PHRASES.join('|')})\\b`, 
 const SPOKEN_COMMAND_RE =
   /\b(bullet points?|next bullet|new paragraph|new line|line break|numbered list|full stop|question mark|exclamation (?:mark|point)|em dash|period|comma|semicolon|colon|step (?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)|number (?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)|point (?:one|two|three|four|five|\d+)|first(?:ly)?|second(?:ly)?|third(?:ly)?|fourth(?:ly)?|fifth(?:ly)?|lastly|finally)\b/gi
 
-/** Reject hallucinated rewrites that drop/add content or change vocabulary. */
-export function sanityCheck(raw: string, formatted: string): boolean {
+/** Reject hallucinated rewrites that drop/add content or change vocabulary.
+ *  `dictionaryWords` is only used to keep the retraction span identical to the
+ *  one the deterministic guard uses — a dictionary term the speaker never took
+ *  back narrows the span, which can only tighten the floors below. */
+export function sanityCheck(
+  raw: string,
+  formatted: string,
+  dictionaryWords: string[] = [],
+): boolean {
   if (!formatted) return false
   const corrective = CORRECTION_HINT.test(raw)
   // ≥2 list lines in the output = a list conversion, which also drops intro
@@ -180,7 +187,7 @@ export function sanityCheck(raw: string, formatted: string): boolean {
   // recognized phrase — so this is an accounting correction, not slack.
   // Non-corrective clips are byte-for-byte unaffected: retainedRaw ===
   // contentRaw whenever there is no retraction phrase.
-  const retainedRaw = (corrective ? stripRetractedSpans(raw) : raw).replace(
+  const retainedRaw = (corrective ? stripRetractedSpans(raw, dictionaryWords) : raw).replace(
     SPOKEN_COMMAND_RE,
     ' ',
   )
@@ -248,7 +255,29 @@ export type FormatGuardResult =
 // from ordinary speech with a slash in it, and anchoring also keeps this from
 // swallowing the email addresses matched by the rule above it.
 const PROTECTED_URL_RE = /(?:https?:\/\/|www\.)[^\s<>"'`]+/gi
-const PROTECTED_EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g
+// Local parts also carry the RFC 5321 "atext" specials — o'brien@, sales&support@
+// are ordinary addresses. They are accepted only BETWEEN two plain local-part
+// characters: an apostrophe or backtick the formatter wrapped around a whole
+// address ('alex@…') is sentence punctuation, not part of the mailbox, and must
+// stay outside the match. Without the internal run the class stopped at the
+// apostrophe and left the leading "o'" unprotected, so rewriting the address to
+// a different mailbox passed the guard.
+//
+// The internal run is `+`, not a single character: RFC 5322 puts no limit on
+// how many atext specials sit next to each other. Matching only one made the
+// extractor start at the TAIL of "foo!#$bar@example.test", so a rewrite to
+// exactly that tail ("bar@example.test") compared equal and passed.
+const EMAIL_LOCAL_PLAIN = String.raw`[A-Za-z0-9._%+-]`
+const EMAIL_LOCAL_INTERNAL = String.raw`['’&!#$*/=?^\`{|}~]`
+const EMAIL_LOCAL = `${EMAIL_LOCAL_PLAIN}+(?:${EMAIL_LOCAL_INTERNAL}+${EMAIL_LOCAL_PLAIN}+)*`
+const EMAIL_DOMAIN = String.raw`[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+`
+// One definition, two consumers: the protection extractor here and the
+// retraction walk-back's scalar test (correctedScalar). While they disagreed,
+// an address the walk-back could not see was an address a nearby numeric
+// "scratch that" silently widened its abandoned clause straight back over.
+const EMAIL_SOURCE = `${EMAIL_LOCAL}@${EMAIL_DOMAIN}`
+const PROTECTED_EMAIL_RE = new RegExp(EMAIL_SOURCE, 'g')
+const EMAIL_SCALAR_RE = new RegExp(`^${EMAIL_SOURCE}$`)
 // Digit runs with internal grouping/decimal separators: 48219, 48,219, 3.5,
 // 2026. A trailing sentence period is not captured (no digit follows it).
 const PROTECTED_NUMBER_RE = /\d+(?:[.,]\d+)*/g
@@ -324,9 +353,72 @@ type CorrectedScalar = 'number' | 'email' | 'url'
 function correctedScalar(token: Token): CorrectedScalar | null {
   const text = token.text.replace(/^[([{]+|[,.;:!?\])}]+$/g, '')
   if (/^\d+(?:[.,]\d+)*$/.test(text)) return 'number'
-  if (/^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(text)) return 'email'
+  if (EMAIL_SCALAR_RE.test(text)) return 'email'
   if (/^(?:https?:\/\/|www\.)\S+$/i.test(text)) return 'url'
   return null
+}
+
+/**
+ * Floor for the clause walk-back: a protected value the speaker never took
+ * back is a hard stop.
+ *
+ * The walk-back exists so "call alex at 2, scratch that, 3" abandons the whole
+ * "call alex at 2" clause. But it reaches back up to MAX_ABANDONED_WORDS
+ * tokens, and Whisper punctuates dictation, so the comma that triggers it is
+ * extremely common. That let "invoice 48219 is at location 7, scratch that, 8"
+ * swallow the invoice number the speaker never corrected.
+ *
+ * A retraction replaces ONE thing. Everything before the nearest earlier
+ * number, address, URL, negation or personal-dictionary term stays protected.
+ * The replaced item itself (`lastIndex`) is never clamped away.
+ *
+ * Negation is in that list because dropping a "not" inverts the sentence:
+ * unclamped, "we will not deliver 24, scratch that, 36 trays" licensed
+ * "Deliver 36 trays." A retraction that really does take a negation with it
+ * ("don't send it today, scratch that, send it today") is a parallel-clause
+ * correction and never reaches this scalar path.
+ */
+function protectedClauseFloor(
+  tokens: Token[],
+  first: number,
+  lastIndex: number,
+  rawText: string,
+  dictionaryWords: string[],
+): number {
+  // Character offset just past the last unrelated protected item, or -1.
+  let cut = -1
+  for (let index = lastIndex - 1; index >= first; index--) {
+    const token = tokens[index]
+    const bare = bareToken(token)
+    if (
+      correctedScalar(token) !== null ||
+      NEGATION_WORDS.has(bare) ||
+      /n['’]t$/.test(bare)
+    ) {
+      cut = token.end
+      break
+    }
+  }
+  // Dictionary terms can be multi-word, so they are matched against the raw
+  // text of the walk-back rather than token by token.
+  const windowStart = tokens[first].start
+  const window = rawText.slice(windowStart, tokens[lastIndex].start)
+  for (const word of dictionaryWords) {
+    const term = typeof word === 'string' ? word.trim() : ''
+    if (!term) continue
+    try {
+      for (const match of window.matchAll(dictionaryMatcher(term, true))) {
+        cut = Math.max(cut, windowStart + (match.index ?? 0) + match[0].length)
+      }
+    } catch {
+      continue // pathological term — never a reason to reject a dictation
+    }
+  }
+  if (cut < 0) return first
+  for (let index = first; index < lastIndex; index++) {
+    if (tokens[index].start >= cut) return index
+  }
+  return lastIndex
 }
 
 function clauseStart(tokens: Token[], lastIndex: number, rawText: string): number {
@@ -396,8 +488,17 @@ function parallelContinuationStart(before: Token[], after: Token[]): number | nu
  * Character ranges an explicit spoken retraction licenses the formatter to
  * delete. Pure and side-effect free. Exported for tests — the exact reach of
  * this licence is the whole safety argument, so it is asserted directly.
+ *
+ * `dictionaryWords` are personal-dictionary terms. They act as a floor on the
+ * clause walk-back exactly like numbers, addresses and negations do: a term the
+ * speaker never retracted stops the abandoned clause from reaching back over
+ * it. Optional, and defaulting to none, so every internal caller that has no
+ * dictionary in hand keeps the pre-existing behaviour.
  */
-export function retractedSpans(rawText: string): RetractedSpan[] {
+export function retractedSpans(
+  rawText: string,
+  dictionaryWords: string[] = [],
+): RetractedSpan[] {
   if (!rawText || !CORRECTION_HINT.test(rawText)) return []
   const tokens = tokenize(rawText)
   const spans: RetractedSpan[] = []
@@ -438,10 +539,12 @@ export function retractedSpans(rawText: string): RetractedSpan[] {
       after.length > 1 &&
       bareToken(tokens[idx]) === bareToken(after[1])
     if (priorScalar && priorScalar === replacementScalar && (priorScalarIndex === idx || repeatedUnit)) {
-      const start =
-        priorScalarIndex === idx && CLAUSE_END_RE.test(tokens[idx].text)
-          ? tokens[clauseStart(tokens, idx, rawText)].start
-          : tokens[priorScalarIndex].start
+      let start = tokens[priorScalarIndex].start
+      if (priorScalarIndex === idx && CLAUSE_END_RE.test(tokens[idx].text)) {
+        const clause = clauseStart(tokens, idx, rawText)
+        start =
+          tokens[protectedClauseFloor(tokens, clause, idx, rawText, dictionaryWords)].start
+      }
       spans.push({ start, end: phraseEnd })
       continue
     }
@@ -459,8 +562,8 @@ export function retractedSpans(rawText: string): RetractedSpan[] {
 /** Remove every retracted span outright. Used where LENGTH matters (the size
  *  ratios in sanityCheck), since blanking would leave the abandoned words
  *  counting toward the total. */
-function stripRetractedSpans(rawText: string): string {
-  const spans = retractedSpans(rawText)
+function stripRetractedSpans(rawText: string, dictionaryWords: string[] = []): string {
+  const spans = retractedSpans(rawText, dictionaryWords)
   if (spans.length === 0) return rawText
   let out = ''
   let cursor = 0
@@ -473,8 +576,8 @@ function stripRetractedSpans(rawText: string): string {
 
 /** Blank out every retracted span, preserving offsets and word boundaries, so
  *  the protection checks below run against only the speech the user stood by. */
-function maskRetractedSpans(rawText: string): string {
-  const spans = retractedSpans(rawText)
+function maskRetractedSpans(rawText: string, dictionaryWords: string[] = []): string {
+  const spans = retractedSpans(rawText, dictionaryWords)
   if (spans.length === 0) return rawText
   // split('') not [...text]: regex match indices are UTF-16 offsets, and a
   // code-point split would shift them on any emoji or astral character.
@@ -632,39 +735,84 @@ const LIST_NUMBER: Record<string, number> = {
 
 interface SpokenListLabel {
   value: number
+  /** Offsets of the whole spoken label ("step 2", "first", "one") in the raw. */
+  start: number
+  end: number
+  /** Offsets of a digit-spelled value — the only raw characters a licensed
+   *  conversion may delete. */
   digitStart?: number
   digitEnd?: number
 }
 
-function sequential(labels: SpokenListLabel[], minimum = 2): boolean {
-  return labels.length >= minimum && labels.every((label, index) => label.value === index + 1)
+/**
+ * The opening run of candidates that counts 1, 2, 3 … in spoken order.
+ *
+ * Parsing STOPS at the first candidate that does not continue the count; it is
+ * never skipped over. An out-of-order explicit label means the dictation is
+ * malformed, and re-reading "step one … step three … step two" as a tidy
+ * two-item list quietly discarded the stray "step three" and let the remaining
+ * labels map onto the generated counters.
+ *
+ * Cue families may treat everything after the stop as content, which lets a
+ * completed list carry a trailing noun phrase: "… number two check the stock
+ * and quote invoice number 48219" keeps 48219 protected. Ordinal and bare
+ * families have no cue phrase to preserve downstream, so they require every
+ * candidate to belong to the run; otherwise a broken count could license
+ * dropping the unselected suffix.
+ */
+function coherentLabelRun(
+  candidates: SpokenListLabel[],
+  minimum: number,
+  requireEveryCandidate = false,
+): SpokenListLabel[] {
+  const run: SpokenListLabel[] = []
+  for (const candidate of candidates) {
+    if (candidate.value !== run.length + 1) {
+      return requireEveryCandidate ? [] : run.length >= minimum ? run : []
+    }
+    run.push(candidate)
+  }
+  return run.length >= minimum ? run : []
+}
+
+const CUE_WORDS = ['step', 'number', 'point'] as const
+
+/** Every "<cue> <word-or-digit>" match in the raw, in spoken order — the full
+ * candidate pool a coherent family run is drawn from, before any candidate is
+ * discarded for breaking the count. */
+function cueLabelCandidates(raw: string, cue: string): SpokenListLabel[] {
+  const candidates: SpokenListLabel[] = []
+  const pattern = new RegExp(
+    `\\b${cue}\\s+(one|two|three|four|five|six|seven|eight|nine|ten|\\d+)\\b`,
+    'gi',
+  )
+  for (const match of raw.matchAll(pattern)) {
+    const spelling = match[1].toLowerCase()
+    const value = LIST_NUMBER[spelling] ?? Number(spelling)
+    const start = match.index ?? 0
+    const valueOffset = match[0].toLowerCase().lastIndexOf(spelling)
+    candidates.push({
+      value,
+      start,
+      end: start + match[0].length,
+      ...(/^\d+$/.test(spelling)
+        ? {
+            digitStart: start + valueOffset,
+            digitEnd: start + valueOffset + spelling.length,
+          }
+        : {}),
+    })
+  }
+  return candidates
 }
 
 /** Parse one coherent label family. Other "number N" phrases remain content;
  * they are neither counted as items nor masked as labels. */
 function spokenListLabels(raw: string): SpokenListLabel[] {
   const families: SpokenListLabel[][] = []
-  for (const cue of ['step', 'number', 'point']) {
-    const labels: SpokenListLabel[] = []
-    const pattern = new RegExp(
-      `\\b${cue}\\s+(one|two|three|four|five|six|seven|eight|nine|ten|\\d+)\\b`,
-      'gi',
-    )
-    for (const match of raw.matchAll(pattern)) {
-      const spelling = match[1].toLowerCase()
-      const value = LIST_NUMBER[spelling] ?? Number(spelling)
-      const valueOffset = match[0].toLowerCase().lastIndexOf(spelling)
-      labels.push({
-        value,
-        ...(/^\d+$/.test(spelling)
-          ? {
-              digitStart: (match.index ?? 0) + valueOffset,
-              digitEnd: (match.index ?? 0) + valueOffset + spelling.length,
-            }
-          : {}),
-      })
-    }
-    if (sequential(labels)) families.push(labels)
+  for (const cue of CUE_WORDS) {
+    const run = coherentLabelRun(cueLabelCandidates(raw, cue), 2)
+    if (run.length > 0) families.push(run)
   }
 
   const ordinalValues: Record<string, number> = {
@@ -684,21 +832,110 @@ function spokenListLabels(raw: string): SpokenListLabel[] {
     /\b(first(?:ly)?|second(?:ly)?|third(?:ly)?|fourth(?:ly)?|fifth(?:ly)?|lastly|finally)\b/gi,
   )) {
     const word = match[1].toLowerCase()
+    const start = match.index ?? 0
     ordinals.push({
       value: word === 'lastly' || word === 'finally' ? ordinals.length + 1 : ordinalValues[word],
+      start,
+      end: start + match[0].length,
     })
   }
-  if (sequential(ordinals)) families.push(ordinals)
+  const ordinalRun = coherentLabelRun(ordinals, 2, true)
+  if (ordinalRun.length > 0) families.push(ordinalRun)
 
   const bare: SpokenListLabel[] = []
   for (const match of raw.matchAll(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\b/gi)) {
-    const prefix = raw.slice(Math.max(0, (match.index ?? 0) - 8), match.index).toLowerCase()
+    const start = match.index ?? 0
+    const prefix = raw.slice(Math.max(0, start - 8), start).toLowerCase()
     if (/\b(?:step|number|point)\s+$/.test(prefix)) continue
-    bare.push({ value: LIST_NUMBER[match[1].toLowerCase()] })
+    bare.push({
+      value: LIST_NUMBER[match[1].toLowerCase()],
+      start,
+      end: start + match[0].length,
+    })
   }
-  if (sequential(bare, 3)) families.push(bare)
+  const bareRun = coherentLabelRun(bare, 3, true)
+  if (bareRun.length > 0) families.push(bareRun)
 
   return families.length === 1 ? families[0] : []
+}
+
+/** First few content words of a fragment, lowercased. */
+function leadingWords(text: string, limit: number): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).slice(0, limit)
+}
+
+/**
+ * Every generated counter must introduce the speech that actually followed its
+ * label. That one-to-one mapping is what separates a real conversion from a
+ * formatter that minted a line out of a content phrase — the reported
+ * "3. Number", produced from "send the invoice number 3", maps to no spoken
+ * item at all and must fail closed.
+ *
+ * A three-word lead-in window absorbs a dropped filler without licensing a
+ * shifted item boundary.
+ */
+function countersMapToLabels(
+  raw: string,
+  labels: SpokenListLabel[],
+  formatted: string,
+  counters: RegExpMatchArray[],
+): boolean {
+  return labels.every((label, index) => {
+    const spokenEnd = index + 1 < labels.length ? labels[index + 1].start : raw.length
+    const spoken = leadingWords(raw.slice(label.end, spokenEnd), 3)
+    const counter = counters[index]
+    const itemStart = (counter.index ?? 0) + counter[0].length
+    const itemEnd =
+      index + 1 < counters.length ? (counters[index + 1].index ?? 0) : formatted.length
+    const [item] = leadingWords(formatted.slice(itemStart, itemEnd), 1)
+    return spoken.length > 0 && item !== undefined && spoken.includes(item)
+  })
+}
+
+/** Lowercase, canonicalize numeric separators, and collapse every remaining run
+ *  of non-letter/non-number characters to a single space, so punctuation,
+ *  capitalization, and safe number grouping do not affect whether a raw
+ *  fragment survived. */
+function normalizeCueFragment(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\d+(?:[,.]\d+)*/g, normalizeNumber)
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim()
+}
+
+/**
+ * A word-spelled "step/number/point one" phrase that was NOT selected as a
+ * licensed label is content, not a counter. Its whole list-tail fragment — from
+ * that malformed cue through the speech before the next cue, or end of input —
+ * must still be readable in the formatted text. Preserving only "step four"
+ * would otherwise let the formatter discard the associated item body.
+ *
+ * Digit-valued unselected phrases need the same full-fragment protection. The
+ * exact number multiset can prove that their digit survived, but not that the
+ * associated item body did. Every candidate still delimits the preceding
+ * malformed fragment so one item's required tail cannot absorb the next cue.
+ */
+function unselectedCuePhrasesSurviveFormatting(
+  raw: string,
+  labels: SpokenListLabel[],
+  formatted: string,
+): boolean {
+  const selectedRanges = new Set(labels.map((label) => `${label.start}:${label.end}`))
+  const normalizedFormatted = normalizeCueFragment(formatted)
+  const candidates = [...raw.matchAll(
+    /\b(step|number|point)\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b/gi,
+  )]
+  for (let index = 0; index < candidates.length; index++) {
+    const match = candidates[index]
+    const start = match.index ?? 0
+    const end = start + match[0].length
+    if (selectedRanges.has(`${start}:${end}`)) continue
+    const nextStart = candidates[index + 1]?.index ?? raw.length
+    const requiredFragment = normalizeCueFragment(raw.slice(start, nextStart))
+    if (!requiredFragment || !normalizedFormatted.includes(requiredFragment)) return false
+  }
+  return true
 }
 
 /** Remove only counters created by a clearly licensed numbered-list
@@ -710,14 +947,22 @@ function maskLicensedListCounters(
   formatted: string,
 ): { raw: string; formatted: string; invalidCounters: boolean } {
   const outputCounters = [...formatted.matchAll(/^\s*(\d+)\.\s+/gm)]
+  if (outputCounters.length < 2) return { raw, formatted, invalidCounters: false }
+  const unlicensed = { raw, formatted, invalidCounters: true }
+  if (outputCounters.some((match, index) => Number(match[1]) !== index + 1)) return unlicensed
+
+  // EVERY spoken label in the run must have become a counter. Licensing just
+  // the first K let a formatter stop early: three spoken items, two numbered
+  // lines, and the third item's words gone. Cue labels ("step three") survive
+  // that by their digits or by the unselected-phrase check below, but ORDINAL
+  // ("third") and BARE ("three") labels carry neither, so nothing downstream
+  // noticed the loss. A count mismatch in either direction is not a licensed
+  // conversion — the raw keeps its numbers and the guard decides on those.
   const labels = spokenListLabels(raw)
-  if (
-    labels.length < 2 ||
-    outputCounters.length !== labels.length ||
-    outputCounters.some((match, index) => Number(match[1]) !== index + 1)
-  ) {
-    return { raw, formatted, invalidCounters: outputCounters.length >= 2 }
-  }
+  if (labels.length !== outputCounters.length) return unlicensed
+  if (!countersMapToLabels(raw, labels, formatted, outputCounters)) return unlicensed
+  if (!unselectedCuePhrasesSurviveFormatting(raw, labels, formatted)) return unlicensed
+
   const rawChars = raw.split('')
   for (const label of labels) {
     if (label.digitStart === undefined || label.digitEnd === undefined) continue
@@ -834,7 +1079,7 @@ export function validateFormattedTranscript(
   // Everything the speaker explicitly abandoned ("... at 2, scratch that, 3")
   // is blanked out first. Protected items inside that span are allowed to
   // disappear; every protected item OUTSIDE it is enforced exactly as before.
-  const enforcedRaw = maskRetractedSpans(rawText)
+  const enforcedRaw = maskRetractedSpans(rawText, dictionaryWords)
 
   const numberSources = maskLicensedListCounters(enforcedRaw, formattedText)
   if (numberSources.invalidCounters) {
@@ -956,8 +1201,15 @@ export function decideFormattedText(
   }
 
   if (!formattedText || !formattedText.trim()) return reject('formatted-empty')
-  // Statistical gate: did the model reformat, or did it answer/rewrite?
-  if (!sanityCheck(rawText, formattedText)) return reject('sanity-check-failed')
+  // Statistical gate: did the model reformat, or did it answer/rewrite? The
+  // dictionary goes to BOTH gates: it is what stops the retraction walk-back at
+  // a personal term the speaker never took back, and while only the
+  // deterministic guard received it the two gates measured different
+  // retractions — the statistical one assumed the wider clause, which shrank
+  // the retained text it compares against and quietly lowered its own floor.
+  if (!sanityCheck(rawText, formattedText, dictionaryWords)) {
+    return reject('sanity-check-failed')
+  }
   // Deterministic gate: did every protected item survive?
   const verdict = validateFormattedTranscript(rawText, formattedText, dictionaryWords)
   if (!verdict.accepted) return reject(verdict.reason)
