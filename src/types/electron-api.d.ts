@@ -60,6 +60,16 @@ declare global {
     onHotkeyState?: (cb: (state: { accelerator: string }) => void) => () => void
     onNavigateTo: (cb: (route: string) => void) => () => void
     onUpdateAvailable: (cb: (version: string) => void) => () => void
+    flowcast: {
+      status: () => Promise<{ state: string; elapsedMs: number; enabled: boolean }>
+      probe: () => Promise<{ ok: boolean; caps: unknown }>
+      start: () => Promise<{ ok: boolean; error?: string }>
+      stop: () => Promise<{ ok: boolean; shareUrl: string | null }>
+      discard: () => Promise<{ ok: boolean }>
+      onState: (cb: (payload: unknown) => void) => () => void
+      onDone: (cb: (shareUrl: string) => void) => () => void
+      onError: (cb: (message: string) => void) => () => void
+    }
 
     commands: {
       list: () => Promise<CommandsListResult>
@@ -94,11 +104,20 @@ declare global {
         | 'enableSmartFormatting'
         | 'stripDisfluencies'
         | 'asrShadowCompare'
+        | 'flowcastEnabled'
+        | 'flowcastCaptureMic'
+        | 'flowcastCaptureSystemAudio'
+        | 'flowcastCursor'
         | 'streamingTranscription',
       value: boolean,
     ) => Promise<{ ok: boolean; error?: string }>
     setChoiceSetting: (
-      key: 'transcriptionMode' | 'transcriptionProvider' | 'streamingEngine',
+      key:
+        | 'transcriptionMode'
+        | 'transcriptionProvider'
+        | 'streamingEngine'
+        | 'flowcastQuality'
+        | 'flowcastVisibility',
       value: string,
     ) => Promise<{ ok: boolean; error?: string }>
     getSettings: () => Promise<Record<string, unknown>>

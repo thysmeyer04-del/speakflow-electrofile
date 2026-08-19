@@ -1,0 +1,54 @@
+[package]
+name = "flowcast-recorder"
+version = "0.1.0"
+edition = "2021"
+description = "Flowcast screen recorder sidecar for Speakflow"
+publish = false
+
+# LICENCE NOTE — read before adding a dependency.
+#
+# Speakflow is closed source and sold commercially. Every crate here must be
+# MIT or Apache-2.0. Do NOT add anything GPL or AGPL.
+#
+# In particular: Cap (github.com/CapSoftware/Cap) is AGPLv3. Its `scap-*` and
+# `cap-camera-*` crates ARE MIT and could be used if we ever need lower-level
+# capture. But `cap-recording`, `cap-muxer` and `cap-enc-mediafoundation` carry
+# no licence field and therefore fall under the repo's AGPL default. Using them
+# would oblige us to publish Speakflow's source to anyone who opens a share
+# link. Do not.
+
+[dependencies]
+# MIT. Windows Graphics Capture + hardware H.264 encoding + MP4 output.
+windows-capture = "=2.0.1"
+
+# MIT/Apache-2.0. Used for the parent-process watchdog and disk-space checks.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
+
+# MIT. Microphone and system-audio (loopback) capture via WASAPI.
+wasapi = "0.23"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+# These were originally lto = "fat", codegen-units = 1, opt-level = "z" — chasing
+# the smallest possible binary. That combination could not compile: the `windows`
+# crate is enormous (it pulls in ~60 Windows API feature sets) and whole-program
+# optimisation over it exhausted memory and killed rustc outright.
+#
+# Thin LTO with 4 codegen units builds reliably on a normal machine and produces
+# a binary within a few hundred KB of the aggressive settings. Against a ~132 MB
+# installer, that difference is not worth a build that cannot run.
+lto = "thin"
+codegen-units = 4
+opt-level = 2
+strip = true
+# NOTE: deliberately NOT panic = "abort". We install a panic hook that finalises
+# the MP4 before dying, so a panic mid-recording still leaves a playable file.
+
+[build-dependencies]
+# Embeds flowcast.manifest (DPI awareness). Without it, capture on a scaled
+# display comes back blurry and the wrong size.

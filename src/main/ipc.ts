@@ -34,11 +34,13 @@ import {
 import { refreshUserContext, clearUserContext } from './user-context'
 import { clearAsrToken, flushStreamingUsageOutbox, prewarmAsrToken } from './asr-token'
 import { purgeOwnerOutbox } from './event-outbox'
+import type { FlowcastController } from './flowcast/controller'
 
 interface SetupArgs {
   mainWindow: BrowserWindow
   overlayWindow: BrowserWindow
   onRecordingStateChange?: (recording: boolean) => void
+  flowcast: FlowcastController
 }
 
 let cachedAuthToken: string | null = null
@@ -143,7 +145,12 @@ function gatedHandle<T, R>(
   })
 }
 
-export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: trayCallback }: SetupArgs): void {
+export function setupIPC({
+  mainWindow,
+  overlayWindow,
+  onRecordingStateChange: trayCallback,
+  flowcast,
+}: SetupArgs): void {
   ipcMain.removeHandler('security:get-nonce')
   ipcMain.handle('security:get-nonce', (event) => {
     const nonce = issueTrustedFrameNonce(event)
@@ -239,13 +246,17 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
         setSetting('transcriptionMode', validated.value)
       } else if (validated.key === 'transcriptionProvider') {
         setSetting('transcriptionProvider', validated.value)
-      } else {
+      } else if (validated.key === 'streamingEngine') {
         // True Streaming engine toggle — applies from the NEXT dictation
         // (doStart reads settings live); a recording in progress finishes on
         // whatever path it started with.
         setSetting('streamingEngine', validated.value)
         clearAsrToken()
         void prewarmAsrToken()
+      } else if (validated.key === 'flowcastQuality') {
+        setSetting('flowcastQuality', validated.value)
+      } else {
+        setSetting('flowcastVisibility', validated.value)
       }
       return { ok: true }
     },
@@ -266,6 +277,11 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       cachedAuthToken = (raw as string).trim()
       cachedTokenExpiresAt = result.expiresAt ?? 0
       cachedAuthOwner = result.subject ?? null
+      if (cachedAuthOwner && getSettings().flowcastEnabled) {
+        void flowcast
+          .recoverAbandonedSessions()
+          .catch((err) => log.warn('[flowcast] signed-in recovery failed', err))
+      }
       // The renderer writes the (possibly just-rotated) Supabase session to
       // localStorage immediately before pushing it here, so commit it to disk
       // now. Chromium flushes DOM storage lazily; without this a crash or
@@ -327,6 +343,7 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
     // leave a stale request continuing with the just-cleared token.
     // (This also aborts a live ASR socket via the controller's teardown.)
     abortInFlightRecording('auth-cleared')
+    void flowcast.stop().catch((err) => log.warn('[flowcast] stop on sign-out failed', err))
   })
 
   gatedOn('recording:start', () => {
@@ -334,6 +351,37 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
   })
   gatedOn('recording:stop', () => {
     stopRecording().catch((err) => log.error('stopRecording IPC failed', err))
+  })
+
+  gatedHandle('flowcast:get-status', () => ({
+    state: flowcast.getState(),
+    elapsedMs: flowcast.elapsedMs(),
+    enabled: getSettings().flowcastEnabled,
+  }))
+  gatedHandle('flowcast:probe', async () => {
+    const caps = await flowcast.checkCapabilities()
+    return { ok: Boolean(caps), caps }
+  })
+  gatedHandle('flowcast:start', async () => {
+    const settings = getSettings()
+    if (!settings.flowcastEnabled) return { ok: false, error: 'flowcast-disabled' }
+    try {
+      await flowcast.start({
+        captureMic: settings.flowcastCaptureMic,
+        captureSystemAudio: settings.flowcastCaptureSystemAudio,
+        quality: settings.flowcastQuality,
+        cursor: settings.flowcastCursor,
+        visibility: settings.flowcastVisibility,
+      })
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'flowcast-start-failed' }
+    }
+  })
+  gatedHandle('flowcast:stop', async () => ({ ok: true, shareUrl: await flowcast.stop() }))
+  gatedHandle('flowcast:discard', async () => {
+    await flowcast.stop(true)
+    return { ok: true }
   })
 
   gatedHandle<number, { ok: boolean; error?: string }>(

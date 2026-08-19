@@ -5,10 +5,14 @@ import log from 'electron-log/main'
 import { markQuitting } from './quit-state'
 import { toggleRecording } from './recording-controller'
 import { installPendingUpdate, checkForUpdatesNow, getPendingUpdateVersion } from './updater'
+import type { FlowcastController, FlowcastState } from './flowcast/controller'
+import { getSettings } from './settings'
 
 let tray: Tray | null = null
 // Rebuilding the context menu needs the window reference captured at setup.
 let rebuildMenu: (() => void) | null = null
+let dictationRecording = false
+let flowcastState: FlowcastState = 'idle'
 
 // Minimal 16x16 solid-colour PNG fallback if the real icon is missing.
 const FALLBACK_PNG_BASE64 =
@@ -27,7 +31,7 @@ function loadIcon(file: string): NativeImage {
   return image
 }
 
-export function setupTray(mainWindow: BrowserWindow): void {
+export function setupTray(mainWindow: BrowserWindow, flowcast: FlowcastController): void {
   // Idempotent: tear down any prior tray before installing a new one.
   if (tray && !tray.isDestroyed()) {
     tray.destroy()
@@ -51,6 +55,8 @@ export function setupTray(mainWindow: BrowserWindow): void {
   rebuildMenu = () => {
     if (!tray || tray.isDestroyed()) return
     const pending = getPendingUpdateVersion()
+    const flowcastEnabled = process.platform === 'win32' && getSettings().flowcastEnabled
+    const flowcastBusy = flowcastState !== 'idle'
 
     const menu = Menu.buildFromTemplate([
       ...(pending
@@ -67,6 +73,29 @@ export function setupTray(mainWindow: BrowserWindow): void {
       {
         label: 'Start / Stop Recording',
         click: () => { void toggleRecording() },
+      },
+      {
+        label: flowcastBusy ? 'Stop screen recording' : 'Start screen recording',
+        enabled: flowcastEnabled,
+        click: () => {
+          const settings = getSettings()
+          const operation = flowcastBusy
+            ? flowcast.stop()
+            : flowcast.start({
+                captureMic: settings.flowcastCaptureMic,
+                captureSystemAudio: settings.flowcastCaptureSystemAudio,
+                quality: settings.flowcastQuality,
+                cursor: settings.flowcastCursor,
+                visibility: settings.flowcastVisibility,
+              })
+          void operation.catch((error) => {
+            log.warn('[flowcast] tray operation failed', error)
+            dialog.showErrorBox(
+              'Screen recording',
+              error instanceof Error ? error.message : 'Screen recording failed.',
+            )
+          })
+        },
       },
       { type: 'separator' as const },
       {
@@ -120,14 +149,26 @@ export function setTrayUpdatePending(version: string | null): void {
 
 export function setTrayRecording(recording: boolean): void {
   if (!tray || tray.isDestroyed()) return
-  tray.setImage(loadIcon(recording ? 'tray-icon-recording.png' : 'tray-icon.png'))
-  if (recording) {
+  dictationRecording = recording
+  tray.setImage(loadIcon(recording || flowcastState !== 'idle' ? 'tray-icon-recording.png' : 'tray-icon.png'))
+  if (recording || flowcastState !== 'idle') {
     tray.setToolTip('Speakflow — Recording…')
     return
   }
   // Idle: keep advertising a waiting update rather than clobbering it.
   const pending = getPendingUpdateVersion()
   tray.setToolTip(pending ? `Speakflow — update ${pending} ready` : 'Speakflow')
+}
+
+export function setTrayFlowcastState(state: FlowcastState): void {
+  flowcastState = state
+  if (tray && !tray.isDestroyed()) {
+    tray.setImage(
+      loadIcon(dictationRecording || state !== 'idle' ? 'tray-icon-recording.png' : 'tray-icon.png'),
+    )
+    tray.setToolTip(state === 'idle' ? 'Speakflow' : 'Speakflow — Screen recording…')
+  }
+  rebuildMenu?.()
 }
 
 // Verify the bundled fallback at boot so missing-asset issues surface early.

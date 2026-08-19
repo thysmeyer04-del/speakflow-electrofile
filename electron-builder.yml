@@ -34,6 +34,8 @@ asarUnpack:
 extraResources:
   - from: assets/sounds
     to: sounds
+  - from: native/bin
+    to: flowcast
 
 mac:
   icon: assets/icon.icns
