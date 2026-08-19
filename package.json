@@ -1,7 +1,7 @@
 {
   "name": "speakflow-desktop",
-  "version": "0.7.5",
-  "description": "Speakflow — voice-to-text desktop app powered by Groq Whisper",
+  "version": "0.8.0",
+  "description": "Speakflow — voice-to-text desktop app powered by Deepgram Nova-3",
   "main": "dist/main/main.js",
   "author": {
     "name": "Speakflow",
@@ -10,7 +10,6 @@
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
-    "generate-icons": "electron-icon-builder --input=assets/icon.svg --output=assets --flatten",
     "clean": "rimraf dist dist-electron dist-test",
     "build:ts": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
@@ -29,25 +28,23 @@
     "dist": "npm run build && electron-builder"
   },
   "dependencies": {
-    "@nut-tree-fork/nut-js": "^4.2.0",
+    "@huggingface/transformers": "^4.2.0",
+    "@nut-tree-fork/nut-js": "^4.2.6",
     "@supabase/supabase-js": "^2.105.4",
     "@types/ws": "^8.18.1",
-    "@xenova/transformers": "^2.17.2",
     "dotenv": "^16.4.7",
     "electron-log": "^5.2.0",
     "electron-store": "^8.2.0",
-    "electron-updater": "^6.3.9",
+    "electron-updater": "^6.8.9",
     "ws": "^8.20.1"
   },
   "devDependencies": {
-    "@pinecone-database/pinecone": "^7.2.0",
     "@resvg/resvg-js": "^2.6.2",
     "@types/node": "^20.17.0",
     "concurrently": "^9.1.0",
     "cross-env": "^7.0.3",
-    "electron": "^32.3.3",
-    "electron-builder": "^25.1.8",
-    "electron-icon-builder": "^2.0.1",
+    "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
     "rimraf": "^6.0.1",
     "typescript": "^5.6.3",
     "wait-on": "^8.0.1"

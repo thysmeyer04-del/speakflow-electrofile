@@ -19,12 +19,13 @@ import {
   setPcmUnavailableHandler,
 } from './recorder'
 import { transcribeAudio, getProxyBaseUrl } from './transcribe'
-import { dictateViaProxy, isAuthOrQuotaError } from './dictate'
+import { dictateViaProxy } from './dictate'
 import { startAsrStream, AsrSession, AsrFinalizeResult } from './asr-stream'
 import { asrErrorCode, reportStreamingUsage } from './asr-token'
 import { isSilenceArtifact, ARTIFACT_MAX_SPEECH_MS } from './whisper-artifacts'
 import { syncToKnowledgeBase } from './supabase'
-import { getAuthToken, ensureAuthToken } from './ipc'
+import { getAuthToken, getAuthContext, ensureAuthToken, type AuthContext } from './ipc'
+import { getDeletionGeneration } from './event-outbox'
 import { injectText, captureFocusTarget, WindowSnapshot } from './inject'
 import { getSettings } from './settings'
 import { playSound } from './sound'
@@ -45,6 +46,7 @@ import {
   applyPronunciationAliases,
   getPronunciationSpellings,
 } from './user-context'
+import { isOriginTrusted } from './security'
 
 export type RecordingState =
   | 'idle'
@@ -70,6 +72,11 @@ let pendingCommandId: string | null = null
 // Wall-clock moment the recorder ACKed 'recording-started' — used to report
 // the actual audio duration (not processing time) in the completion payload.
 let recordingStartedAt = 0
+// Identity and deletion generation are captured at hotkey press. Every
+// downstream write remains bound to this owner even if auth rotates, the user
+// signs out, or a history purge races the in-flight recording.
+let recordingAuthContext: AuthContext | null = null
+let recordingGenerationPromise: Promise<number> = Promise.resolve(0)
 
 export function getPendingCommandId(): string | null {
   return pendingCommandId
@@ -284,6 +291,18 @@ function setState(next: RecordingState): void {
 }
 
 function broadcast(channel: string, payload?: unknown): void {
+  if (
+    channel === 'transcription-complete' &&
+    payload &&
+    typeof payload === 'object' &&
+    (payload as { protocolVersion?: unknown }).protocolVersion === 2
+  ) {
+    const trusted = BrowserWindow.getAllWindows().find(
+      (win) => !win.isDestroyed() && isOriginTrusted(win.webContents.getURL()),
+    )
+    if (trusted) trusted.webContents.mainFrame.send(channel, payload)
+    return
+  }
   BrowserWindow.getAllWindows().forEach((win) => {
     if (!win.isDestroyed()) win.webContents.send(channel, payload)
   })
@@ -304,6 +323,8 @@ onRecorderCrash((reason) => {
     broadcast('transcription-error', 'Recorder crashed — please try again.')
     broadcast('processing-complete')
     focusTarget = null
+    recordingAuthContext = null
+    recordingGenerationPromise = Promise.resolve(0)
     pendingCommandId = null
     setState('idle')
   })
@@ -381,6 +402,10 @@ async function doStart(forCommand = false): Promise<void> {
   // socket from an abnormal path must never receive a new session's audio.
   teardownAsrStream('superseded-by-new-start')
   const mySession = ++sessionId
+  recordingAuthContext = getAuthContext()
+  recordingGenerationPromise = recordingAuthContext
+    ? getDeletionGeneration(recordingAuthContext.ownerId)
+    : Promise.resolve(0)
   // A plain F11 dictation must never inherit a command from a previous
   // session; startCommandRecording re-arms this after doStart returns.
   pendingCommandId = null
@@ -449,6 +474,8 @@ async function doStart(forCommand = false): Promise<void> {
     teardownAsrStream('recorder-start-failed') // no recorder → no PCM → no stream
     broadcast('transcription-error', humanizeStartError(msg))
     focusTarget = null
+    recordingAuthContext = null
+    recordingGenerationPromise = Promise.resolve(0)
     setState('idle')
     return
   }
@@ -467,6 +494,8 @@ async function doStart(forCommand = false): Promise<void> {
 async function doStop(): Promise<void> {
   const t0 = Date.now()
   const mySession = sessionId
+  const authContext = recordingAuthContext
+  const deletionGeneration = await recordingGenerationPromise.catch(() => 0)
   // Audio duration = hotkey-to-hotkey, measured from the recorder's start
   // ACK. Captured here, before any network round-trips inflate the clock.
   const durationSeconds =
@@ -522,6 +551,8 @@ async function doStop(): Promise<void> {
     broadcast('transcription-error', 'Could not finalise the recording.')
     broadcast('processing-complete')
     focusTarget = null
+    recordingAuthContext = null
+    recordingGenerationPromise = Promise.resolve(0)
     setState('idle')
     return
   }
@@ -574,6 +605,8 @@ async function doStop(): Promise<void> {
   if (!audioBuffer || audioBuffer.byteLength === 0) {
     broadcast('processing-complete')
     focusTarget = null
+    recordingAuthContext = null
+    recordingGenerationPromise = Promise.resolve(0)
     setState('idle')
     return
   }
@@ -586,6 +619,8 @@ async function doStop(): Promise<void> {
     stopToBlobMs,
     streamText,
     streamMs,
+    authContext,
+    deletionGeneration,
   })
 }
 
@@ -631,6 +666,8 @@ interface StopStats {
   // How long doStop waited on the flush — becomes 'transcribe' in the summary
   // when the stream path wins.
   streamMs: number
+  authContext: AuthContext | null
+  deletionGeneration: number
 }
 
 async function processAudio(
@@ -682,8 +719,6 @@ async function processAudio(
 
     const transcriptionMode =
       process.env.SPEAKFLOW_TRANSCRIPTION_MODE || liveSettings.transcriptionMode
-    const provider =
-      process.env.SPEAKFLOW_TRANSCRIPTION_PROVIDER || liveSettings.transcriptionProvider
     const proxyBase = getProxyBaseUrl()
     if (transcriptionMode === 'local') path = 'local'
 
@@ -696,8 +731,7 @@ async function processAudio(
     //     worse than one extra round-trip;
     //   - dev builds without a proxy keep the direct-Groq legacy path;
     //   - command dictations keep transcribe→transformText untouched.
-    const useDictate =
-      transcriptionMode === 'cloud' && provider === 'groq' && !!proxyBase && !command
+    const useDictate = transcriptionMode === 'cloud' && !!proxyBase
 
     // True Streaming result from doStop's parallel finalize. Command guard is
     // belt + braces — doStart already refuses streaming for command sessions,
@@ -711,11 +745,21 @@ async function processAudio(
     // one — which used to destroy the whole recording ("Sign in via the
     // dashboard", 81 s of speech lost, 2026-07-29). Wait a beat for the
     // renderer to push the refreshed session before committing to that fate.
-    // Skipped on the stream path (already transcribed) and in local mode.
-    if (!streamText && transcriptionMode !== 'local' && proxyBase) {
-      const token = await ensureAuthToken()
-      if (!token) {
-        log.warn('[recording] no auth token after wait — dictation cannot be transcribed')
+    // The owner is captured at hotkey press. A refreshed JWT may replace the
+    // captured token only when it belongs to that same owner.
+    let operationAuth = stats.authContext
+    if (transcriptionMode !== 'local' && proxyBase) {
+      let current = getAuthContext()
+      if (!current && operationAuth) {
+        await ensureAuthToken()
+        current = getAuthContext()
+      }
+      if (current && operationAuth && current.ownerId === operationAuth.ownerId) {
+        operationAuth = current
+      }
+      if (!operationAuth) {
+        log.warn('[recording] no captured auth owner for this dictation')
+        throw new Error('Sign in via the dashboard to use Speakflow.')
       }
       if (mySession !== sessionId) {
         log.info('[recording] abandoned during auth wait — session invalidated')
@@ -725,6 +769,8 @@ async function processAudio(
 
     let rawText: string | null = null
     let serverFormatted: string | undefined
+    let usageEventId: string | null = null
+    let eventEngine = path === 'local' ? 'local-whisper' : 'deepgram-nova-3'
 
     if (streamText) {
       // Stream path: the transcript is already here — no upload, no proxy
@@ -742,8 +788,10 @@ async function processAudio(
       const tDictate = Date.now()
       try {
         const res = await dictateViaProxy(buffer, {
+          authToken: operationAuth?.token ?? '',
+          deletionGeneration: stats.deletionGeneration,
           language: lang,
-          format: liveSettings.enableSmartFormatting,
+          format: !command && liveSettings.enableSmartFormatting,
           stripDisfluencies: liveSettings.stripDisfluencies,
           appName: targetSnapshot?.processName ?? undefined,
           windowTitle: targetSnapshot?.title ?? undefined,
@@ -759,21 +807,16 @@ async function processAudio(
         transcribeMs += Math.max(0, rtt - serverFormatMs)
         formatMs = serverFormatMs > 0 ? serverFormatMs : null
         rawText = res.raw
+        usageEventId = res.usageEventId
+        eventEngine = `${res.provider}-${res.model}`
         if (!res.skipped) serverFormatted = res.formatted
       } catch (err) {
-        // 401/402 surface to the user exactly as the legacy proxy path would
-        // — a legacy retry would hit the same auth/quota wall and re-upload
-        // the audio for nothing.
-        if (isAuthOrQuotaError(err)) throw err
         const wasted = Date.now() - tDictate
         transcribeMs += wasted
-        // ANY other failure (offline, DNS, 404 while the server route is
-        // still deploying, 413, 5xx, 503, timeout) → transparent fallback to
-        // the proven legacy pipeline. The user notices nothing but latency.
-        log.warn(
-          `[dictate] failed after ${wasted}ms — falling back to legacy path: ${(err as Error).message}`,
-        )
-        path = 'legacy'
+        // v0.8 never retries via the unmetered legacy endpoint. The server
+        // owns ASR fallback and succeeds only after the one atomic charge.
+        log.warn(`[dictate] failed after ${wasted}ms: ${(err as Error).message}`)
+        throw err
       }
     }
 
@@ -788,6 +831,7 @@ async function processAudio(
         speechMs: stats.speechMs,
       })
       transcribeMs += Date.now() - tTranscribe
+      eventEngine = path === 'local' ? 'local-whisper' : 'legacy-cloud'
     }
 
     if (mySession !== sessionId) {
@@ -971,13 +1015,48 @@ async function processAudio(
         log.info('[recording] post-inject broadcast skipped — session invalidated')
         return
       }
-      broadcast('transcription-complete', {
-        text: trimmed,
-        durationSeconds: stats.durationSeconds,
-        appName: targetSnapshot?.processName ?? null,
-        windowTitle: targetSnapshot?.title ?? null,
-        source: 'dictation',
-      })
+      let persisted = false
+      let clientEventId = usageEventId
+      if (path !== 'dictate') {
+        if (!operationAuth) {
+          throw new Error('Sign in via the dashboard to save this dictation.')
+        }
+        const committed = await reportStreamingUsage({
+          ownerId: operationAuth.ownerId,
+          authToken: operationAuth.token,
+          text: trimmed,
+          audioSeconds: stats.durationSeconds,
+          durationSeconds: stats.durationSeconds,
+          engine: eventEngine,
+          source: path === 'local' ? 'local' : 'streaming',
+          appContext: targetSnapshot?.processName ?? null,
+          deletionGeneration: stats.deletionGeneration,
+        })
+        persisted = committed.persisted
+        usageEventId = committed.usageEventId
+        clientEventId = committed.clientEventId
+        if (!committed.persisted && !committed.queued) {
+          log.warn('[metering] event could not be committed or encrypted locally')
+        }
+      }
+
+      // Persisted local/stream events already have a history row. Admitted
+      // batch events carry the canonical usage id and let the compatibility
+      // writer insert their history row exactly once.
+      if (path === 'dictate' || persisted) {
+        broadcast('transcription-complete', {
+          protocolVersion: 2,
+          text: trimmed,
+          durationSeconds: stats.durationSeconds,
+          appName: targetSnapshot?.processName ?? null,
+          windowTitle: targetSnapshot?.title ?? null,
+          source: command ? 'transform' : 'dictation',
+          clientEventId,
+          usageEventId,
+          deletionGeneration: stats.deletionGeneration,
+          persisted,
+        })
+      }
       if (!injectResult.ok) {
         broadcast('transcription-error', humanizeInjectError(injectResult.error ?? ''))
       }
@@ -985,43 +1064,23 @@ async function processAudio(
       // Background sync to Supabase knowledge base (RAG index). Deferred to
       // setImmediate so the CPU-bound embedding step never delays paste —
       // by this point the user already saw their text appear.
-      const token = getAuthToken()
-      if (token) {
+      if (operationAuth) {
         setImmediate(() => {
-          try {
-            const payload = JSON.parse(
-              Buffer.from(token.split('.')[1], 'base64url').toString('utf8'),
-            )
-            const userId = payload.sub
-            if (userId) {
-              // word_count reflects spoken words (raw), not list-marker overhead.
-              syncToKnowledgeBase(trimmed, userId, {
-                window_title: targetSnapshot?.title ?? null,
-                app_name: targetSnapshot?.processName ?? null,
-                word_count: rawTrimmed.split(/\s+/).filter(Boolean).length,
-              }).catch((err) => log.error('[sync] knowledge-base sync failed', err))
-            }
-          } catch (e) {
-            log.warn('[sync] failed to decode token for sync', e)
-          }
+          syncToKnowledgeBase(trimmed, operationAuth.ownerId, {
+            window_title: targetSnapshot?.title ?? null,
+            app_name: targetSnapshot?.processName ?? null,
+            word_count: rawTrimmed.split(/\s+/).filter(Boolean).length,
+          }).catch((err) => log.error('[sync] knowledge-base sync failed', err))
         })
       }
 
       if (path === 'stream') {
-        // Usage accounting: /dictate meters words server-side as a side
-        // effect of the upload, but the stream path never uploads — self-
-        // report so weekly quotas keep counting streamed dictations.
-        // Fire-and-forget; a lost beacon never touches the user.
-        reportStreamingUsage({
-          audioSeconds: stats.durationSeconds,
-          words: rawTrimmed.split(/\s+/).filter(Boolean).length,
-        })
         // Shadow compare (rollout diagnostics): re-run the batch engine on
         // the same blob in the background and log a word-level diff ratio —
         // the data that decides whether streamingEngine can default on.
         // Runs strictly AFTER inject; never affects what the user got.
         if (liveSettings.asrShadowCompare && streamText) {
-          scheduleShadowCompare(buffer, streamText, lang, stats.speechMs)
+          log.info('[asr-shadow] skipped: admitted v0.8 requests are never duplicated')
         }
       }
     }
@@ -1045,6 +1104,8 @@ async function processAudio(
     if (mySession === sessionId) {
       broadcast('processing-complete')
       focusTarget = null
+      recordingAuthContext = null
+      recordingGenerationPromise = Promise.resolve(0)
       setState('idle')
     }
   }
@@ -1066,70 +1127,11 @@ export function abortInFlightRecording(reason: string): void {
     broadcast('recording-stopped')
     broadcast('processing-complete')
     focusTarget = null
+    recordingAuthContext = null
+    recordingGenerationPromise = Promise.resolve(0)
     pendingCommandId = null
     setState('idle')
   })
-}
-
-// ── Shadow compare (streaming rollout diagnostics) ──────────────────────────
-// Grades the stream transcript against the proven batch engine on the SAME
-// audio, entirely in the background, entirely log-only. format:false because
-// the comparison is raw-vs-raw — paying the format LLM for a diff nobody
-// pastes would double the cost of every shadowed dictation.
-function scheduleShadowCompare(
-  audio: Buffer,
-  streamRaw: string,
-  language: string | undefined,
-  speechMs: number | null,
-): void {
-  setImmediate(() => {
-    dictateViaProxy(audio, {
-      language,
-      format: false,
-      stripDisfluencies: false,
-      dictionary: [],
-      speechMs,
-    })
-      .then((res) => {
-        const diff = wordDiffRatio(streamRaw, res.raw)
-        log.info(
-          `[asr-shadow] diffPct=${(diff * 100).toFixed(1)} ` +
-            `streamLen=${streamRaw.length} batchLen=${res.raw.length}`,
-        )
-      })
-      .catch((err) =>
-        log.warn('[asr-shadow] batch compare failed (diagnostics only)', err),
-      )
-  })
-}
-
-// Word-level dissimilarity: 1 - (2·LCS / (|a|+|b|)) over normalized word
-// arrays — 0 = identical, 1 = nothing in common. Words are lowercased and
-// stripped of punctuation before comparing, because smart_format (stream) and
-// raw Whisper (batch) punctuate differently and that noise isn't accuracy.
-// O(n·m) DP capped at 1,500 words per side (~2 ms worst case, off hot path).
-function wordDiffRatio(a: string, b: string): number {
-  const norm = (s: string): string[] =>
-    s
-      .toLowerCase()
-      .split(/\s+/)
-      .map((w) => w.replace(/[^a-z0-9']/g, ''))
-      .filter(Boolean)
-      .slice(0, 1500)
-  const wa = norm(a)
-  const wb = norm(b)
-  if (wa.length === 0 && wb.length === 0) return 0
-  if (wa.length === 0 || wb.length === 0) return 1
-  // Two-row DP keeps memory at O(m) instead of O(n·m).
-  let prev = new Array<number>(wb.length + 1).fill(0)
-  for (let i = 1; i <= wa.length; i++) {
-    const cur = new Array<number>(wb.length + 1).fill(0)
-    for (let j = 1; j <= wb.length; j++) {
-      cur[j] = wa[i - 1] === wb[j - 1] ? prev[j - 1] + 1 : Math.max(prev[j], cur[j - 1])
-    }
-    prev = cur
-  }
-  return 1 - (2 * prev[wb.length]) / (wa.length + wb.length)
 }
 
 // ── User-facing error messages ─────────────────────────────────────────────
@@ -1179,6 +1181,8 @@ export async function shutdownRecording(): Promise<void> {
     }
   } finally {
     focusTarget = null
+    recordingAuthContext = null
+    recordingGenerationPromise = Promise.resolve(0)
     pendingCommandId = null
     setState('idle')
   }

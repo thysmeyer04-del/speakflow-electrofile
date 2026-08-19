@@ -23,6 +23,7 @@ import { runTransform } from './transform-controller'
 import { runWisprMigration, isWisprMigrationRunning } from './migrate-wispr'
 import {
   assertTrustedSender,
+  issueTrustedFrameNonce,
   validateHotkey,
   validateMicrophoneId,
   validateLanguage,
@@ -31,7 +32,8 @@ import {
   validateAuthToken,
 } from './security'
 import { refreshUserContext, clearUserContext } from './user-context'
-import { clearAsrToken, prewarmAsrToken } from './asr-token'
+import { clearAsrToken, flushStreamingUsageOutbox, prewarmAsrToken } from './asr-token'
+import { purgeOwnerOutbox } from './event-outbox'
 
 interface SetupArgs {
   mainWindow: BrowserWindow
@@ -41,6 +43,17 @@ interface SetupArgs {
 
 let cachedAuthToken: string | null = null
 let cachedTokenExpiresAt = 0
+let cachedAuthOwner: string | null = null
+
+export interface AuthContext {
+  token: string
+  ownerId: string
+}
+
+export function getAuthContext(): AuthContext | null {
+  const token = getAuthToken()
+  return token && cachedAuthOwner ? { token, ownerId: cachedAuthOwner } : null
+}
 
 // Safety margin — refuse tokens about to expire so a request doesn't blow up
 // half-way through with a 401.
@@ -59,6 +72,7 @@ export function getAuthToken(): string | null {
     if (Date.now() > cachedTokenExpiresAt) {
       cachedAuthToken = null
       cachedTokenExpiresAt = 0
+      cachedAuthOwner = null
     }
     log.warn(
       '[auth] token within expiry margin — dictation will fall back/fail until the ' +
@@ -72,6 +86,7 @@ export function getAuthToken(): string | null {
 export function clearAuthTokenCache(): void {
   cachedAuthToken = null
   cachedTokenExpiresAt = 0
+  cachedAuthOwner = null
 }
 
 /**
@@ -100,11 +115,17 @@ export async function ensureAuthToken(maxWaitMs = 3_000): Promise<string | null>
   return null
 }
 
+interface PrivilegedIpcEnvelope<T> {
+  nonce?: unknown
+  payload?: T
+}
+
 function gatedOn<T>(channel: string, handler: (event: IpcMainEvent, payload: T) => void) {
   ipcMain.removeAllListeners(channel)
-  ipcMain.on(channel, (event, payload) => {
-    if (!assertTrustedSender(event, channel)) return
-    handler(event, payload as T)
+  ipcMain.on(channel, (event, rawEnvelope) => {
+    const envelope = rawEnvelope as PrivilegedIpcEnvelope<T> | null
+    if (!assertTrustedSender(event, channel, envelope?.nonce)) return
+    handler(event, envelope?.payload as T)
   })
 }
 
@@ -113,15 +134,22 @@ function gatedHandle<T, R>(
   handler: (event: IpcMainInvokeEvent, payload: T) => R | Promise<R>,
 ) {
   ipcMain.removeHandler(channel)
-  ipcMain.handle(channel, async (event, payload) => {
-    if (!assertTrustedSender(event, channel)) {
+  ipcMain.handle(channel, async (event, rawEnvelope) => {
+    const envelope = rawEnvelope as PrivilegedIpcEnvelope<T> | null
+    if (!assertTrustedSender(event, channel, envelope?.nonce)) {
       throw new Error('untrusted-sender')
     }
-    return await handler(event, payload as T)
+    return await handler(event, envelope?.payload as T)
   })
 }
 
 export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: trayCallback }: SetupArgs): void {
+  ipcMain.removeHandler('security:get-nonce')
+  ipcMain.handle('security:get-nonce', (event) => {
+    const nonce = issueTrustedFrameNonce(event)
+    if (!nonce) throw new Error('untrusted-sender')
+    return nonce
+  })
   gatedHandle('app:version', () => app.getVersion())
   gatedHandle('hotkey:get-status', () => getLastRegistrationResult())
 
@@ -136,7 +164,7 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
 
   gatedHandle<string, { ok: boolean; error?: string; activeHotkey?: string }>(
     'settings:update-hotkey',
-    (_event, raw) => {
+    async (_event, raw) => {
       const v = validateHotkey(raw)
       if (!v) return { ok: false, error: 'invalid-hotkey' }
       setSetting('hotkey', v)
@@ -216,6 +244,8 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
         // (doStart reads settings live); a recording in progress finishes on
         // whatever path it started with.
         setSetting('streamingEngine', validated.value)
+        clearAsrToken()
+        void prewarmAsrToken()
       }
       return { ok: true }
     },
@@ -235,6 +265,7 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       }
       cachedAuthToken = (raw as string).trim()
       cachedTokenExpiresAt = result.expiresAt ?? 0
+      cachedAuthOwner = result.subject ?? null
       // The renderer writes the (possibly just-rotated) Supabase session to
       // localStorage immediately before pushing it here, so commit it to disk
       // now. Chromium flushes DOM storage lazily; without this a crash or
@@ -259,6 +290,29 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
       // Warm the personal dictionary + snippets cache now that we can make
       // RLS-authorized reads. Fire-and-forget — never blocks the auth reply.
       void refreshUserContext()
+      const ownerAtSet = cachedAuthOwner
+      const tokenAtSet = cachedAuthToken
+      if (ownerAtSet && tokenAtSet) {
+        void flushStreamingUsageOutbox(ownerAtSet, tokenAtSet)
+          .then((events) => {
+            if (mainWindow.isDestroyed() || cachedAuthOwner !== ownerAtSet) return
+            for (const event of events) {
+              mainWindow.webContents.mainFrame.send('transcription-complete', {
+                protocolVersion: 2,
+                text: event.text,
+                durationSeconds: event.durationSeconds,
+                appName: event.appContext,
+                windowTitle: null,
+                source: 'dictation',
+                clientEventId: event.clientEventId,
+                usageEventId: null,
+                deletionGeneration: event.deletionGeneration,
+                persisted: true,
+              })
+            }
+          })
+          .catch((err) => log.warn('[outbox] replay failed', err))
+      }
       return { ok: true, expiresAt: result.expiresAt ?? 0 }
     },
   )
@@ -281,6 +335,23 @@ export function setupIPC({ mainWindow, overlayWindow, onRecordingStateChange: tr
   gatedOn('recording:stop', () => {
     stopRecording().catch((err) => log.error('stopRecording IPC failed', err))
   })
+
+  gatedHandle<number, { ok: boolean; error?: string }>(
+    'history:purge-local',
+    async (_event, rawGeneration) => {
+      if (!cachedAuthOwner) return { ok: false, error: 'not-authenticated' }
+      if (!Number.isSafeInteger(rawGeneration) || rawGeneration < 0) {
+        return { ok: false, error: 'invalid-generation' }
+      }
+      try {
+        await purgeOwnerOutbox(cachedAuthOwner, rawGeneration)
+        return { ok: true }
+      } catch (error) {
+        log.warn('[outbox] local history purge failed', error)
+        return { ok: false, error: 'purge-failed' }
+      }
+    },
+  )
 
   // ── Transform Commands ────────────────────────────────────────────────────
   gatedHandle('commands:list', () => ({

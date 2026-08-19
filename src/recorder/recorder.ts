@@ -67,8 +67,8 @@ let warmStream: MediaStream | null = null
 // Tracks which deviceId warmStream was opened for so we can detect a mic
 // change in settings and avoid recording from the wrong device.
 let warmMicrophoneId: string | null = null
-// GainNode pipeline that gives a fixed 1.4x boost on top of AGC so quiet
-// mics still deliver enough energy for reliable Whisper transcription.
+// Unity-gain Web Audio pipeline. Browser AGC/noise suppression performs the
+// normalization; adding fixed gain here clipped production captures.
 let gainAudioCtx: AudioContext | null = null
 let gainDestStream: MediaStream | null = null
 let chunks: Blob[] = []
@@ -231,7 +231,6 @@ async function warmupMicStream(microphoneId: string): Promise<void> {
       audio: {
         deviceId: microphoneId && microphoneId !== 'default' ? { exact: microphoneId } : undefined,
         channelCount: 1,
-        sampleRate: 16_000,
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
@@ -290,7 +289,6 @@ async function start(microphoneId: string, needPcm = false, streamPcm = false): 
           ? { exact: microphoneId }
           : undefined,
       channelCount: 1,
-      sampleRate: 16_000,
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
@@ -322,9 +320,8 @@ async function start(microphoneId: string, needPcm = false, streamPcm = false): 
     }
   }
 
-  // Route mediaStream through a 1.4x GainNode so quiet mics still deliver
-  // enough energy for reliable Whisper transcription. Falls back to the raw
-  // stream if the Web Audio API is unavailable.
+  // Route mediaStream through a unity GainNode so the MediaRecorder receives
+  // browser-processed audio without sacrificing AGC headroom.
   let recorderStream: MediaStream = mediaStream
   try {
     const AudioCtor =
@@ -334,7 +331,9 @@ async function start(microphoneId: string, needPcm = false, streamPcm = false): 
       gainAudioCtx = new AudioCtor()
       const src = gainAudioCtx.createMediaStreamSource(mediaStream)
       const gain = gainAudioCtx.createGain()
-      gain.gain.value = 1.4
+      // Browser AGC already normalizes speech. Unity gain preserves its
+      // headroom; the previous 1.4x boost clipped real production captures.
+      gain.gain.value = 1
       const dest = gainAudioCtx.createMediaStreamDestination()
       src.connect(gain)
       gain.connect(dest)
@@ -402,8 +401,7 @@ async function start(microphoneId: string, needPcm = false, streamPcm = false): 
 }
 
 // ── Live PCM tap: 16 kHz worklet graph for True Streaming ──────────────────
-// mediaStream → MediaStreamSource → GainNode(1.4x, same boost the recording
-// gets so Deepgram hears what Whisper would) → AudioWorkletNode
+// mediaStream → MediaStreamSource → unity GainNode → AudioWorkletNode
 // ('pcm16-frames') → muted gain → destination. The muted sink matters:
 // Chromium only pulls (and therefore only calls process() on) graph branches
 // that terminate in a rendered output; gain 0 keeps the tap silent.
@@ -411,7 +409,7 @@ async function startPcmStream(stream: MediaStream): Promise<void> {
   const mySession = ++pcmSession
   let ctx: AudioContext | null = null
   try {
-    // decode-rate pinning: a 16 kHz context makes Chromium do the resampling
+    // Rate pinning: a 16 kHz context makes Chromium do the resampling
     // from the device rate for us, so the worklet's samples are wire-ready.
     ctx = new AudioContext({ sampleRate: 16_000 })
     if (Math.round(ctx.sampleRate) !== 16_000) {
@@ -432,7 +430,7 @@ async function startPcmStream(stream: MediaStream): Promise<void> {
     }
     const source = ctx.createMediaStreamSource(stream)
     const gain = ctx.createGain()
-    gain.gain.value = 1.4
+    gain.gain.value = 1
     const worklet = new AudioWorkletNode(ctx, 'pcm16-frames', {
       numberOfInputs: 1,
       numberOfOutputs: 1,

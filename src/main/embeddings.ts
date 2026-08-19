@@ -1,12 +1,12 @@
-// Local embedding via @xenova/transformers (Xenova/all-MiniLM-L6-v2, 384-dim).
+// Local embedding via @huggingface/transformers (all-MiniLM-L6-v2, 384-dim).
 //
-// CRITICAL: @xenova/transformers is ESM-only, but this project compiles to
+// CRITICAL: @huggingface/transformers is ESM-only, but this project compiles to
 // CommonJS (`module: "CommonJS"` in tsconfig). TypeScript would normally
-// compile `import { pipeline } from '@xenova/transformers'` into
-// `require('@xenova/transformers')`, which Node refuses with:
+// compile `import { pipeline } from '@huggingface/transformers'` into
+// `require('@huggingface/transformers')`, which Node refuses with:
 //   "require() of ES Module ... not supported"
 //
-// Even `await import('@xenova/transformers')` gets rewritten by TS to
+// Even `await import('@huggingface/transformers')` gets rewritten by TS to
 // `Promise.resolve(require(...))` under CommonJS — same crash.
 //
 // The Function-constructor trick below opaquely creates a real ECMAScript
@@ -16,7 +16,7 @@
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const importTransformers: () => Promise<any> = new Function(
-  'return import("@xenova/transformers")',
+  'return import("@huggingface/transformers")',
 ) as () => Promise<any>
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

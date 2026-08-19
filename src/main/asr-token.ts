@@ -18,6 +18,8 @@
 // only content would be an error interface.
 
 import log from 'electron-log/main'
+import { randomUUID } from 'crypto'
+import { REVISION16_CONTRACT } from '../generated/revision16-contract'
 import { getAuthToken } from './ipc'
 import { isProxyUrlAllowed } from './security'
 import { getSettings } from './settings'
@@ -27,6 +29,12 @@ import {
   safeReadBody,
   userMessageForStatus,
 } from './transcribe'
+import {
+  enqueueUsageEvent,
+  flushUsageEvents,
+  getDeletionGeneration,
+  type UsageOutboxEvent,
+} from './event-outbox'
 
 // ── Typed errors ────────────────────────────────────────────────────────────
 // Same pattern as dictate.ts's DictateHttpError: a plain Error with a code
@@ -195,31 +203,113 @@ export async function getAsrToken(): Promise<string> {
 // weekly quota silently stops counting streamed dictations. Fire-and-forget
 // by design: a lost beacon must never delay or fail a dictation the user has
 // already received.
-const USAGE_TIMEOUT_MS = 5_000
+const USAGE_TIMEOUT_MS = 8_000
 
-export function reportStreamingUsage(opts: { audioSeconds: number; words: number }): void {
+export interface UsageCommitResult {
+  persisted: boolean
+  queued: boolean
+  usageEventId: string | null
+  clientEventId: string
+  deletionGeneration: number
+}
+
+async function submitUsageEvent(event: UsageOutboxEvent, token: string): Promise<{
+  ok: boolean
+  usageEventId: string | null
+  discard: boolean
+}> {
   const base = getProxyBaseUrl()
-  const token = getAuthToken()
-  if (!base || !isProxyUrlAllowed(base) || !token) return
+  if (!base || !isProxyUrlAllowed(base)) return { ok: false, usageEventId: null, discard: false }
   const url = base.replace(/\/+$/, '') + '/usage'
-  void fetchWithTimeout(
-    url,
-    {
+  try {
+    const response = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        engine: 'deepgram-streaming',
-        audioSeconds: Math.round(opts.audioSeconds),
-        words: opts.words,
+        protocolVersion: REVISION16_CONTRACT.protocolVersion,
+        clientEventId: event.clientEventId,
+        text: event.text,
+        engine: event.engine,
+        // The fallback keeps any pre-release v2 outbox written before this
+        // field was made explicit replayable after an upgrade.
+        source: event.source ?? 'streaming',
+        audioSeconds: event.audioSeconds,
+        durationSeconds: event.durationSeconds,
+        appContext: event.appContext,
+        deletionGeneration: event.deletionGeneration,
+        producerMeta: { appVersion: '0.8', ownerBound: true },
       }),
-    },
-    USAGE_TIMEOUT_MS,
-  )
-    .then((res) => {
-      if (!res.ok) log.warn(`[asr] usage report rejected: ${res.status}`)
-    })
-    .catch((err) => log.warn('[asr] usage report failed (logged only)', err))
+    }, USAGE_TIMEOUT_MS)
+    if (!response.ok) {
+      log.warn(`[asr] v2 usage commit rejected: ${response.status}`)
+      return { ok: false, usageEventId: null, discard: response.status === 409 }
+    }
+    const data = await response.json().catch(() => null) as { usageEventId?: unknown } | null
+    return {
+      ok: typeof data?.usageEventId === 'string',
+      usageEventId: typeof data?.usageEventId === 'string' ? data.usageEventId : null,
+      discard: false,
+    }
+  } catch (error) {
+    log.warn('[asr] v2 usage commit unavailable; trying encrypted outbox', (error as Error).message)
+    return { ok: false, usageEventId: null, discard: false }
+  }
+}
+
+export async function reportStreamingUsage(opts: {
+  ownerId: string
+  authToken: string
+  text: string
+  audioSeconds: number
+  durationSeconds: number
+  engine: string
+  source: 'local' | 'streaming' | 'dictation'
+  appContext: string | null
+  deletionGeneration?: number
+}): Promise<UsageCommitResult> {
+  const deletionGeneration = opts.deletionGeneration ?? await getDeletionGeneration(opts.ownerId)
+  const event: UsageOutboxEvent = {
+    id: randomUUID(),
+    ownerId: opts.ownerId,
+    clientEventId: randomUUID(),
+    text: opts.text,
+    audioSeconds: Math.max(0, opts.audioSeconds),
+    durationSeconds: Math.max(0, opts.durationSeconds),
+    engine: opts.engine.slice(0, 80),
+    source: opts.source,
+    appContext: opts.appContext?.slice(0, 120) ?? null,
+    deletionGeneration,
+    createdAt: Date.now(),
+  }
+  const submitted = await submitUsageEvent(event, opts.authToken)
+  if (submitted.ok) {
+    return {
+      persisted: true,
+      queued: false,
+      usageEventId: submitted.usageEventId,
+      clientEventId: event.clientEventId,
+      deletionGeneration,
+    }
+  }
+  const queued = submitted.discard ? false : await enqueueUsageEvent(event)
+  return {
+    persisted: false,
+    queued,
+    usageEventId: null,
+    clientEventId: event.clientEventId,
+    deletionGeneration,
+  }
+}
+
+export async function flushStreamingUsageOutbox(
+  ownerId: string,
+  authToken: string,
+): Promise<UsageOutboxEvent[]> {
+  return flushUsageEvents(ownerId, async (event) => {
+    const result = await submitUsageEvent(event, authToken)
+    return result.ok || result.discard
+  })
 }

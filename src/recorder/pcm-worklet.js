@@ -1,4 +1,4 @@
-// AudioWorkletProcessor for the True Streaming (Deepgram) path.
+// AudioWorkletProcessor for the Deepgram live-transcription path.
 //
 // Plain JS on purpose: AudioWorklet modules are fetched and evaluated inside
 // the audio rendering thread's worklet scope — they can't go through this
@@ -49,8 +49,8 @@ class Pcm16FramesProcessor extends AudioWorkletProcessor {
     // quantum or batches several, frames fill across process() calls
     // (800 = 6.25 quanta, so every frame boundary lands mid-quantum).
     for (let i = 0; i < channel.length; i++) {
-      // Float32 [-1, 1] → int16. Clamp first: upstream gain (1.4x) can push
-      // samples past ±1 and int16 overflow wraps into loud clicks.
+      // Float32 [-1, 1] → int16. Clamp defensively so malformed upstream
+      // samples cannot overflow into loud clicks.
       let s = channel[i]
       if (s > 1) s = 1
       else if (s < -1) s = -1

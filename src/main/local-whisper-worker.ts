@@ -1,6 +1,6 @@
 // Isolated inference worker for on-device Whisper.
 //
-// Runs @xenova/transformers (onnxruntime native code) in an Electron
+// Runs @huggingface/transformers (onnxruntime native code) in an Electron
 // utilityProcess. Rationale: onnxruntime inference can hard-crash at the
 // native level — nothing catchable in JS. In-process that killed the whole
 // app mid-dictation; in a worker it kills only this process, and the parent
@@ -18,7 +18,7 @@
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const importTransformers: () => Promise<any> = new Function(
-  'return import("@xenova/transformers")',
+  'return import("@huggingface/transformers")',
 ) as () => Promise<any>
 
 interface ParentPort {
