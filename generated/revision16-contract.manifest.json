@@ -1,0 +1,10 @@
+{
+  "revision": 16,
+  "protocolVersion": 2,
+  "sourceSha256": "cc5458265b2f4b10716ba84fc8e39b046012d978b30dec256953ef25ac5ce46d",
+  "migrationSha256": "b17d1d8a47a411c2da794029948212dbe40c1df1806d9f4b8030ea57ec3b51cd",
+  "rollbackSha256": "4cb6409b9e14bcc9a4fb668fdcd456dd6e9a7262fdc6200a25497a90c66aecdd",
+  "verifySha256": "6a7acfa3cc359cf540fcc4ab890518bbaff0353c8c9f8b3aaa7f6da2b016bf6f",
+  "generatedTypeScriptSha256": "721dcffffd1bb9e127b3e50190b226d66a92e7d6ac00e56b3c0e9a7e5d60e8a6",
+  "generatedAclVerifySha256": "d49107d47505cbf387fa6de4b117e9be4458a770e9798894ef8ddb9327d05c99"
+}

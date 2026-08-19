@@ -32,6 +32,11 @@ interface TranscriptionPayload {
   appName: string | null
   windowTitle: string | null
   source: 'dictation' | 'transform'
+  protocolVersion?: 1 | 2
+  clientEventId?: string | null
+  usageEventId?: string | null
+  deletionGeneration?: number
+  persisted?: boolean
 }
 
 declare global {
@@ -106,6 +111,7 @@ declare global {
 
     setAuthToken: (token: string) => Promise<{ ok: boolean; error?: string; expiresAt?: number }>
     clearAuthToken: () => void
+    purgeHistory: (deletionGeneration: number) => Promise<{ ok: boolean; error?: string }>
 
     startRecording: () => void
     stopRecording: () => void

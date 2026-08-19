@@ -11,26 +11,21 @@ export interface AppSettings {
   muteMusicWhenDictating: boolean
   enableSmartFormatting: boolean
   stripDisfluencies: boolean
-  // 'cloud'  — Groq Whisper API (default; needs internet)
-  // 'local'  — on-device Whisper via @xenova/transformers (works offline;
+  // 'cloud'  — admitted Deepgram Nova-3 API (default; needs internet)
+  // 'local'  — on-device Whisper via @huggingface/transformers (works offline;
   //            falls back to cloud if the local pass fails)
   transcriptionMode: 'cloud' | 'local'
-  // Cloud STT engine. 'groq' = Whisper (default), 'deepgram' = Nova-3.
-  // Deepgram failures always fall back to Groq transparently.
+  // Cloud STT engine. Deepgram is canonical; the retained 'groq' value is a
+  // v0.7.5 compatibility input and is migrated to Deepgram below.
   transcriptionProvider: 'groq' | 'deepgram'
   // HuggingFace model id for local mode. Whisper sizes trade speed for
   // accuracy: Xenova/whisper-tiny < base < small < medium.
   localWhisperModel: string
-  // True Streaming (2026-07): live word-by-word transcription over a
-  // Deepgram Nova-3 WebSocket owned by the main process. 'off' by default —
-  // the batch pipeline is the proven path, and every streaming failure falls
-  // back to it seamlessly, so streaming is pure opt-in until shadow-compare
-  // data (below) proves transcript parity. English + cloud mode only.
+  // Deepgram Nova-3 live transcription. Every failure falls back to the full
+  // recorded clip, so streaming cannot lose a dictation. English/cloud only.
   streamingEngine: 'off' | 'deepgram'
-  // Diagnostics for the streaming rollout: after a stream-path dictation
-  // injects, ALSO run the batch /dictate on the same (still fully recorded)
-  // blob in the background and log a word-level diff ratio. Never affects
-  // what the user sees; costs one extra proxy round-trip per dictation.
+  // Legacy diagnostics toggle. v0.8 never duplicates an admitted request,
+  // because doing so could create an unnecessary ASR charge.
   asrShadowCompare: boolean
   // NOTE: streamingTranscription was removed with the segment-on-pause
   // streaming feature (Fast Batch, 2026-07). Old deployed dashboards still
@@ -50,9 +45,9 @@ const defaults: AppSettings = {
   enableSmartFormatting: true,
   stripDisfluencies: true,
   transcriptionMode: 'cloud',
-  transcriptionProvider: 'groq',
+  transcriptionProvider: 'deepgram',
   localWhisperModel: 'Xenova/whisper-medium',
-  streamingEngine: 'off',
+  streamingEngine: 'deepgram',
   asrShadowCompare: false,
 }
 
@@ -82,6 +77,17 @@ const F11_MIGRATION_KEY = 'migratedF11Default' as const
 const flexStore = store as unknown as {
   get(key: string): unknown
   set(key: string, value: unknown): void
+}
+
+// Product migration: Deepgram is the canonical speech-to-text provider.
+// Run once so installations that inherited the earlier Groq batch default or
+// the short-lived OpenAI/auto experiment move to the same Deepgram path. A
+// user can still turn live transcription off again after this migration.
+const DEEPGRAM_PRIMARY_MIGRATION_KEY = 'migratedDeepgramPrimaryV1' as const
+if (!flexStore.get(DEEPGRAM_PRIMARY_MIGRATION_KEY)) {
+  store.set('transcriptionProvider', 'deepgram')
+  store.set('streamingEngine', 'deepgram')
+  flexStore.set(DEEPGRAM_PRIMARY_MIGRATION_KEY, true)
 }
 if (!flexStore.get(F11_MIGRATION_KEY)) {
   if (store.get('hotkey') === 'F11') {

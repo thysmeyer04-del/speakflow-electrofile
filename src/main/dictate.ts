@@ -34,7 +34,7 @@
 //     5xx, 503, timeout) is fallback-eligible → transparent legacy retry.
 
 import log from 'electron-log/main'
-import { getAuthToken } from './ipc'
+import { REVISION16_CONTRACT } from '../generated/revision16-contract'
 import { isProxyUrlAllowed } from './security'
 import {
   getProxyBaseUrl,
@@ -46,7 +46,7 @@ import {
 } from './transcribe'
 
 const REQUEST_TIMEOUT_MS = 60_000
-const MAX_BYTES = 25 * 1024 * 1024 // Groq hard limit — same gate as /transcribe
+const MAX_BYTES = REVISION16_CONTRACT.media.parserHardBytes
 // Contract field ceilings — the server hard-rejects oversized fields, and a
 // rejected dictation is worse than a truncated window title.
 const MAX_APP_NAME_CHARS = 120
@@ -57,13 +57,18 @@ const MAX_DICTIONARY_WORDS = 25
 export interface DictateServerTimings {
   authMs?: number
   quotaMs?: number
+  admissionMs?: number
   bodyMs?: number
   groqMs?: number
+  asrMs?: number
   formatMs?: number
+  finalizeMs?: number
   totalMs?: number
 }
 
 export interface DictateOptions {
+  authToken: string
+  deletionGeneration: number
   language?: string
   format: boolean
   stripDisfluencies: boolean
@@ -78,6 +83,10 @@ export interface DictateOptions {
 export interface DictateResult {
   raw: string
   formatted?: string
+  usageEventId: string
+  provider: string
+  model: string
+  recovered: boolean
   // True when the server did not produce usable formatted text (its own
   // shouldFormat skip, a formatting failure, or format was never requested).
   // The caller then applies the local cheap cleanup (stripFillerWords) only.
@@ -93,9 +102,8 @@ interface DictateHttpError extends Error {
 
 /** 401 (auth) / 402 (quota): retrying via the legacy path would fail the
  *  same way — these must surface to the user exactly as they do today. */
-export function isAuthOrQuotaError(err: unknown): boolean {
-  const status = (err as DictateHttpError | null)?.dictateStatus
-  return status === 401 || status === 402
+export function isDictateHttpError(err: unknown): boolean {
+  return typeof (err as DictateHttpError | null)?.dictateStatus === 'number'
 }
 
 /** One-round-trip dictation via the Speakflow proxy. Proxy-only by design:
@@ -115,7 +123,7 @@ export async function dictateViaProxy(
   if (!isProxyUrlAllowed(baseUrl)) {
     throw new Error('Speakflow API URL is not allowed.')
   }
-  const token = getAuthToken()
+  const token = opts.authToken
   if (!token) {
     // Same wording as the legacy proxy path — humanizeTranscribeError keys
     // on "Sign in". NOTE: no dictateStatus here on purpose; a missing local
@@ -135,6 +143,8 @@ export async function dictateViaProxy(
   form.append('prompt', whisperPromptForClip(opts.speechMs))
   form.append('format', opts.format ? '1' : '0')
   form.append('stripDisfluencies', opts.stripDisfluencies ? '1' : '0')
+  form.append('maxWords', String(REVISION16_CONTRACT.media.maxDeclaredWords))
+  form.append('deletionGeneration', String(opts.deletionGeneration))
   if (opts.appName) form.append('appName', opts.appName.slice(0, MAX_APP_NAME_CHARS))
   if (opts.windowTitle) {
     form.append('windowTitle', opts.windowTitle.slice(0, MAX_WINDOW_TITLE_CHARS))
@@ -193,6 +203,10 @@ export async function dictateViaProxy(
     formatError?: string
     droppedSegments?: number
     timings?: DictateServerTimings
+    usageEventId?: string
+    provider?: string
+    model?: string
+    recovered?: boolean
     error?: string
   }
   try {
@@ -204,6 +218,9 @@ export async function dictateViaProxy(
     log.warn(`[dictate] proxy returned error: ${data.error}`)
     throw new Error('Transcription failed. Try again.')
   }
+  if (typeof data.usageEventId !== 'string' || data.usageEventId.length === 0) {
+    throw new Error('Transcription was not committed. Please try again.')
+  }
 
   const clientRtt = Date.now() - t0
   const st = data.timings
@@ -213,7 +230,8 @@ export async function dictateViaProxy(
     const serverTotal = typeof st.totalMs === 'number' ? st.totalMs : 0
     log.info(
       `[timing] dictate server auth=${st.authMs ?? '?'} quota=${st.quotaMs ?? '?'} body=${st.bodyMs ?? '?'} ` +
-        `groq=${st.groqMs ?? '?'} format=${st.formatMs ?? '?'} total=${st.totalMs ?? '?'}; ` +
+        `admission=${st.admissionMs ?? '?'} asr=${st.asrMs ?? st.groqMs ?? '?'} ` +
+        `format=${st.formatMs ?? '?'} finalize=${st.finalizeMs ?? '?'} total=${st.totalMs ?? '?'}; ` +
         `clientRtt=${clientRtt}; network=${clientRtt - serverTotal}`,
     )
   } else {
@@ -234,6 +252,10 @@ export async function dictateViaProxy(
   return {
     raw,
     formatted,
+    usageEventId: data.usageEventId,
+    provider: typeof data.provider === 'string' ? data.provider : 'deepgram',
+    model: typeof data.model === 'string' ? data.model : 'nova-3',
+    recovered: data.recovered === true,
     skipped: data.skippedFormat === true || !formatted,
     serverTimings: st,
   }

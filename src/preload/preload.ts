@@ -2,6 +2,36 @@ import { contextBridge, ipcRenderer, IpcRendererEvent } from 'electron'
 
 type Unsubscribe = () => void
 
+let frameNoncePromise: Promise<string> | null = null
+
+async function requestFrameNonce(attempt = 0): Promise<string> {
+  try {
+    const nonce = await ipcRenderer.invoke('security:get-nonce')
+    if (typeof nonce !== 'string' || nonce.length !== 64) throw new Error('invalid-frame-nonce')
+    return nonce
+  } catch (error) {
+    // main installs IPC after the first remote dashboard load; tolerate that
+    // narrow startup race without ever sending a privileged unbound message.
+    if (attempt >= 9) throw error
+    await new Promise<void>((resolve) => setTimeout(resolve, 100))
+    return requestFrameNonce(attempt + 1)
+  }
+}
+
+function getFrameNonce(): Promise<string> {
+  if (!frameNoncePromise) frameNoncePromise = requestFrameNonce()
+  return frameNoncePromise
+}
+
+async function privilegedInvoke<T>(channel: string, payload?: unknown): Promise<T> {
+  const nonce = await getFrameNonce()
+  return ipcRenderer.invoke(channel, { nonce, payload }) as Promise<T>
+}
+
+function privilegedSend(channel: string, payload?: unknown): void {
+  void getFrameNonce().then((nonce) => ipcRenderer.send(channel, { nonce, payload }))
+}
+
 function on<T>(channel: string, handler: (payload: T) => void): Unsubscribe {
   const wrapped = (_event: IpcRendererEvent, payload: T) => handler(payload)
   ipcRenderer.on(channel, wrapped)
@@ -36,6 +66,11 @@ interface TranscriptionPayload {
   appName: string | null
   windowTitle: string | null
   source: 'dictation' | 'transform'
+  protocolVersion?: 1 | 2
+  clientEventId?: string | null
+  usageEventId?: string | null
+  deletionGeneration?: number
+  persisted?: boolean
 }
 
 // Choice settings the dashboard may change — mirrors main's allowlist in
@@ -65,18 +100,18 @@ contextBridge.exposeInMainWorld('electronAPI', {
   updateHotkey: async (hotkey: string): Promise<SettingsResult> => {
     const v = safeString(hotkey, 64)
     if (!v || !HOTKEY_PATTERN.test(v)) return { ok: false, error: 'invalid-hotkey' }
-    return ipcRenderer.invoke('settings:update-hotkey', v) as Promise<SettingsResult>
+    return privilegedInvoke<SettingsResult>('settings:update-hotkey', v)
   },
   updateMicrophone: async (deviceId: string): Promise<SettingsResult> => {
     const v = safeString(deviceId, 256)
     if (!v) return { ok: false, error: 'invalid-microphone' }
-    return ipcRenderer.invoke('settings:update-microphone', v) as Promise<SettingsResult>
+    return privilegedInvoke<SettingsResult>('settings:update-microphone', v)
   },
   updateLanguage: async (language: string): Promise<SettingsResult> => {
     const v = safeString(language, 8)
     if (!v || !ALLOWED_LANGUAGES.has(v.toLowerCase()))
       return { ok: false, error: 'invalid-language' }
-    return ipcRenderer.invoke('settings:update-language', v.toLowerCase()) as Promise<SettingsResult>
+    return privilegedInvoke<SettingsResult>('settings:update-language', v.toLowerCase())
   },
   updateToggle: async (
     key:
@@ -102,59 +137,65 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ])
     if (!allowed.has(key)) return { ok: false, error: 'invalid-key' }
     if (typeof value !== 'boolean') return { ok: false, error: 'invalid-value' }
-    return ipcRenderer.invoke('settings:update-toggle', { key, value }) as Promise<SettingsResult>
+    return privilegedInvoke<SettingsResult>('settings:update-toggle', { key, value })
   },
   setChoiceSetting: async (key: string, value: string): Promise<SettingsResult> => {
     const allowedValues = ALLOWED_CHOICE_SETTINGS[key]
     if (!allowedValues || !allowedValues.has(value)) {
       return { ok: false, error: 'invalid-choice' }
     }
-    return ipcRenderer.invoke('settings:set-choice', { key, value }) as Promise<SettingsResult>
+    return privilegedInvoke<SettingsResult>('settings:set-choice', { key, value })
   },
-  getSettings: () => ipcRenderer.invoke('settings:get'),
+  getSettings: () => privilegedInvoke('settings:get'),
 
   // ── App / system info ─────────────────────────────────────────────────────
-  getVersion: () => ipcRenderer.invoke('app:version'),
+  getVersion: () => privilegedInvoke('app:version'),
   getPlatform: () => process.platform as NodeJS.Platform,
 
   // ── Window controls ───────────────────────────────────────────────────────
-  minimizeWindow: () => ipcRenderer.send('window:minimize'),
-  hideWindow: () => ipcRenderer.send('window:hide'),
+  minimizeWindow: () => privilegedSend('window:minimize'),
+  hideWindow: () => privilegedSend('window:hide'),
 
   // ── Auth handoff (Supabase JWT for the Railway proxy) ────────────────────
   setAuthToken: async (token: string): Promise<SettingsResult & { expiresAt?: number }> => {
     const v = safeString(token, 4096)
     if (!v) return { ok: false, error: 'invalid-token' }
-    return ipcRenderer.invoke('auth:set-token', v) as Promise<SettingsResult & { expiresAt?: number }>
+    return privilegedInvoke<SettingsResult & { expiresAt?: number }>('auth:set-token', v)
   },
-  clearAuthToken: () => ipcRenderer.send('auth:clear-token'),
+  clearAuthToken: () => privilegedSend('auth:clear-token'),
+  purgeHistory: (deletionGeneration: number) => {
+    if (!Number.isSafeInteger(deletionGeneration) || deletionGeneration < 0) {
+      return Promise.resolve({ ok: false, error: 'invalid-generation' })
+    }
+    return privilegedInvoke<SettingsResult>('history:purge-local', deletionGeneration)
+  },
 
   // ── Recording control ─────────────────────────────────────────────────────
-  startRecording: () => ipcRenderer.send('recording:start'),
-  stopRecording: () => ipcRenderer.send('recording:stop'),
+  startRecording: () => privilegedSend('recording:start'),
+  stopRecording: () => privilegedSend('recording:stop'),
 
   // ── Transform Commands ────────────────────────────────────────────────────
   commands: {
-    list: () => ipcRenderer.invoke('commands:list'),
-    save: (cmd: unknown) => ipcRenderer.invoke('commands:save', cmd),
+    list: () => privilegedInvoke('commands:list'),
+    save: (cmd: unknown) => privilegedInvoke('commands:save', cmd),
     delete: (id: string) => {
       const v = safeString(id, 64)
       if (!v) return Promise.resolve({ success: false, error: 'invalid-id' })
-      return ipcRenderer.invoke('commands:delete', v)
+      return privilegedInvoke('commands:delete', v)
     },
-    resetDefaults: () => ipcRenderer.invoke('commands:reset-defaults'),
+    resetDefaults: () => privilegedInvoke('commands:reset-defaults'),
     run: (id: string) => {
       const v = safeString(id, 64)
       if (!v) return Promise.resolve({ success: false, error: 'invalid-id' })
-      return ipcRenderer.invoke('commands:run', v)
+      return privilegedInvoke('commands:run', v)
     },
   },
   onTransformStarting: (cb: () => void) => on<void>('transform-starting', cb),
 
   // ── One-shot Wispr Flow migration ─────────────────────────────────────────
   migrate: {
-    fromWispr: () => ipcRenderer.invoke('migrate:start-wispr-import'),
-    status: () => ipcRenderer.invoke('migrate:status'),
+    fromWispr: () => privilegedInvoke('migrate:start-wispr-import'),
+    status: () => privilegedInvoke('migrate:status'),
     onProgress: (cb: (p: unknown) => void) => on<unknown>('migrate:progress', cb),
   },
 })

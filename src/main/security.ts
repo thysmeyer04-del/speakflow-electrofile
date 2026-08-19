@@ -2,15 +2,18 @@
 
 import { IpcMainEvent, IpcMainInvokeEvent } from 'electron'
 import log from 'electron-log/main'
+import { randomBytes, timingSafeEqual } from 'crypto'
 
 let allowedSenderId: number | null = null
 let allowedOrigin: string | null = null
+let trustedMainFrameNonce: string | null = null
 
 export function configureSecurity(opts: {
   allowedSenderId: number
   allowedOrigin: string
 }): void {
   allowedSenderId = opts.allowedSenderId
+  trustedMainFrameNonce = randomBytes(32).toString('hex')
   try {
     allowedOrigin = new URL(opts.allowedOrigin).origin
   } catch {
@@ -22,6 +25,7 @@ export function configureSecurity(opts: {
 export function assertTrustedSender(
   event: IpcMainEvent | IpcMainInvokeEvent,
   channel: string,
+  nonce?: unknown,
 ): boolean {
   if (allowedSenderId === null) {
     log.warn(`[security] IPC "${channel}" rejected — security not yet configured`)
@@ -31,6 +35,10 @@ export function assertTrustedSender(
     log.warn(
       `[security] IPC "${channel}" from sender ${event.sender.id} rejected (expected ${allowedSenderId})`,
     )
+    return false
+  }
+  if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) {
+    log.warn(`[security] IPC "${channel}" rejected — sender is not the trusted main frame`)
     return false
   }
   const frameUrl = event.senderFrame?.url ?? ''
@@ -48,7 +56,31 @@ export function assertTrustedSender(
       return false
     }
   }
+  if (typeof nonce !== 'string' || !trustedMainFrameNonce) {
+    log.warn(`[security] IPC "${channel}" rejected — missing frame nonce`)
+    return false
+  }
+  const supplied = Buffer.from(nonce, 'utf8')
+  const expected = Buffer.from(trustedMainFrameNonce, 'utf8')
+  if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+    log.warn(`[security] IPC "${channel}" rejected — invalid frame nonce`)
+    return false
+  }
   return true
+}
+
+/** Bootstrap the per-process nonce only to the configured trusted main frame. */
+export function issueTrustedFrameNonce(
+  event: IpcMainInvokeEvent,
+  channel = 'security:get-nonce',
+): string | null {
+  if (allowedSenderId === null || event.sender.id !== allowedSenderId) return null
+  if (!event.senderFrame || event.senderFrame !== event.sender.mainFrame) return null
+  if (!isOriginTrusted(event.senderFrame.url)) {
+    log.warn(`[security] IPC "${channel}" rejected — untrusted nonce request`)
+    return null
+  }
+  return trustedMainFrameNonce
 }
 
 export function isOriginTrusted(url: string): boolean {
@@ -165,8 +197,7 @@ export type ChoiceSetting =
 const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
   transcriptionMode: new Set(['cloud', 'local']),
   transcriptionProvider: new Set(['groq', 'deepgram']),
-  // True Streaming rollout knob. 'off' by default — streaming is opt-in until
-  // shadow-compare data proves parity with the batch pipeline.
+  // Deepgram live transcription; failures retain the recorded batch path.
   streamingEngine: new Set(['off', 'deepgram']),
 }
 
@@ -204,6 +235,7 @@ const SUPABASE_ISSUER_PATTERN = /^https:\/\/[a-z0-9-]+\.supabase\.(co|in)\/auth\
 export interface JwtValidationResult {
   ok: boolean
   expiresAt: number | null
+  subject?: string
   reason?: string
 }
 
@@ -269,8 +301,11 @@ export function validateAuthToken(input: unknown): JwtValidationResult {
   if (!auds.includes('authenticated')) {
     return { ok: false, expiresAt: expMs, reason: 'bad-audience' }
   }
+  if (typeof payload.sub !== 'string' || !/^[0-9a-f-]{36}$/i.test(payload.sub)) {
+    return { ok: false, expiresAt: expMs, reason: 'bad-subject' }
+  }
 
-  return { ok: true, expiresAt: expMs }
+  return { ok: true, expiresAt: expMs, subject: payload.sub }
 }
 
 // Production proxy hosts — exact match, no wildcards. We deliberately do NOT
