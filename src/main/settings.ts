@@ -27,6 +27,14 @@ export interface AppSettings {
   // Legacy diagnostics toggle. v0.8 never duplicates an admitted request,
   // because doing so could create an unnecessary ASR charge.
   asrShadowCompare: boolean
+  // Flowcast Windows beta. Off until the user explicitly accepts screen/audio
+  // capture and cloud-upload behavior in Settings.
+  flowcastEnabled: boolean
+  flowcastCaptureMic: boolean
+  flowcastCaptureSystemAudio: boolean
+  flowcastCursor: boolean
+  flowcastQuality: 'balanced' | 'high'
+  flowcastVisibility: 'private' | 'unlisted'
   // NOTE: streamingTranscription was removed with the segment-on-pause
   // streaming feature (Fast Batch, 2026-07). Old deployed dashboards still
   // send the toggle over IPC — ipc.ts accepts it as a no-op. Any stale
@@ -49,6 +57,12 @@ const defaults: AppSettings = {
   localWhisperModel: 'Xenova/whisper-medium',
   streamingEngine: 'deepgram',
   asrShadowCompare: false,
+  flowcastEnabled: false,
+  flowcastCaptureMic: true,
+  flowcastCaptureSystemAudio: true,
+  flowcastCursor: true,
+  flowcastQuality: 'balanced',
+  flowcastVisibility: 'private',
 }
 
 const store = new Store<AppSettings>({

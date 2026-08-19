@@ -80,6 +80,8 @@ const ALLOWED_CHOICE_SETTINGS: Record<string, Set<string>> = {
   transcriptionProvider: new Set(['groq', 'deepgram']),
   // True Streaming engine (2026-07): opt-in live transcription.
   streamingEngine: new Set(['off', 'deepgram']),
+  flowcastQuality: new Set(['balanced', 'high']),
+  flowcastVisibility: new Set(['private', 'unlisted']),
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -122,6 +124,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
       | 'enableSmartFormatting'
       | 'stripDisfluencies'
       | 'asrShadowCompare'
+      | 'flowcastEnabled'
+      | 'flowcastCaptureMic'
+      | 'flowcastCaptureSystemAudio'
+      | 'flowcastCursor'
       | 'streamingTranscription',
     value: boolean,
   ): Promise<SettingsResult> => {
@@ -133,6 +139,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'enableSmartFormatting',
       'stripDisfluencies',
       'asrShadowCompare',
+      'flowcastEnabled',
+      'flowcastCaptureMic',
+      'flowcastCaptureSystemAudio',
+      'flowcastCursor',
       'streamingTranscription',
     ])
     if (!allowed.has(key)) return { ok: false, error: 'invalid-key' }
@@ -173,6 +183,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // ── Recording control ─────────────────────────────────────────────────────
   startRecording: () => privilegedSend('recording:start'),
   stopRecording: () => privilegedSend('recording:stop'),
+
+  flowcast: {
+    status: () => privilegedInvoke('flowcast:get-status'),
+    probe: () => privilegedInvoke('flowcast:probe'),
+    start: () => privilegedInvoke('flowcast:start'),
+    stop: () => privilegedInvoke('flowcast:stop'),
+    discard: () => privilegedInvoke('flowcast:discard'),
+    onState: (cb: (payload: unknown) => void) => on<unknown>('flowcast:state', cb),
+    onDone: (cb: (shareUrl: string) => void) => on<string>('flowcast:done', cb),
+    onError: (cb: (message: string) => void) => on<string>('flowcast:error', cb),
+  },
 
   // ── Transform Commands ────────────────────────────────────────────────────
   commands: {

@@ -164,6 +164,10 @@ export type ToggleKey =
   // True Streaming diagnostics: after a stream-path dictation, re-run the
   // batch engine on the same blob in the background and log a diff ratio.
   | 'asrShadowCompare'
+  | 'flowcastEnabled'
+  | 'flowcastCaptureMic'
+  | 'flowcastCaptureSystemAudio'
+  | 'flowcastCursor'
   // Legacy: the streamingTranscription setting was removed along with
   // segment-on-pause streaming (Fast Batch, 2026-07), but old DEPLOYED
   // dashboards still render the toggle and send this key over IPC. It stays
@@ -181,6 +185,10 @@ export function validateToggleKey(input: unknown): ToggleKey | null {
     'enableSmartFormatting',
     'stripDisfluencies',
     'asrShadowCompare',
+    'flowcastEnabled',
+    'flowcastCaptureMic',
+    'flowcastCaptureSystemAudio',
+    'flowcastCursor',
     'streamingTranscription', // accepted-but-ignored — see ToggleKey note
   ])
   return (allowed as Set<string>).has(input) ? (input as ToggleKey) : null
@@ -193,12 +201,16 @@ export type ChoiceSetting =
   | { key: 'transcriptionMode'; value: 'cloud' | 'local' }
   | { key: 'transcriptionProvider'; value: 'groq' | 'deepgram' }
   | { key: 'streamingEngine'; value: 'off' | 'deepgram' }
+  | { key: 'flowcastQuality'; value: 'balanced' | 'high' }
+  | { key: 'flowcastVisibility'; value: 'private' | 'unlisted' }
 
 const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
   transcriptionMode: new Set(['cloud', 'local']),
   transcriptionProvider: new Set(['groq', 'deepgram']),
   // Deepgram live transcription; failures retain the recorded batch path.
   streamingEngine: new Set(['off', 'deepgram']),
+  flowcastQuality: new Set(['balanced', 'high']),
+  flowcastVisibility: new Set(['private', 'unlisted']),
 }
 
 export function validateChoiceSetting(

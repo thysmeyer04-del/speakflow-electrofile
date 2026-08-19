@@ -11,7 +11,13 @@ app.commandLine.appendSwitch('disable-gpu')
 app.commandLine.appendSwitch('no-sandbox')
 import path from 'path'
 import log from 'electron-log/main'
-import { setupTray, setTrayRecording, selfCheckTrayAssets, setTrayUpdatePending } from './tray'
+import {
+  setupTray,
+  setTrayRecording,
+  setTrayFlowcastState,
+  selfCheckTrayAssets,
+  setTrayUpdatePending,
+} from './tray'
 import { registerHotkey, unregisterHotkey, reassertHotkey } from './hotkey'
 import { initCommandsStore, getCommands } from './commands-store'
 import {
@@ -31,6 +37,7 @@ import { shutdownRecording } from './recording-controller'
 import { isQuitting, markQuitting } from './quit-state'
 import { configureSecurity, isExternalUrlAllowed, isOriginTrusted } from './security'
 import { warmupInject, registerOwnWindowPid, unregisterOwnWindowPid } from './inject'
+import { FlowcastController } from './flowcast/controller'
 
 log.initialize()
 log.transports.file.level = 'info'
@@ -44,6 +51,7 @@ const DASHBOARD_URL = process.env.DASHBOARD_URL || PRODUCTION_DASHBOARD
 
 let mainWindow: BrowserWindow | null = null
 let overlayWindow: BrowserWindow | null = null
+let flowcastController: FlowcastController | null = null
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 if (!gotSingleInstanceLock) {
@@ -437,6 +445,25 @@ app.whenReady().then(async () => {
 
   mainWindow = await createMainWindow()
   overlayWindow = createOverlayWindow()
+  const flowcast = new FlowcastController({
+    onState: (state, detail) => {
+      setTrayFlowcastState(state)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('flowcast:state', { state, ...detail })
+      }
+    },
+    onDone: (shareUrl) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('flowcast:done', shareUrl)
+      }
+    },
+    onError: (message) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('flowcast:error', message)
+      }
+    },
+  })
+  flowcastController = flowcast
 
   // Show the overlay window immediately at startup so its first paint cost
   // is paid before the user ever presses the hotkey. The .visible CSS class
@@ -464,11 +491,12 @@ app.whenReady().then(async () => {
   })
 
   selfCheckTrayAssets()
-  setupTray(mainWindow)
+  setupTray(mainWindow, flowcast)
   setupIPC({
     mainWindow,
     overlayWindow,
     onRecordingStateChange: (recording) => setTrayRecording(recording),
+    flowcast,
   })
   initRecorder()
   setLevelTargetWindow(overlayWindow)
@@ -493,6 +521,14 @@ app.whenReady().then(async () => {
   // Streaming grants are pre-minted in the background so hotkey-press never
   // pays mint latency (2.3s cold, observed in the field) inside the dictation.
   startAsrTokenPrewarm()
+  if (getSettings().flowcastEnabled) {
+    const timer = setTimeout(() => {
+      void flowcast.checkCapabilities()
+      void flowcast.recoverAbandonedSessions()
+      void flowcast.sweepOldSessions()
+    }, 8_000)
+    timer.unref?.()
+  }
   registerHotkey(getSettings().hotkey)
   initCommandsStore()
   registerCommandHotkeys(getCommands())
@@ -540,8 +576,10 @@ app.on('before-quit', (event) => {
   unregisterHotkey()
   unregisterAllCommandHotkeys()
   event.preventDefault()
-  shutdownRecording()
-    .catch((err) => log.warn('Shutdown recording failed', err))
+  Promise.all([
+    shutdownRecording().catch((err) => log.warn('Shutdown recording failed', err)),
+    flowcastController?.shutdown().catch((err) => log.warn('Shutdown Flowcast failed', err)),
+  ])
     .finally(() => {
       destroyRecorder()
       app.exit(0)

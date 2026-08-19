@@ -25,6 +25,7 @@ import { asrErrorCode, reportStreamingUsage } from './asr-token'
 import { isSilenceArtifact, ARTIFACT_MAX_SPEECH_MS } from './whisper-artifacts'
 import { syncToKnowledgeBase } from './supabase'
 import { getAuthToken, getAuthContext, ensureAuthToken, type AuthContext } from './ipc'
+import { releaseMedia, tryAcquireMedia } from './media-owner'
 import { getDeletionGeneration } from './event-outbox'
 import { injectText, captureFocusTarget, WindowSnapshot } from './inject'
 import { getSettings } from './settings'
@@ -281,6 +282,7 @@ function setState(next: RecordingState): void {
   if (state === next) return
   log.info(`[recording] ${state} -> ${next}`)
   state = next
+  if (next === 'idle') releaseMedia('dictation')
   for (const cb of listeners) {
     try {
       cb(next)
@@ -393,6 +395,10 @@ export function stopRecording(): Promise<void> {
 
 async function doStart(forCommand = false): Promise<void> {
   const t0 = Date.now()
+  if (!tryAcquireMedia('dictation')) {
+    broadcast('transcription-error', 'Stop the screen recording before starting dictation.')
+    return
+  }
   // If a transform is mid-flight (LLM call resolving), abort it so its
   // delayed Ctrl+V doesn't fire into a now-active recording context.
   abortInFlightTransform()
