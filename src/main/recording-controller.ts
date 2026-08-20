@@ -47,6 +47,7 @@ import {
   getPronunciationSpellings,
 } from './user-context'
 import { isOriginTrusted } from './security'
+import { waitForStopTail } from './recording-tail'
 
 export type RecordingState =
   | 'idle'
@@ -506,6 +507,13 @@ async function doStop(): Promise<void> {
 
   const settings = getSettings()
   if (settings.dictationSounds) playSound('stop')
+
+  // The click/hotkey changes the UI immediately, but audio capture is allowed
+  // to drain for one short tail window before either pipeline is closed. This
+  // preserves the final word when Stop lands immediately after the speaker's
+  // last syllable. Both the MediaRecorder fallback and live Deepgram stream
+  // remain open during this wait, so they end at the same audio boundary.
+  await waitForStopTail()
 
   // ── True Streaming: flush Deepgram IN PARALLEL with the blob collection ──
   // finalize() sends the Finalize control message immediately; its promise is
