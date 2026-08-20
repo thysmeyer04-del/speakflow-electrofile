@@ -1,3 +1,4 @@
+(() => {
 type StatePayload = { state: string; elapsedMs?: number }
 
 interface FlowcastControlApi {
@@ -8,9 +9,7 @@ interface FlowcastControlApi {
   onState: (callback: (payload: StatePayload) => void) => () => void
 }
 
-declare global {
-  interface Window { flowcastControl: FlowcastControlApi }
-}
+const api = (window as unknown as { flowcastControl: FlowcastControlApi }).flowcastControl
 
 const timer = document.querySelector<HTMLElement>('#timer')!
 const status = document.querySelector<HTMLElement>('#status')!
@@ -55,7 +54,7 @@ setInterval(() => {
 
 pauseButton.addEventListener('click', async () => {
   pauseButton.disabled = true
-  const result = await window.flowcastControl.pauseOrResume()
+  const result = await api.pauseOrResume()
   if (!result.ok) pauseButton.disabled = false
 })
 
@@ -64,7 +63,7 @@ stopButton.addEventListener('click', async () => {
   pauseButton.disabled = true
   discardButton.disabled = true
   status.textContent = 'Saving safely…'
-  await window.flowcastControl.stop()
+  await api.stop()
 })
 
 discardButton.addEventListener('click', async () => {
@@ -73,10 +72,9 @@ discardButton.addEventListener('click', async () => {
   pauseButton.disabled = true
   discardButton.disabled = true
   status.textContent = 'Discarding…'
-  await window.flowcastControl.discard()
+  await api.discard()
 })
 
-window.flowcastControl.onState(render)
-void window.flowcastControl.getState().then(render)
-
-export {}
+api.onState(render)
+void api.getState().then(render)
+})()
