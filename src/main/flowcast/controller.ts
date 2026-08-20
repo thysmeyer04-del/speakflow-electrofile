@@ -19,7 +19,7 @@ import { releaseMedia, tryAcquireMedia } from '../media-owner'
 import { getAuthContext } from '../ipc'
 import { exportFinalizedRecording, resolveLocalExportDirectory } from './local-export'
 
-export type FlowcastState = 'idle' | 'starting' | 'recording' | 'stopping' | 'saving' | 'uploading'
+export type FlowcastState = 'idle' | 'starting' | 'recording' | 'paused' | 'stopping' | 'saving' | 'uploading'
 export type FlowcastStorageMode = 'onedrive' | 'cloud'
 
 export interface FlowcastCompletion {
@@ -63,6 +63,8 @@ export class FlowcastController {
   private state: FlowcastState = 'idle'
   private manifest: SessionManifest | null = null
   private startedAt = 0
+  private pausedAt = 0
+  private totalPausedMs = 0
   private caps: Caps | null = null
   private chain: Promise<unknown> = Promise.resolve()
   private maximumTimer: NodeJS.Timeout | null = null
@@ -96,7 +98,9 @@ export class FlowcastController {
   }
 
   elapsedMs(): number {
-    return this.startedAt ? Date.now() - this.startedAt : 0
+    if (!this.startedAt) return 0
+    const end = this.pausedAt || Date.now()
+    return Math.max(0, end - this.startedAt - this.totalPausedMs)
   }
 
   getLastCompletion(): FlowcastCompletion | null {
@@ -204,6 +208,8 @@ export class FlowcastController {
         })
 
         this.startedAt = Date.now()
+        this.pausedAt = 0
+        this.totalPausedMs = 0
         this.manifest = {
           v: 1,
           sessionId,
@@ -237,9 +243,32 @@ export class FlowcastController {
     })
   }
 
+  pause(): Promise<void> {
+    return this.queue(async () => {
+      if (this.state !== 'recording') return
+      await this.sidecar.pauseRecording(true)
+      this.pausedAt = Date.now()
+      this.setState('paused')
+    })
+  }
+
+  resume(): Promise<void> {
+    return this.queue(async () => {
+      if (this.state !== 'paused') return
+      await this.sidecar.pauseRecording(false)
+      if (this.pausedAt) this.totalPausedMs += Date.now() - this.pausedAt
+      this.pausedAt = 0
+      this.setState('recording')
+    })
+  }
+
   stop(discard = false): Promise<FlowcastCompletion | null> {
     return this.queue(async () => {
-      if (this.state !== 'recording') return null
+      if (this.state !== 'recording' && this.state !== 'paused') return null
+      if (this.pausedAt) {
+        this.totalPausedMs += Date.now() - this.pausedAt
+        this.pausedAt = 0
+      }
       this.setState('stopping')
       if (this.maximumTimer) {
         clearTimeout(this.maximumTimer)

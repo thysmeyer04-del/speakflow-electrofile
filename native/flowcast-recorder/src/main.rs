@@ -285,6 +285,26 @@ fn run_server() {
                     }),
                 }
             }
+
+            Command::Pause { id } | Command::Resume { id } => {
+                let paused = matches!(command, Command::Pause { .. });
+                match session.as_mut() {
+                    Some(active) => {
+                        active.paused.store(paused, Ordering::Release);
+                        emit(&Event::Paused {
+                            id,
+                            session: active.session_id.clone(),
+                            paused,
+                        });
+                    }
+                    None => emit(&Event::Error {
+                        id: Some(id),
+                        code: "not_recording",
+                        fatal: false,
+                        message: "nothing is being recorded".into(),
+                    }),
+                }
+            }
         }
     }
 
@@ -315,6 +335,7 @@ struct Session {
     fps: u32,
     audio_bitrate: u32,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     state: Arc<CaptureState>,
     control: Option<Control>,
     runtime: Runtime,
@@ -379,6 +400,7 @@ fn start_session(
     ffmpeg::probe_h264(&runtime)?;
 
     let stop = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
     let state = Arc::new(CaptureState::default());
     let latest: LatestFrame = Arc::new(Mutex::new(None));
     let video_path = temporary_path(out_path, "video.tmp.mp4");
@@ -395,6 +417,7 @@ fn start_session(
         video.bitrate,
         latest.clone(),
         stop.clone(),
+        paused.clone(),
         state.clone(),
     )?;
 
@@ -479,7 +502,7 @@ fn start_session(
         let (tx, rx) = sync_channel(AUDIO_CHANNEL_DEPTH);
         let candidate = temporary_path(out_path, "audio.tmp.pcm");
         let _ = std::fs::remove_file(&candidate);
-        match ffmpeg::start_pcm_writer(candidate.clone(), rx, state.clone()) {
+        match ffmpeg::start_pcm_writer(candidate.clone(), rx, paused.clone(), state.clone()) {
             Ok(writer) => {
                 pcm_path = Some(candidate);
                 audio_writer = Some(writer);
@@ -520,6 +543,7 @@ fn start_session(
         fps: video.fps,
         audio_bitrate: audio_opts.bitrate,
         stop,
+        paused,
         state,
         control: Some(control),
         runtime,

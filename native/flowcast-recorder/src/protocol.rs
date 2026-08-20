@@ -58,6 +58,12 @@ pub enum Command {
     /// Finish the MP4 cleanly and answer with `Event::Stopped`.
     Stop { id: u64 },
 
+    /// Temporarily stop adding video frames and audio samples to the output.
+    Pause { id: u64 },
+
+    /// Continue a paused recording on the same output timeline.
+    Resume { id: u64 },
+
     /// Stop and delete the output file.
     Abort { id: u64 },
 }
@@ -159,6 +165,11 @@ pub enum Event {
         width: u32,
         height: u32,
         fps: u32,
+    },
+    Paused {
+        id: u64,
+        session: String,
+        paused: bool,
     },
     #[allow(dead_code)]
     Stats {

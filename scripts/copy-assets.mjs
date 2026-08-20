@@ -12,6 +12,7 @@ const root = path.resolve(__dirname, '..')
 const pairs = [
   { src: 'src/recorder/recorder.html', dst: 'dist/recorder/recorder.html' },
   { src: 'src/overlay/overlay.html',   dst: 'dist/overlay/overlay.html' },
+  { src: 'src/flowcast-control/flowcast-control.html', dst: 'dist/flowcast-control/flowcast-control.html' },
   // AudioWorklet module for True Streaming: plain JS (worklet scopes can't be
   // produced by this tsc build), loaded at runtime relative to recorder.html
   // via audioWorklet.addModule('pcm-worklet.js') — must sit beside it in dist.
@@ -20,6 +21,7 @@ const pairs = [
 
 await fs.mkdir(path.join(root, 'dist/recorder'), { recursive: true })
 await fs.mkdir(path.join(root, 'dist/overlay'), { recursive: true })
+await fs.mkdir(path.join(root, 'dist/flowcast-control'), { recursive: true })
 await fs.mkdir(path.join(root, 'dist/preload'), { recursive: true })
 
 for (const { src, dst } of pairs) {

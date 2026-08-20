@@ -4,7 +4,7 @@
 // module-level constants and silently no-op forever after.
 import 'dotenv/config'
 
-import { app, BrowserWindow, Notification, powerMonitor, screen, session, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, Notification, powerMonitor, screen, session, shell } from 'electron'
 
 app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('disable-gpu')
@@ -51,6 +51,7 @@ const DASHBOARD_URL = process.env.DASHBOARD_URL || PRODUCTION_DASHBOARD
 
 let mainWindow: BrowserWindow | null = null
 let overlayWindow: BrowserWindow | null = null
+let flowcastControlWindow: BrowserWindow | null = null
 let flowcastController: FlowcastController | null = null
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
@@ -408,6 +409,88 @@ function createOverlayWindow(): BrowserWindow {
   return win
 }
 
+function createFlowcastControlWindow(): BrowserWindow {
+  const { x, y, width, height } = screen.getPrimaryDisplay().workArea
+  const win = new BrowserWindow({
+    width: 420,
+    height: 72,
+    x: Math.floor(x + width / 2 - 210),
+    y: Math.floor(y + height - 94),
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, '..', 'flowcast-control', 'flowcast-control-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  })
+
+  win.setAlwaysOnTop(true, 'screen-saver')
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  win.webContents.on('will-navigate', (event) => event.preventDefault())
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  win.webContents.on('render-process-gone', (_event, details) => {
+    log.warn('[flowcast-control] renderer gone:', details.reason)
+    if (!win.isDestroyed()) win.webContents.reload()
+  })
+  win.on('closed', () => {
+    if (flowcastControlWindow === win) flowcastControlWindow = null
+  })
+  win.loadFile(
+    path.join(__dirname, '..', 'flowcast-control', 'flowcast-control.html'),
+  ).catch((error) => log.error('[flowcast-control] failed to load', error))
+  return win
+}
+
+function setupFlowcastControlIPC(win: BrowserWindow, flowcast: FlowcastController): void {
+  const trusted = (senderId: number) => !win.isDestroyed() && senderId === win.webContents.id
+  const install = <T>(channel: string, handler: () => T | Promise<T>) => {
+    ipcMain.removeHandler(channel)
+    ipcMain.handle(channel, (event) => {
+      if (!trusted(event.sender.id)) throw new Error('untrusted-sender')
+      return handler()
+    })
+  }
+
+  install('flowcast-control:get-state', () => ({
+    state: flowcast.getState(),
+    elapsedMs: flowcast.elapsedMs(),
+  }))
+  install('flowcast-control:pause-or-resume', async () => {
+    try {
+      if (flowcast.getState() === 'recording') await flowcast.pause()
+      else if (flowcast.getState() === 'paused') await flowcast.resume()
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'pause-failed' }
+    }
+  })
+  install('flowcast-control:stop', async () => {
+    try {
+      await flowcast.stop()
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'stop-failed' }
+    }
+  })
+  install('flowcast-control:discard', async () => {
+    try {
+      await flowcast.stop(true)
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'discard-failed' }
+    }
+  })
+}
+
 function resolveIcon(): string | undefined {
   const file =
     process.platform === 'win32'
@@ -445,11 +528,18 @@ app.whenReady().then(async () => {
 
   mainWindow = await createMainWindow()
   overlayWindow = createOverlayWindow()
+  flowcastControlWindow = createFlowcastControlWindow()
   const flowcast = new FlowcastController({
     onState: (state, detail) => {
       setTrayFlowcastState(state)
+      const payload = { state, ...detail }
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('flowcast:state', { state, ...detail })
+        mainWindow.webContents.send('flowcast:state', payload)
+      }
+      if (flowcastControlWindow && !flowcastControlWindow.isDestroyed()) {
+        flowcastControlWindow.webContents.send('flowcast-control:state', payload)
+        if (state === 'idle') flowcastControlWindow.hide()
+        else flowcastControlWindow.showInactive()
       }
     },
     onDone: (result) => {
@@ -472,6 +562,7 @@ app.whenReady().then(async () => {
     },
   })
   flowcastController = flowcast
+  setupFlowcastControlIPC(flowcastControlWindow, flowcast)
 
   // Show the overlay window immediately at startup so its first paint cost
   // is paid before the user ever presses the hotkey. The .visible CSS class
