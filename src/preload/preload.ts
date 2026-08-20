@@ -82,6 +82,7 @@ const ALLOWED_CHOICE_SETTINGS: Record<string, Set<string>> = {
   streamingEngine: new Set(['off', 'deepgram']),
   flowcastQuality: new Set(['balanced', 'high']),
   flowcastVisibility: new Set(['private', 'unlisted']),
+  flowcastStorageMode: new Set(['onedrive', 'cloud']),
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -190,8 +191,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     start: () => privilegedInvoke('flowcast:start'),
     stop: () => privilegedInvoke('flowcast:stop'),
     discard: () => privilegedInvoke('flowcast:discard'),
+    chooseExportDirectory: () => privilegedInvoke('flowcast:choose-export-directory'),
+    openExportDirectory: () => privilegedInvoke('flowcast:open-export-directory'),
+    openLastRecording: () => privilegedInvoke('flowcast:open-last-recording'),
     onState: (cb: (payload: unknown) => void) => on<unknown>('flowcast:state', cb),
-    onDone: (cb: (shareUrl: string) => void) => on<string>('flowcast:done', cb),
+    onDone: (cb: (result: unknown) => void) => on<unknown>('flowcast:done', cb),
     onError: (cb: (message: string) => void) => on<string>('flowcast:error', cb),
   },
 

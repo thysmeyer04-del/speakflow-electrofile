@@ -4,7 +4,7 @@
 // module-level constants and silently no-op forever after.
 import 'dotenv/config'
 
-import { app, BrowserWindow, powerMonitor, screen, session, shell } from 'electron'
+import { app, BrowserWindow, Notification, powerMonitor, screen, session, shell } from 'electron'
 
 app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('disable-gpu')
@@ -452,9 +452,17 @@ app.whenReady().then(async () => {
         mainWindow.webContents.send('flowcast:state', { state, ...detail })
       }
     },
-    onDone: (shareUrl) => {
+    onDone: (result) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('flowcast:done', shareUrl)
+        mainWindow.webContents.send('flowcast:done', result)
+      }
+      if (result.storageMode === 'onedrive' && Notification.isSupported()) {
+        const notification = new Notification({
+          title: 'Flowcast saved to OneDrive',
+          body: 'Click to show the completed recording.',
+        })
+        notification.on('click', () => shell.showItemInFolder(result.location))
+        notification.show()
       }
     },
     onError: (message) => {

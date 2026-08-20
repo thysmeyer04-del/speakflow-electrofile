@@ -35,6 +35,11 @@ export interface AppSettings {
   flowcastCursor: boolean
   flowcastQuality: 'balanced' | 'high'
   flowcastVisibility: 'private' | 'unlisted'
+  // OneDrive is the internal-test path and never contacts the Flowcast API.
+  // Cloud remains available behind the production profile/server gates.
+  flowcastStorageMode: 'onedrive' | 'cloud'
+  // Empty means auto-detect OneDrive and use "Speakflow Flowcast" below it.
+  flowcastExportDirectory: string
   // NOTE: streamingTranscription was removed with the segment-on-pause
   // streaming feature (Fast Batch, 2026-07). Old deployed dashboards still
   // send the toggle over IPC — ipc.ts accepts it as a no-op. Any stale
@@ -63,6 +68,8 @@ const defaults: AppSettings = {
   flowcastCursor: true,
   flowcastQuality: 'balanced',
   flowcastVisibility: 'private',
+  flowcastStorageMode: 'onedrive',
+  flowcastExportDirectory: '',
 }
 
 const store = new Store<AppSettings>({

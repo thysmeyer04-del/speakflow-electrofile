@@ -1,4 +1,5 @@
-import { ipcMain, app, BrowserWindow, IpcMainEvent, IpcMainInvokeEvent } from 'electron'
+import { ipcMain, app, BrowserWindow, dialog, shell, IpcMainEvent, IpcMainInvokeEvent } from 'electron'
+import fs from 'node:fs'
 import log from 'electron-log/main'
 import { getSettings, setSetting } from './settings'
 import { updateHotkey, getLastRegistrationResult } from './hotkey'
@@ -255,8 +256,10 @@ export function setupIPC({
         void prewarmAsrToken()
       } else if (validated.key === 'flowcastQuality') {
         setSetting('flowcastQuality', validated.value)
-      } else {
+      } else if (validated.key === 'flowcastVisibility') {
         setSetting('flowcastVisibility', validated.value)
+      } else {
+        setSetting('flowcastStorageMode', validated.value)
       }
       return { ok: true }
     },
@@ -353,11 +356,19 @@ export function setupIPC({
     stopRecording().catch((err) => log.error('stopRecording IPC failed', err))
   })
 
-  gatedHandle('flowcast:get-status', () => ({
-    state: flowcast.getState(),
-    elapsedMs: flowcast.elapsedMs(),
-    enabled: getSettings().flowcastEnabled,
-  }))
+  gatedHandle('flowcast:get-status', () => {
+    const settings = getSettings()
+    return {
+      state: flowcast.getState(),
+      elapsedMs: flowcast.elapsedMs(),
+      enabled: settings.flowcastEnabled,
+      storageMode: settings.flowcastStorageMode,
+      exportDirectory: flowcast.resolveExportDirectory(settings.flowcastExportDirectory),
+      lastSavedFile: flowcast.getLastCompletion()?.storageMode === 'onedrive'
+        ? flowcast.getLastCompletion()?.location ?? null
+        : null,
+    }
+  })
   gatedHandle('flowcast:probe', async () => {
     const caps = await flowcast.checkCapabilities()
     return { ok: Boolean(caps), caps }
@@ -372,15 +383,54 @@ export function setupIPC({
         quality: settings.flowcastQuality,
         cursor: settings.flowcastCursor,
         visibility: settings.flowcastVisibility,
+        storageMode: settings.flowcastStorageMode,
+        exportDirectory: settings.flowcastExportDirectory,
       })
       return { ok: true }
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'flowcast-start-failed' }
     }
   })
-  gatedHandle('flowcast:stop', async () => ({ ok: true, shareUrl: await flowcast.stop() }))
+  gatedHandle('flowcast:stop', async () => {
+    const result = await flowcast.stop()
+    return {
+      ok: true,
+      shareUrl: result?.storageMode === 'cloud' ? result.location : null,
+      localFile: result?.storageMode === 'onedrive' ? result.location : null,
+    }
+  })
   gatedHandle('flowcast:discard', async () => {
     await flowcast.stop(true)
+    return { ok: true }
+  })
+  gatedHandle('flowcast:choose-export-directory', async () => {
+    const settings = getSettings()
+    const selected = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose where Flowcast recordings are saved',
+      defaultPath:
+        flowcast.resolveExportDirectory(settings.flowcastExportDirectory) ?? app.getPath('videos'),
+      properties: ['openDirectory', 'createDirectory'],
+      buttonLabel: 'Use this folder',
+    })
+    const directory = selected.filePaths[0]
+    if (selected.canceled || !directory) return { ok: false, error: 'cancelled' }
+    setSetting('flowcastExportDirectory', directory)
+    return { ok: true, directory }
+  })
+  gatedHandle('flowcast:open-export-directory', async () => {
+    const settings = getSettings()
+    const directory = flowcast.resolveExportDirectory(settings.flowcastExportDirectory)
+    if (!directory) return { ok: false, error: 'onedrive-not-found' }
+    await fs.promises.mkdir(directory, { recursive: true })
+    const error = await shell.openPath(directory)
+    return error ? { ok: false, error } : { ok: true }
+  })
+  gatedHandle('flowcast:open-last-recording', () => {
+    const completion = flowcast.getLastCompletion()
+    if (!completion || completion.storageMode !== 'onedrive') {
+      return { ok: false, error: 'no-local-recording' }
+    }
+    shell.showItemInFolder(completion.location)
     return { ok: true }
   })
 

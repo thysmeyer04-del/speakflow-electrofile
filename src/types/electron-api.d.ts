@@ -61,13 +61,30 @@ declare global {
     onNavigateTo: (cb: (route: string) => void) => () => void
     onUpdateAvailable: (cb: (version: string) => void) => () => void
     flowcast: {
-      status: () => Promise<{ state: string; elapsedMs: number; enabled: boolean }>
+      status: () => Promise<{
+        state: string
+        elapsedMs: number
+        enabled: boolean
+        storageMode: 'onedrive' | 'cloud'
+        exportDirectory: string | null
+        lastSavedFile: string | null
+      }>
       probe: () => Promise<{ ok: boolean; caps: unknown }>
       start: () => Promise<{ ok: boolean; error?: string }>
-      stop: () => Promise<{ ok: boolean; shareUrl: string | null }>
+      stop: () => Promise<{
+        ok: boolean
+        shareUrl: string | null
+        localFile: string | null
+      }>
       discard: () => Promise<{ ok: boolean }>
+      chooseExportDirectory: () => Promise<{ ok: boolean; directory?: string; error?: string }>
+      openExportDirectory: () => Promise<{ ok: boolean; error?: string }>
+      openLastRecording: () => Promise<{ ok: boolean; error?: string }>
       onState: (cb: (payload: unknown) => void) => () => void
-      onDone: (cb: (shareUrl: string) => void) => () => void
+      onDone: (cb: (result: {
+        storageMode: 'onedrive' | 'cloud'
+        location: string
+      }) => void) => () => void
       onError: (cb: (message: string) => void) => () => void
     }
 
@@ -117,7 +134,8 @@ declare global {
         | 'transcriptionProvider'
         | 'streamingEngine'
         | 'flowcastQuality'
-        | 'flowcastVisibility',
+        | 'flowcastVisibility'
+        | 'flowcastStorageMode',
       value: string,
     ) => Promise<{ ok: boolean; error?: string }>
     getSettings: () => Promise<Record<string, unknown>>

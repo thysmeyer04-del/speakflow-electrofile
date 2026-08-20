@@ -55,7 +55,8 @@ export function setupTray(mainWindow: BrowserWindow, flowcast: FlowcastControlle
   rebuildMenu = () => {
     if (!tray || tray.isDestroyed()) return
     const pending = getPendingUpdateVersion()
-    const flowcastEnabled = process.platform === 'win32' && getSettings().flowcastEnabled
+    const flowcastSettings = getSettings()
+    const flowcastEnabled = process.platform === 'win32' && flowcastSettings.flowcastEnabled
     const flowcastBusy = flowcastState !== 'idle'
 
     const menu = Menu.buildFromTemplate([
@@ -75,7 +76,11 @@ export function setupTray(mainWindow: BrowserWindow, flowcast: FlowcastControlle
         click: () => { void toggleRecording() },
       },
       {
-        label: flowcastBusy ? 'Stop screen recording' : 'Start screen recording',
+        label: flowcastBusy
+          ? 'Stop screen recording'
+          : flowcastSettings.flowcastStorageMode === 'onedrive'
+            ? 'Start screen recording → OneDrive'
+            : 'Start screen recording',
         enabled: flowcastEnabled,
         click: () => {
           const settings = getSettings()
@@ -87,6 +92,8 @@ export function setupTray(mainWindow: BrowserWindow, flowcast: FlowcastControlle
                 quality: settings.flowcastQuality,
                 cursor: settings.flowcastCursor,
                 visibility: settings.flowcastVisibility,
+                storageMode: settings.flowcastStorageMode,
+                exportDirectory: settings.flowcastExportDirectory,
               })
           void operation.catch((error) => {
             log.warn('[flowcast] tray operation failed', error)

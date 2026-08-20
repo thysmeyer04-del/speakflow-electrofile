@@ -100,6 +100,9 @@ export interface SessionManifest {
   /** Supabase subject that created the recording. Recovery must never upload
    *  this file while a different account is active. */
   ownerId: string
+  /** Cloud is the production multipart path. OneDrive is the internal-test
+   *  path that exports only a completed, validated MP4 to a local sync folder. */
+  destination?: 'cloud' | 'onedrive'
   state: 'recording' | 'stopped' | 'uploading' | 'done' | 'failed'
   createdAtUnixMs: number
   file: string
@@ -113,6 +116,11 @@ export interface SessionManifest {
   createRequestId?: string
   shareId?: string
   shareUrl?: string
+  /** Present after a local test recording has been copied successfully. */
+  localExportPath?: string
+  /** The user-selected local sync folder, used only to resume a local export
+   *  after a crash. It is never sent to the server. */
+  localExportDirectory?: string
   uploadId?: string
   /** Parts already accepted by storage, so an interrupted upload resumes
    *  instead of starting again. */
