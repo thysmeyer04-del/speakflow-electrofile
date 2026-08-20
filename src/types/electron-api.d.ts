@@ -71,6 +71,8 @@ declare global {
       }>
       probe: () => Promise<{ ok: boolean; caps: unknown }>
       start: () => Promise<{ ok: boolean; error?: string }>
+      pause: () => Promise<{ ok: boolean; error?: string }>
+      resume: () => Promise<{ ok: boolean; error?: string }>
       stop: () => Promise<{
         ok: boolean
         shareUrl: string | null
@@ -80,6 +82,7 @@ declare global {
       chooseExportDirectory: () => Promise<{ ok: boolean; directory?: string; error?: string }>
       openExportDirectory: () => Promise<{ ok: boolean; error?: string }>
       openLastRecording: () => Promise<{ ok: boolean; error?: string }>
+      playLastRecording: () => Promise<{ ok: boolean; error?: string }>
       onState: (cb: (payload: unknown) => void) => () => void
       onDone: (cb: (result: {
         storageMode: 'onedrive' | 'cloud'

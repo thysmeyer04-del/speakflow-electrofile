@@ -21,6 +21,8 @@ export interface StartCommand {
 export type Command =
   | { cmd: 'probe' }
   | StartCommand
+  | { cmd: 'pause' }
+  | { cmd: 'resume' }
   | { cmd: 'stop' }
   | { cmd: 'abort' }
 
@@ -65,6 +67,7 @@ export type Event =
       height: number
       fps: number
     }
+  | { v: number; ev: 'paused'; id: number; session: string; paused: boolean }
   | {
       v: number
       ev: 'stats'

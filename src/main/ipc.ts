@@ -375,8 +375,17 @@ export function setupIPC({
   })
   gatedHandle('flowcast:start', async () => {
     const settings = getSettings()
+    // Pressing Record in local OneDrive mode is explicit intent to use the
+    // recorder. Enable it here so an old default cannot turn the primary CTA
+    // into a silent no-op. Cloud access remains separately gated by preflight.
+    if (!settings.flowcastEnabled && settings.flowcastStorageMode === 'onedrive') {
+      setSetting('flowcastEnabled', true)
+      settings.flowcastEnabled = true
+      log.info('[flowcast] enabled local OneDrive recording from the Record screen action')
+    }
     if (!settings.flowcastEnabled) return { ok: false, error: 'flowcast-disabled' }
     try {
+      log.info(`[flowcast] start requested (${settings.flowcastStorageMode})`)
       await flowcast.start({
         captureMic: settings.flowcastCaptureMic,
         captureSystemAudio: settings.flowcastCaptureSystemAudio,
@@ -388,7 +397,25 @@ export function setupIPC({
       })
       return { ok: true }
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : 'flowcast-start-failed' }
+      const message = error instanceof Error ? error.message : 'flowcast-start-failed'
+      log.error('[flowcast] start request failed', error)
+      return { ok: false, error: message }
+    }
+  })
+  gatedHandle('flowcast:pause', async () => {
+    try {
+      await flowcast.pause()
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'flowcast-pause-failed' }
+    }
+  })
+  gatedHandle('flowcast:resume', async () => {
+    try {
+      await flowcast.resume()
+      return { ok: true }
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'flowcast-resume-failed' }
     }
   })
   gatedHandle('flowcast:stop', async () => {
@@ -432,6 +459,14 @@ export function setupIPC({
     }
     shell.showItemInFolder(completion.location)
     return { ok: true }
+  })
+  gatedHandle('flowcast:play-last-recording', async () => {
+    const completion = flowcast.getLastCompletion()
+    if (!completion || completion.storageMode !== 'onedrive') {
+      return { ok: false, error: 'no-local-recording' }
+    }
+    const error = await shell.openPath(completion.location)
+    return error ? { ok: false, error } : { ok: true }
   })
 
   gatedHandle<number, { ok: boolean; error?: string }>(

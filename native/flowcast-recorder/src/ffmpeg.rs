@@ -144,6 +144,7 @@ pub fn start_video(
     bitrate: u32,
     latest: LatestFrame,
     stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     state: Arc<CaptureState>,
 ) -> Result<VideoWorker, String> {
     if let Some(parent) = path.parent() {
@@ -208,6 +209,13 @@ pub fn start_video(
             let mut failure: Option<String> = None;
 
             while !stop.load(Ordering::Acquire) {
+                if paused.load(Ordering::Acquire) {
+                    // Keep the encoder timeline compact: a five-minute pause
+                    // must not create five minutes of duplicated frames.
+                    next_frame = Instant::now();
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
                 let current = match latest.lock() {
                     Ok(slot) => slot.clone(),
                     Err(_) => {
@@ -250,9 +258,7 @@ pub fn start_video(
                 }
             }
 
-            let duration_seconds = timeline_started
-                .map(|started| started.elapsed().as_secs_f64())
-                .unwrap_or(0.0);
+            let duration_seconds = frames as f64 / f64::from(fps.max(1));
             drop(input);
             let output = child
                 .wait_with_output()
@@ -289,6 +295,7 @@ pub fn start_video(
 pub fn start_pcm_writer(
     path: PathBuf,
     rx: Receiver<Vec<u8>>,
+    paused: Arc<AtomicBool>,
     state: Arc<CaptureState>,
 ) -> Result<JoinHandle<Result<u64, String>>, String> {
     let file = File::create(&path)
@@ -300,6 +307,9 @@ pub fn start_pcm_writer(
             let mut writer = BufWriter::new(file);
             let mut bytes = 0u64;
             while let Ok(chunk) = rx.recv() {
+                if paused.load(Ordering::Acquire) {
+                    continue;
+                }
                 writer
                     .write_all(&chunk)
                     .map_err(|err| format!("could not save recorded audio: {err}"))?;

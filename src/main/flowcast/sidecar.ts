@@ -133,6 +133,13 @@ export class Sidecar {
     return event
   }
 
+  async pauseRecording(paused: boolean): Promise<void> {
+    const event = await this.request({ cmd: paused ? 'pause' : 'resume' }, START_TIMEOUT_MS)
+    if (event.ev !== 'paused' || event.paused !== paused) {
+      throw new Error(`the recorder did not confirm ${paused ? 'pause' : 'resume'}`)
+    }
+  }
+
   /** Resolves once the file has been finalised and is playable. */
   stopRecording(discard = false): Promise<Extract<Event, { ev: 'stopped' }>> {
     this.stopping = true
@@ -244,6 +251,8 @@ export class Sidecar {
     switch (event.ev) {
       case 'started':
         this.handlers.onStarted?.(event)
+        break
+      case 'paused':
         break
       case 'warn':
         // Audio failures arrive here. The recording is still running.
