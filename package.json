@@ -1,6 +1,6 @@
 {
   "name": "speakflow-desktop",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Speakflow — voice-to-text desktop app powered by Deepgram Nova-3",
   "main": "dist/main/main.js",
   "author": {
