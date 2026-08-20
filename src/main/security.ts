@@ -203,6 +203,7 @@ export type ChoiceSetting =
   | { key: 'streamingEngine'; value: 'off' | 'deepgram' }
   | { key: 'flowcastQuality'; value: 'balanced' | 'high' }
   | { key: 'flowcastVisibility'; value: 'private' | 'unlisted' }
+  | { key: 'flowcastStorageMode'; value: 'onedrive' | 'cloud' }
 
 const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
   transcriptionMode: new Set(['cloud', 'local']),
@@ -211,6 +212,7 @@ const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
   streamingEngine: new Set(['off', 'deepgram']),
   flowcastQuality: new Set(['balanced', 'high']),
   flowcastVisibility: new Set(['private', 'unlisted']),
+  flowcastStorageMode: new Set(['onedrive', 'cloud']),
 }
 
 export function validateChoiceSetting(

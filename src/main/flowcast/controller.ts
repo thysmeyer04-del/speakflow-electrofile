@@ -17,8 +17,15 @@ import type { Caps, SessionManifest } from './types'
 import { preflightRecording } from './api'
 import { releaseMedia, tryAcquireMedia } from '../media-owner'
 import { getAuthContext } from '../ipc'
+import { exportFinalizedRecording, resolveLocalExportDirectory } from './local-export'
 
-export type FlowcastState = 'idle' | 'starting' | 'recording' | 'stopping' | 'uploading'
+export type FlowcastState = 'idle' | 'starting' | 'recording' | 'stopping' | 'saving' | 'uploading'
+export type FlowcastStorageMode = 'onedrive' | 'cloud'
+
+export interface FlowcastCompletion {
+  storageMode: FlowcastStorageMode
+  location: string
+}
 
 export interface FlowcastOptions {
   captureMic: boolean
@@ -27,12 +34,14 @@ export interface FlowcastOptions {
   monitorIndex?: number
   cursor: boolean
   visibility: 'private' | 'unlisted'
+  storageMode: FlowcastStorageMode
+  exportDirectory?: string
 }
 
 export interface FlowcastEvents {
   onState?: (state: FlowcastState, detail?: { elapsedMs?: number; percent?: number }) => void
   onWarn?: (message: string) => void
-  onDone?: (shareUrl: string) => void
+  onDone?: (result: FlowcastCompletion) => void
   onError?: (message: string) => void
 }
 
@@ -46,6 +55,8 @@ const QUALITY = {
 /** Refuse to start below this. Running out of disk halfway through is a lost
  *  recording, and the person will not find out until they stop. */
 const MIN_FREE_MB = 2_048
+const LOCAL_MAX_DURATION_SECONDS = 2 * 60 * 60
+const LOCAL_MANIFEST_OWNER = 'local-onedrive-test'
 
 export class FlowcastController {
   private sidecar: Sidecar
@@ -56,6 +67,9 @@ export class FlowcastController {
   private chain: Promise<unknown> = Promise.resolve()
   private maximumTimer: NodeJS.Timeout | null = null
   private recoveryPromise: Promise<number> | null = null
+  private activeStorageMode: FlowcastStorageMode = 'onedrive'
+  private activeExportDirectory: string | null = null
+  private lastCompletion: FlowcastCompletion | null = null
 
   constructor(private events: FlowcastEvents = {}) {
     this.sidecar = new Sidecar({
@@ -83,6 +97,14 @@ export class FlowcastController {
 
   elapsedMs(): number {
     return this.startedAt ? Date.now() - this.startedAt : 0
+  }
+
+  getLastCompletion(): FlowcastCompletion | null {
+    return this.lastCompletion
+  }
+
+  resolveExportDirectory(configuredDirectory?: string): string | null {
+    return resolveLocalExportDirectory(configuredDirectory)
   }
 
   /** Check the machine can do this at all, once at startup.
@@ -119,14 +141,38 @@ export class FlowcastController {
           throw new Error(caps?.h264_error ?? 'Screen recording is unavailable on this computer.')
         }
 
-        const auth = getAuthContext()
-        if (!auth) throw new Error('Please sign in before starting a screen recording.')
-        const preflight = await preflightRecording()
-        if (!preflight.enabled) {
-          throw new Error(preflight.reason ?? 'Screen recording is not enabled for this account yet.')
-        }
-        if (getAuthContext()?.ownerId !== auth.ownerId) {
-          throw new Error('The signed-in account changed while Flowcast was starting.')
+        const storageMode: FlowcastStorageMode =
+          options.storageMode === 'cloud' ? 'cloud' : 'onedrive'
+        let ownerId = LOCAL_MANIFEST_OWNER
+        let maximumSeconds = LOCAL_MAX_DURATION_SECONDS
+        let exportDirectory: string | null = null
+
+        if (storageMode === 'cloud') {
+          const auth = getAuthContext()
+          if (!auth) throw new Error('Please sign in before starting a screen recording.')
+          const preflight = await preflightRecording()
+          if (!preflight.enabled) {
+            throw new Error(preflight.reason ?? 'Screen recording is not enabled for this account yet.')
+          }
+          if (getAuthContext()?.ownerId !== auth.ownerId) {
+            throw new Error('The signed-in account changed while Flowcast was starting.')
+          }
+          ownerId = auth.ownerId
+          maximumSeconds = Math.max(1, preflight.maxDurationSeconds)
+        } else {
+          exportDirectory = this.resolveExportDirectory(options.exportDirectory)
+          if (!exportDirectory) {
+            throw new Error(
+              'OneDrive was not found. Choose a OneDrive folder in Settings → Flowcast first.',
+            )
+          }
+          await fs.promises.mkdir(exportDirectory, { recursive: true })
+          const exportFreeMb = await freeSpaceMb(exportDirectory)
+          if (exportFreeMb !== null && exportFreeMb < MIN_FREE_MB) {
+            throw new Error(
+              `Not enough OneDrive disk space — ${Math.round(exportFreeMb / 1024)} GB free. About 2 GB is needed.`,
+            )
+          }
         }
 
         const sessionId = randomUUID()
@@ -161,7 +207,8 @@ export class FlowcastController {
         this.manifest = {
           v: 1,
           sessionId,
-          ownerId: auth.ownerId,
+          ownerId,
+          destination: storageMode,
           state: 'recording',
           createdAtUnixMs: this.startedAt,
           file: path.join(dir, 'recording.mp4'),
@@ -170,23 +217,27 @@ export class FlowcastController {
           width: started.width,
           height: started.height,
           visibility: options.visibility,
+          localExportDirectory: exportDirectory ?? undefined,
         }
         await this.writeManifest()
+        this.activeStorageMode = storageMode
+        this.activeExportDirectory = exportDirectory
+        this.lastCompletion = null
         this.setState('recording')
-        const maximumSeconds = Math.max(1, preflight.maxDurationSeconds)
         this.maximumTimer = setTimeout(() => {
           this.events.onWarn?.('The maximum recording length was reached. Saving your recording now.')
           void this.stop()
         }, maximumSeconds * 1_000)
         this.maximumTimer.unref?.()
       } catch (error) {
+        this.activeExportDirectory = null
         this.setState('idle')
         throw error
       }
     })
   }
 
-  stop(discard = false): Promise<string | null> {
+  stop(discard = false): Promise<FlowcastCompletion | null> {
     return this.queue(async () => {
       if (this.state !== 'recording') return null
       this.setState('stopping')
@@ -211,6 +262,33 @@ export class FlowcastController {
         if (stopped.file) manifest.file = stopped.file
         await this.writeManifest()
 
+        if (this.activeStorageMode === 'onedrive') {
+          this.setState('saving')
+          const exportDirectory =
+            this.activeExportDirectory ?? this.resolveExportDirectory()
+          if (!exportDirectory) {
+            throw new Error(
+              'OneDrive was not found. The completed recording remains safely stored on this computer.',
+            )
+          }
+          const localFile = await exportFinalizedRecording(manifest.file, exportDirectory)
+          manifest.state = 'done'
+          manifest.localExportPath = localFile
+          manifest.error = undefined
+          await this.writeManifest()
+
+          const completion: FlowcastCompletion = {
+            storageMode: 'onedrive',
+            location: localFile,
+          }
+          this.lastCompletion = completion
+          this.events.onDone?.(completion)
+          this.manifest = null
+          this.activeExportDirectory = null
+          this.setState('idle')
+          return completion
+        }
+
         this.setState('uploading')
         const result = await uploadRecording(manifest, {
           onProgress: (progress) => this.setState('uploading', { percent: progress.percent }),
@@ -223,11 +301,17 @@ export class FlowcastController {
         // preview essentially forever. Private recordings deliberately have no
         // viewer link; their owner opens them from the authenticated library.
         if (manifest.visibility === 'unlisted') clipboard.writeText(result.shareUrl)
-        this.events.onDone?.(result.shareUrl)
+        const completion: FlowcastCompletion = {
+          storageMode: 'cloud',
+          location: result.shareUrl,
+        }
+        this.lastCompletion = completion
+        this.events.onDone?.(completion)
 
         this.manifest = null
+        this.activeExportDirectory = null
         this.setState('idle')
-        return result.shareUrl
+        return completion
       } catch (error) {
         log.error('[flowcast] stop failed', error)
         if (manifest) {
@@ -235,6 +319,7 @@ export class FlowcastController {
           manifest.error = error instanceof Error ? error.message : String(error)
           await this.writeManifest()
         }
+        this.activeExportDirectory = null
         this.setState('idle')
         this.events.onError?.(
           error instanceof Error ? error.message : 'The recording could not be saved.',
@@ -263,7 +348,6 @@ export class FlowcastController {
   private async doRecoverAbandonedSessions(): Promise<number> {
     const root = path.join(app.getPath('userData'), 'flowcast')
     const activeOwner = getAuthContext()?.ownerId
-    if (!activeOwner) return 0
     let recovered = 0
 
     let entries: string[]
@@ -281,7 +365,9 @@ export class FlowcastController {
           await fs.promises.readFile(manifestPath, 'utf8'),
         )
         if (manifest.state === 'done') continue
-        if (manifest.ownerId !== activeOwner) {
+        const destination: FlowcastStorageMode =
+          manifest.destination === 'onedrive' ? 'onedrive' : 'cloud'
+        if (destination === 'cloud' && (!activeOwner || manifest.ownerId !== activeOwner)) {
           log.warn(`[flowcast] leaving session ${entry} for its original account`)
           continue
         }
@@ -311,7 +397,25 @@ export class FlowcastController {
         if (stat.size === 0) continue
         manifest.bytes = stat.size
         manifest.state = 'stopped'
+        manifest.destination = destination
         await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2))
+
+        if (destination === 'onedrive') {
+          const exportDirectory = this.resolveExportDirectory(manifest.localExportDirectory)
+          if (!exportDirectory) {
+            log.warn(`[flowcast] OneDrive unavailable; leaving local session ${entry} for recovery`)
+            continue
+          }
+          const localFile = await exportFinalizedRecording(manifest.file, exportDirectory)
+          manifest.state = 'done'
+          manifest.localExportPath = localFile
+          manifest.error = undefined
+          await fs.promises.writeFile(manifestPath, JSON.stringify(manifest, null, 2))
+          this.lastCompletion = { storageMode: 'onedrive', location: localFile }
+          log.info(`[flowcast] recovered local recording ${localFile}`)
+          recovered++
+          continue
+        }
 
         log.info(`[flowcast] finishing an interrupted recording: ${manifest.sessionId}`)
         const result = await uploadRecording(manifest, {
@@ -398,6 +502,7 @@ export class FlowcastController {
       // Nothing to do — the weekly sweep will get it.
     }
     this.manifest = null
+    this.activeExportDirectory = null
   }
 }
 
