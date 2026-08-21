@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::capture::{CaptureState, LatestFrame};
+use crate::overlay::OverlayState;
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 
 #[derive(Clone, Debug)]
@@ -146,6 +147,7 @@ pub fn start_video(
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     state: Arc<CaptureState>,
+    overlay: Arc<OverlayState>,
 ) -> Result<VideoWorker, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -238,7 +240,19 @@ pub fn start_video(
                     break;
                 }
 
-                if let Err(err) = input.write_all(frame.as_slice()) {
+                let composited;
+                let output = if overlay.has_visuals() {
+                    composited = {
+                        let mut pixels = frame.as_slice().to_vec();
+                        overlay.composite(&mut pixels, input_width, input_height);
+                        pixels
+                    };
+                    composited.as_slice()
+                } else {
+                    frame.as_slice()
+                };
+
+                if let Err(err) = input.write_all(output) {
                     failure = Some(format!("the video encoder stopped accepting frames: {err}"));
                     break;
                 }

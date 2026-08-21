@@ -21,6 +21,7 @@
 mod audio;
 mod capture;
 mod ffmpeg;
+mod overlay;
 mod probe;
 mod protocol;
 
@@ -38,9 +39,11 @@ use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
+use windows_capture::window::Window;
 
 use crate::capture::{CaptureState, Flags, LatestFrame, Recorder};
 use crate::ffmpeg::{Runtime, VideoWorker};
+use crate::overlay::{CaptureBounds, OverlayState};
 use crate::protocol::{emit, log, AudioOpts, Command, Event, Source, VideoOpts};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -118,7 +121,16 @@ fn run_standalone(args: &[String], seconds: u64) -> i32 {
         audio.system
     ));
 
-    let session = match start_session("standalone", &out_path, source, video, audio, cursor, None) {
+    let session = match start_session(
+        "standalone",
+        &out_path,
+        source,
+        video,
+        audio,
+        cursor,
+        false,
+        None,
+    ) {
         Ok(session) => session,
         Err(message) => {
             log(&format!("could not start: {message}"));
@@ -210,6 +222,7 @@ fn run_server() {
                 source,
                 video,
                 audio,
+                click_highlight,
                 cursor,
                 parent_pid,
             } => {
@@ -236,6 +249,7 @@ fn run_server() {
                     video,
                     audio,
                     cursor,
+                    click_highlight,
                     parent_pid,
                 ) {
                     Ok(started) => {
@@ -305,6 +319,56 @@ fn run_server() {
                     }),
                 }
             }
+
+            Command::CameraLayout {
+                _id: _,
+                visible,
+                x,
+                y,
+                size,
+            } => {
+                if let Some(active) = session.as_ref() {
+                    if let Err(message) = active.overlay.set_camera_layout(visible, x, y, size) {
+                        emit(&Event::Warn {
+                            code: "overlay_rejected",
+                            message,
+                        });
+                    }
+                }
+            }
+
+            Command::CameraFrame { _id: _, data } => {
+                if let Some(active) = session.as_ref() {
+                    if let Err(message) = active.overlay.set_camera_frame(&data) {
+                        emit(&Event::Warn {
+                            code: "camera_frame_rejected",
+                            message,
+                        });
+                    }
+                }
+            }
+
+            Command::DrawStroke {
+                _id: _,
+                color,
+                width,
+                points,
+            } => {
+                if let Some(active) = session.as_ref() {
+                    if let Err(message) = active.overlay.add_stroke(color, width, points) {
+                        emit(&Event::Warn {
+                            code: "overlay_rejected",
+                            message,
+                        });
+                    }
+                }
+            }
+
+            Command::ClearInk { _id: _ } => {
+                if let Some(active) = session.as_ref() {
+                    active.overlay.clear_ink();
+                }
+            }
         }
     }
 
@@ -342,6 +406,8 @@ struct Session {
     video_worker: Option<VideoWorker>,
     audio_writer: Option<JoinHandle<Result<u64, String>>>,
     audio: Option<audio::AudioCapture>,
+    overlay: Arc<OverlayState>,
+    click_worker: Option<JoinHandle<()>>,
 }
 
 struct Stopped {
@@ -375,26 +441,51 @@ fn start_session(
     mut video: VideoOpts,
     audio_opts: AudioOpts,
     cursor: bool,
+    click_highlight: bool,
     parent_pid: Option<u32>,
 ) -> Result<Session, String> {
-    let Source::Monitor { index } = source;
+    enum CaptureTarget {
+        Monitor(Monitor),
+        Window(Window),
+    }
 
-    let monitor = match index {
-        Some(index) => Monitor::enumerate()
-            .map_err(|err| format!("could not list monitors: {err}"))?
-            .into_iter()
-            .nth(index)
-            .ok_or_else(|| format!("there is no monitor {index}"))?,
-        None => Monitor::primary().map_err(|err| format!("no primary monitor: {err}"))?,
+    let (target, capture_bounds) = match source {
+        Source::Monitor { index } => {
+            let monitor = match index {
+                Some(index) => Monitor::enumerate()
+                    .map_err(|err| format!("could not list monitors: {err}"))?
+                    .into_iter()
+                    .nth(index)
+                    .ok_or_else(|| format!("there is no monitor {index}"))?,
+                None => Monitor::primary().map_err(|err| format!("no primary monitor: {err}"))?,
+            };
+            let width = monitor.width().unwrap_or(MAX_WIDTH);
+            let height = monitor.height().unwrap_or(MAX_HEIGHT);
+            let bounds = monitor_bounds(&monitor).unwrap_or(CaptureBounds {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            });
+            (CaptureTarget::Monitor(monitor), bounds)
+        }
+        Source::Window { index } => {
+            let window = Window::enumerate()
+                .map_err(|err| format!("could not list windows: {err}"))?
+                .into_iter()
+                .nth(index)
+                .ok_or_else(|| format!("there is no capturable window {index}"))?;
+            let (x, y, width, height) = probe::window_capture_rect(&window)
+                .ok_or_else(|| "could not inspect the selected window".to_string())?;
+            let bounds = CaptureBounds {
+                x,
+                y,
+                width,
+                height,
+            };
+            (CaptureTarget::Window(window), bounds)
+        }
     };
-
-    // Fit the monitor into our size ceiling. A 4K display becomes 1920x1080
-    // rather than being recorded at four times the data for no benefit.
-    let native_width = monitor.width().unwrap_or(MAX_WIDTH);
-    let native_height = monitor.height().unwrap_or(MAX_HEIGHT);
-    let (fitted_width, fitted_height) = fit_within(native_width, native_height);
-    video.width = fitted_width;
-    video.height = fitted_height;
 
     let runtime = ffmpeg::resolve_runtime()?;
     ffmpeg::probe_h264(&runtime)?;
@@ -402,11 +493,90 @@ fn start_session(
     let stop = Arc::new(AtomicBool::new(false));
     let paused = Arc::new(AtomicBool::new(false));
     let state = Arc::new(CaptureState::default());
+    let overlay = Arc::new(OverlayState::default());
     let latest: LatestFrame = Arc::new(Mutex::new(None));
     let video_path = temporary_path(out_path, "video.tmp.mp4");
     let _ = std::fs::remove_file(&video_path);
 
-    let video_worker = ffmpeg::start_video(
+    // Audio channel is created up front but the capture threads are started
+    // AFTER the picture is recording — see below.
+    let flags = Flags {
+        latest: latest.clone(),
+        stop: stop.clone(),
+        state: state.clone(),
+        fps: video.fps,
+    };
+
+    let cursor_setting = if cursor {
+        CursorCaptureSettings::WithCursor
+    } else {
+        CursorCaptureSettings::WithoutCursor
+    };
+    // Controls and preview windows are excluded by Electron. The native
+    // compositor burns only intentional camera/ink/click visuals into BGRA.
+    let control_result = match target {
+        CaptureTarget::Monitor(monitor) => Recorder::start_free_threaded(Settings::new(
+            monitor,
+            cursor_setting,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            flags,
+        )),
+        CaptureTarget::Window(window) => Recorder::start_free_threaded(Settings::new(
+            window,
+            cursor_setting,
+            DrawBorderSettings::Default,
+            SecondaryWindowSettings::Default,
+            MinimumUpdateIntervalSettings::Default,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            flags,
+        )),
+    };
+
+    let control = match control_result {
+        Ok(control) => control,
+        Err(err) => {
+            stop.store(true, Ordering::Release);
+            let _ = std::fs::remove_file(&video_path);
+            return Err(format!("capture failed: {err}"));
+        }
+    };
+
+    // Window rectangles include invisible borders and title chrome. Wait for
+    // the first actual Graphics Capture frame before fixing the raw-pipe size.
+    let source_deadline = Instant::now() + START_TIMEOUT;
+    let (native_width, native_height) = loop {
+        if let Some(message) = state.take_error() {
+            stop.store(true, Ordering::Release);
+            let _ = control.stop();
+            let _ = std::fs::remove_file(&video_path);
+            return Err(message);
+        }
+        let width = state.source_width.load(Ordering::Acquire);
+        let height = state.source_height.load(Ordering::Acquire);
+        if width > 0 && height > 0 {
+            break (width, height);
+        }
+        if Instant::now() >= source_deadline {
+            stop.store(true, Ordering::Release);
+            let _ = control.stop();
+            let _ = std::fs::remove_file(&video_path);
+            return Err("the selected capture target did not produce a frame in time".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // Fit the actual capture surface into our size ceiling. A 4K source
+    // becomes 1920x1080 rather than being recorded at four times the data.
+    let (fitted_width, fitted_height) = fit_within(native_width, native_height);
+    video.width = fitted_width;
+    video.height = fitted_height;
+
+    let video_worker = match ffmpeg::start_video(
         runtime.clone(),
         video_path.clone(),
         native_width,
@@ -415,52 +585,18 @@ fn start_session(
         video.height,
         video.fps,
         video.bitrate,
-        latest.clone(),
+        latest,
         stop.clone(),
         paused.clone(),
         state.clone(),
-    )?;
-
-    // Audio channel is created up front but the capture threads are started
-    // AFTER the picture is recording — see below.
-    let flags = Flags {
-        latest,
-        stop: stop.clone(),
-        state: state.clone(),
-        fps: video.fps,
-    };
-
-    let settings = Settings::new(
-        monitor,
-        if cursor {
-            CursorCaptureSettings::WithCursor
-        } else {
-            CursorCaptureSettings::WithoutCursor
-        },
-        // NOTE: Windows draws a yellow border around whatever is being
-        // captured. `WithoutBorder` needs a capability only Microsoft Store
-        // apps can be granted, and Speakflow ships as a normal installer — so
-        // asking for it here would simply fail. Left at Default deliberately.
-        // If the border proves unacceptable, the fallback is DXGI Desktop
-        // Duplication, which has no border.
-        DrawBorderSettings::Default,
-        SecondaryWindowSettings::Default,
-        MinimumUpdateIntervalSettings::Default,
-        DirtyRegionSettings::Default,
-        // VideoEncoder declares its Direct3D input stream as BGRA8. Passing
-        // RGBA8 surfaces works until Media Foundation finalizes the transcode,
-        // then fails with E_FAIL and leaves a zero-byte MP4.
-        ColorFormat::Bgra8,
-        flags,
-    );
-
-    let control = match Recorder::start_free_threaded(settings) {
-        Ok(control) => control,
-        Err(err) => {
+        overlay.clone(),
+    ) {
+        Ok(worker) => worker,
+        Err(message) => {
             stop.store(true, Ordering::Release);
-            let _ = video_worker.finish();
+            let _ = control.stop();
             let _ = std::fs::remove_file(&video_path);
-            return Err(format!("capture failed: {err}"));
+            return Err(message);
         }
     };
 
@@ -533,6 +669,26 @@ fn start_session(
         watch_parent(pid, stop.clone());
     }
 
+    let click_worker = if click_highlight {
+        match overlay::start_click_watcher(
+            overlay.clone(),
+            capture_bounds,
+            stop.clone(),
+            paused.clone(),
+        ) {
+            Ok(worker) => Some(worker),
+            Err(message) => {
+                emit(&Event::Warn {
+                    code: "click_highlight_unavailable",
+                    message,
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(Session {
         session_id: session_id.to_string(),
         out_path: out_path.to_path_buf(),
@@ -550,6 +706,8 @@ fn start_session(
         video_worker: Some(video_worker),
         audio_writer,
         audio: audio_handle,
+        overlay,
+        click_worker,
     })
 }
 
@@ -560,6 +718,9 @@ fn stop_session(mut session: Session, discard: bool) -> Result<Stopped, String> 
 
     // Ask the capture thread to finalise on its next frame.
     session.stop.store(true, Ordering::Release);
+    if let Some(worker) = session.click_worker.take() {
+        let _ = worker.join();
+    }
 
     // If frames stopped arriving — a completely motionless screen, or a monitor
     // that went away — the handler never got the chance to finalise. Ending the
@@ -670,6 +831,26 @@ fn temporary_path(final_path: &Path, suffix: &str) -> PathBuf {
         .and_then(|value| value.to_str())
         .unwrap_or("recording");
     final_path.with_file_name(format!("{stem}.{suffix}"))
+}
+
+fn monitor_bounds(monitor: &Monitor) -> Option<CaptureBounds> {
+    use std::mem;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(mem::size_of::<MONITORINFO>()).ok()?,
+        ..MONITORINFO::default()
+    };
+    let handle = HMONITOR(monitor.as_raw_hmonitor());
+    if !unsafe { GetMonitorInfoW(handle, &mut info).as_bool() } {
+        return None;
+    }
+    Some(CaptureBounds {
+        x: info.rcMonitor.left,
+        y: info.rcMonitor.top,
+        width: u32::try_from(info.rcMonitor.right - info.rcMonitor.left).ok()?,
+        height: u32::try_from(info.rcMonitor.bottom - info.rcMonitor.top).ok()?,
+    })
 }
 
 fn recovery_metadata_path(final_path: &Path) -> PathBuf {

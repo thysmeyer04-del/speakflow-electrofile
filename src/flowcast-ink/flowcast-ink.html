@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flowcast drawing layer</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body, canvas { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+    canvas { display: block; cursor: crosshair; touch-action: none; }
+    body[data-enabled="false"] canvas { cursor: default; }
+  </style>
+</head>
+<body data-enabled="false">
+  <canvas aria-label="Flowcast temporary drawing layer"></canvas>
+  <script src="flowcast-ink.js"></script>
+</body>
+</html>

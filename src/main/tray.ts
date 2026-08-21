@@ -78,8 +78,8 @@ export function setupTray(mainWindow: BrowserWindow, flowcast: FlowcastControlle
       {
         label: flowcastBusy
           ? 'Stop screen recording'
-          : flowcastSettings.flowcastStorageMode === 'onedrive'
-            ? 'Start screen recording → OneDrive'
+          : flowcastSettings.flowcastStorageMode === 'local'
+            ? 'Start screen recording → Local folder'
             : 'Start screen recording',
         enabled: flowcastEnabled,
         click: () => {
@@ -91,6 +91,11 @@ export function setupTray(mainWindow: BrowserWindow, flowcast: FlowcastControlle
                 captureSystemAudio: settings.flowcastCaptureSystemAudio,
                 quality: settings.flowcastQuality,
                 cursor: settings.flowcastCursor,
+                clickHighlight: settings.flowcastClickHighlight,
+                cameraEnabled: settings.flowcastCameraEnabled,
+                cameraSize: settings.flowcastCameraSize,
+                cameraX: settings.flowcastCameraX,
+                cameraY: settings.flowcastCameraY,
                 visibility: settings.flowcastVisibility,
                 storageMode: settings.flowcastStorageMode,
                 exportDirectory: settings.flowcastExportDirectory,

@@ -82,7 +82,8 @@ const ALLOWED_CHOICE_SETTINGS: Record<string, Set<string>> = {
   streamingEngine: new Set(['off', 'deepgram']),
   flowcastQuality: new Set(['balanced', 'high']),
   flowcastVisibility: new Set(['private', 'unlisted']),
-  flowcastStorageMode: new Set(['onedrive', 'cloud']),
+  flowcastStorageMode: new Set(['local', 'onedrive']),
+  flowcastCameraSize: new Set(['small', 'medium', 'large']),
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
@@ -129,6 +130,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       | 'flowcastCaptureMic'
       | 'flowcastCaptureSystemAudio'
       | 'flowcastCursor'
+      | 'flowcastClickHighlight'
+      | 'flowcastCameraEnabled'
       | 'streamingTranscription',
     value: boolean,
   ): Promise<SettingsResult> => {
@@ -144,6 +147,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
       'flowcastCaptureMic',
       'flowcastCaptureSystemAudio',
       'flowcastCursor',
+      'flowcastClickHighlight',
+      'flowcastCameraEnabled',
       'streamingTranscription',
     ])
     if (!allowed.has(key)) return { ok: false, error: 'invalid-key' }
@@ -188,7 +193,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   flowcast: {
     status: () => privilegedInvoke('flowcast:get-status'),
     probe: () => privilegedInvoke('flowcast:probe'),
-    start: () => privilegedInvoke('flowcast:start'),
+    start: (options?: unknown) => privilegedInvoke('flowcast:start', options),
     pause: () => privilegedInvoke('flowcast:pause'),
     resume: () => privilegedInvoke('flowcast:resume'),
     stop: () => privilegedInvoke('flowcast:stop'),
@@ -196,7 +201,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     chooseExportDirectory: () => privilegedInvoke('flowcast:choose-export-directory'),
     openExportDirectory: () => privilegedInvoke('flowcast:open-export-directory'),
     openLastRecording: () => privilegedInvoke('flowcast:open-last-recording'),
-    playLastRecording: () => privilegedInvoke('flowcast:play-last-recording'),
     onState: (cb: (payload: unknown) => void) => on<unknown>('flowcast:state', cb),
     onDone: (cb: (result: unknown) => void) => on<unknown>('flowcast:done', cb),
     onError: (cb: (message: string) => void) => on<string>('flowcast:error', cb),

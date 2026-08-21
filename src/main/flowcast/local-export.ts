@@ -31,14 +31,32 @@ export function detectOneDriveRoot(
 
 export function resolveLocalExportDirectory(
   configuredDirectory?: string,
-  environment: Environment = process.env,
-  exists: Exists = fs.existsSync,
+  _environment: Environment = process.env,
+  _exists: Exists = fs.existsSync,
 ): string | null {
   const configured = configuredDirectory?.trim()
   if (configured && path.isAbsolute(configured)) return path.normalize(configured)
+  return null
+}
 
-  const root = detectOneDriveRoot(environment, exists)
-  return root ? path.join(root, DEFAULT_EXPORT_FOLDER_NAME) : null
+/** Create the folder if necessary and prove that this process can write,
+ * flush, and remove a file there before Flowcast is enabled. */
+export async function validateLocalExportDirectory(directory: string): Promise<string> {
+  if (!path.isAbsolute(directory)) throw new Error('Choose a valid absolute save folder.')
+  const normalized = path.normalize(directory)
+  await fs.promises.mkdir(normalized, { recursive: true })
+  const probe = path.join(normalized, `.speakflow-write-test-${randomUUID()}.tmp`)
+  try {
+    await fs.promises.writeFile(probe, 'Speakflow Flowcast folder check\n', { flag: 'wx' })
+    await flushFile(probe)
+  } catch (error) {
+    throw new Error(
+      `Flowcast cannot write to that folder: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  } finally {
+    await fs.promises.rm(probe, { force: true }).catch(() => undefined)
+  }
+  return normalized
 }
 
 function timestampForFilename(now: Date): string {
@@ -65,8 +83,8 @@ async function flushFile(file: string): Promise<void> {
   }
 }
 
-/** Copy an already-finalized MP4 to staging outside OneDrive, flush it, then
- *  atomically rename it into the sync directory. The EXDEV fallback uses a
+/** Copy an already-finalized MP4 to staging, flush it, then atomically rename
+ *  it into the destination directory. The EXDEV fallback uses a
  *  .partial name on the destination volume and only exposes the final .mp4
  *  name after the copy and flush complete. */
 export async function exportFinalizedRecording(
@@ -106,7 +124,7 @@ export async function exportFinalizedRecording(
 
     const exported = await fs.promises.stat(finalFile)
     if (!exported.isFile() || exported.size !== source.size) {
-      throw new Error('The OneDrive copy did not match the completed recording.')
+      throw new Error('The saved copy did not match the completed recording.')
     }
     return finalFile
   } finally {

@@ -24,8 +24,17 @@ windows-capture = "=2.0.1"
 # MIT/Apache-2.0. Used for the parent-process watchdog and disk-space checks.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+# MIT/Apache-2.0. Decodes bounded JPEG camera preview frames supplied by the
+# trusted Electron camera renderer before they are composited into BGRA.
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 # MIT. Microphone and system-audio (loopback) capture via WASAPI.
 wasapi = "0.23"

@@ -17,11 +17,11 @@
     }
     .dot { width: 10px; height: 10px; border-radius: 50%; background: #ff4d5e; box-shadow: 0 0 0 5px rgba(255,77,94,.15); }
     body[data-state="paused"] .dot { background: #f7b84b; box-shadow: 0 0 0 5px rgba(247,184,75,.14); }
-    .readout { width: 82px; line-height: 1.05; }
+    .readout { width: 78px; line-height: 1.05; }
     #timer { display: block; font-size: 17px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: .02em; }
     #status { display: block; margin-top: 4px; color: #aeb4c0; font-size: 10px; white-space: nowrap; }
     button {
-      -webkit-app-region: no-drag; height: 38px; padding: 0 13px; border: 0; border-radius: 11px;
+      -webkit-app-region: no-drag; height: 38px; padding: 0 11px; border: 0; border-radius: 11px;
       color: #f6f7f9; background: #353943; font: 600 12px/1 "Segoe UI", sans-serif; cursor: pointer;
     }
     button:hover:not(:disabled) { background: #454b58; }
@@ -29,12 +29,31 @@
     #stop { background: #e64858; }
     #stop:hover:not(:disabled) { background: #f25565; }
     #discard { width: 38px; padding: 0; color: #c8ccd5; background: transparent; font-size: 18px; }
+    .tool { min-width: 42px; padding: 0 9px; }
+    #color {
+      -webkit-app-region: no-drag; width: 42px; height: 38px; border: 0; border-radius: 11px;
+      color: transparent; background: #ff4652; cursor: pointer; padding: 0 4px;
+    }
+    #color option { color: #111; background: #fff; }
+    body[data-drawing="true"] #draw { background: #7257e8; }
+    body[data-camera="true"] #camera { background: #2e7d63; }
   </style>
 </head>
 <body data-state="starting">
   <main class="bar" aria-label="Flowcast recording controls">
     <span class="dot" aria-hidden="true"></span>
     <div class="readout"><span id="timer">00:00</span><span id="status">Starting capture…</span></div>
+    <button id="camera" class="tool" type="button" title="Toggle camera">Camera off</button>
+    <button id="camera-size" class="tool" type="button" title="Change camera size" disabled>S</button>
+    <button id="draw" class="tool" type="button" title="Draw on screen">Pen</button>
+    <select id="color" title="Drawing color" aria-label="Drawing color">
+      <option value="red">Red</option><option value="yellow">Yellow</option>
+      <option value="green">Green</option><option value="blue">Blue</option>
+      <option value="white">White</option>
+    </select>
+    <button id="width" class="tool" type="button" title="Change pen thickness">7px</button>
+    <button id="clear" class="tool" type="button" title="Clear drawings">Clear</button>
+    <button id="restart" class="tool" type="button" title="Discard and immediately restart">Restart</button>
     <button id="pause" type="button" disabled>Ⅱ Pause</button>
     <button id="stop" type="button" disabled>■ Stop & save</button>
     <button id="discard" type="button" title="Discard recording" aria-label="Discard recording" disabled>×</button>
