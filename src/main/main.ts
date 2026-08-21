@@ -38,6 +38,7 @@ import { isQuitting, markQuitting } from './quit-state'
 import { configureSecurity, isExternalUrlAllowed, isOriginTrusted } from './security'
 import { warmupInject, registerOwnWindowPid, unregisterOwnWindowPid } from './inject'
 import { FlowcastController } from './flowcast/controller'
+import { FlowcastOverlayCoordinator } from './flowcast/overlays'
 
 log.initialize()
 log.transports.file.level = 'info'
@@ -53,6 +54,7 @@ let mainWindow: BrowserWindow | null = null
 let overlayWindow: BrowserWindow | null = null
 let flowcastControlWindow: BrowserWindow | null = null
 let flowcastController: FlowcastController | null = null
+let flowcastOverlays: FlowcastOverlayCoordinator | null = null
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
 if (!gotSingleInstanceLock) {
@@ -412,9 +414,9 @@ function createOverlayWindow(): BrowserWindow {
 function createFlowcastControlWindow(): BrowserWindow {
   const { x, y, width, height } = screen.getPrimaryDisplay().workArea
   const win = new BrowserWindow({
-    width: 420,
+    width: 900,
     height: 72,
-    x: Math.floor(x + width / 2 - 210),
+    x: Math.floor(x + width / 2 - 450),
     y: Math.floor(y + height - 94),
     frame: false,
     transparent: true,
@@ -435,6 +437,8 @@ function createFlowcastControlWindow(): BrowserWindow {
 
   win.setAlwaysOnTop(true, 'screen-saver')
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  // Visible to the recorder, absent from the finished MP4.
+  win.setContentProtection(true)
   win.webContents.on('will-navigate', (event) => event.preventDefault())
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   win.webContents.on('render-process-gone', (_event, details) => {
@@ -450,7 +454,11 @@ function createFlowcastControlWindow(): BrowserWindow {
   return win
 }
 
-function setupFlowcastControlIPC(win: BrowserWindow, flowcast: FlowcastController): void {
+function setupFlowcastControlIPC(
+  win: BrowserWindow,
+  flowcast: FlowcastController,
+  overlays: FlowcastOverlayCoordinator,
+): void {
   const trusted = (senderId: number) => !win.isDestroyed() && senderId === win.webContents.id
   const install = <T>(channel: string, handler: () => T | Promise<T>) => {
     ipcMain.removeHandler(channel)
@@ -463,6 +471,7 @@ function setupFlowcastControlIPC(win: BrowserWindow, flowcast: FlowcastControlle
   install('flowcast-control:get-state', () => ({
     state: flowcast.getState(),
     elapsedMs: flowcast.elapsedMs(),
+    ...overlays.snapshot(),
   }))
   install('flowcast-control:pause-or-resume', async () => {
     try {
@@ -488,6 +497,29 @@ function setupFlowcastControlIPC(win: BrowserWindow, flowcast: FlowcastControlle
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : 'discard-failed' }
     }
+  })
+  install('flowcast-control:restart', async () => {
+    const options = flowcast.getActiveOptions()
+    if (!options) return { ok: false, error: 'nothing-to-restart' }
+    await flowcast.stop(true)
+    await flowcast.start(options)
+    return { ok: true }
+  })
+  install('flowcast-control:toggle-camera', () => ({ ok: true, ...overlays.toggleCamera() }))
+  install('flowcast-control:cycle-camera-size', () => ({ ok: true, ...overlays.cycleCameraSize() }))
+  install('flowcast-control:toggle-drawing', () => ({ ok: true, ...overlays.toggleDrawing() }))
+  ipcMain.removeHandler('flowcast-control:set-ink-color')
+  ipcMain.handle('flowcast-control:set-ink-color', (event, color: unknown) => {
+    if (!trusted(event.sender.id)) throw new Error('untrusted-sender')
+    if (!['red', 'yellow', 'green', 'blue', 'white'].includes(String(color))) {
+      return { ok: false, error: 'invalid-color' }
+    }
+    return { ok: true, ...overlays.setInkColor(color as 'red' | 'yellow' | 'green' | 'blue' | 'white') }
+  })
+  install('flowcast-control:cycle-ink-width', () => ({ ok: true, ...overlays.cycleInkWidth() }))
+  install('flowcast-control:clear-ink', () => {
+    overlays.clearInk()
+    return { ok: true }
   })
 }
 
@@ -516,7 +548,11 @@ function hardenSession() {
     const senderUrl = details?.requestingUrl ?? webContents?.getURL() ?? ''
     const isMain = senderId !== undefined && senderId === mainWindow?.webContents.id
     const isRecorder = senderUrl.startsWith('file://') && senderUrl.endsWith('/recorder.html')
-    const allowList = isMain || isRecorder ? new Set(['media']) : new Set<string>()
+    const isFlowcastCamera = senderUrl.startsWith('file://')
+      && senderUrl.endsWith('/flowcast-camera.html')
+    const allowList = isMain || isRecorder || isFlowcastCamera
+      ? new Set(['media'])
+      : new Set<string>()
     callback(allowList.has(permission))
   })
 }
@@ -532,7 +568,9 @@ app.whenReady().then(async () => {
   const flowcast = new FlowcastController({
     onState: (state, detail) => {
       setTrayFlowcastState(state)
-      const payload = { state, ...detail }
+      if (state === 'recording') flowcastOverlays?.start()
+      else if (state === 'idle') flowcastOverlays?.stop()
+      const payload = { state, ...detail, ...(flowcastOverlays?.snapshot() ?? {}) }
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('flowcast:state', payload)
       }
@@ -546,9 +584,9 @@ app.whenReady().then(async () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('flowcast:done', result)
       }
-      if (result.storageMode === 'onedrive' && Notification.isSupported()) {
+      if (result.storageMode === 'local' && Notification.isSupported()) {
         const notification = new Notification({
-          title: 'Flowcast saved to OneDrive',
+          title: 'Flowcast saved',
           body: 'Click to show the completed recording.',
         })
         notification.on('click', () => shell.showItemInFolder(result.location))
@@ -562,7 +600,9 @@ app.whenReady().then(async () => {
     },
   })
   flowcastController = flowcast
-  setupFlowcastControlIPC(flowcastControlWindow, flowcast)
+  flowcastOverlays = new FlowcastOverlayCoordinator(flowcast, path.join(__dirname, '..'))
+  flowcastOverlays.initialize()
+  setupFlowcastControlIPC(flowcastControlWindow, flowcast, flowcastOverlays)
 
   // Show the overlay window immediately at startup so its first paint cost
   // is paid before the user ever presses the hotkey. The .visible CSS class
@@ -680,6 +720,8 @@ app.on('before-quit', (event) => {
     flowcastController?.shutdown().catch((err) => log.warn('Shutdown Flowcast failed', err)),
   ])
     .finally(() => {
+      flowcastOverlays?.destroy()
+      flowcastOverlays = null
       destroyRecorder()
       app.exit(0)
     })

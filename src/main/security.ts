@@ -168,6 +168,8 @@ export type ToggleKey =
   | 'flowcastCaptureMic'
   | 'flowcastCaptureSystemAudio'
   | 'flowcastCursor'
+  | 'flowcastClickHighlight'
+  | 'flowcastCameraEnabled'
   // Legacy: the streamingTranscription setting was removed along with
   // segment-on-pause streaming (Fast Batch, 2026-07), but old DEPLOYED
   // dashboards still render the toggle and send this key over IPC. It stays
@@ -189,6 +191,8 @@ export function validateToggleKey(input: unknown): ToggleKey | null {
     'flowcastCaptureMic',
     'flowcastCaptureSystemAudio',
     'flowcastCursor',
+    'flowcastClickHighlight',
+    'flowcastCameraEnabled',
     'streamingTranscription', // accepted-but-ignored — see ToggleKey note
   ])
   return (allowed as Set<string>).has(input) ? (input as ToggleKey) : null
@@ -203,7 +207,8 @@ export type ChoiceSetting =
   | { key: 'streamingEngine'; value: 'off' | 'deepgram' }
   | { key: 'flowcastQuality'; value: 'balanced' | 'high' }
   | { key: 'flowcastVisibility'; value: 'private' | 'unlisted' }
-  | { key: 'flowcastStorageMode'; value: 'onedrive' | 'cloud' }
+  | { key: 'flowcastStorageMode'; value: 'local' | 'onedrive' }
+  | { key: 'flowcastCameraSize'; value: 'small' | 'medium' | 'large' }
 
 const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
   transcriptionMode: new Set(['cloud', 'local']),
@@ -212,7 +217,8 @@ const CHOICE_SETTINGS: Record<string, ReadonlySet<string>> = {
   streamingEngine: new Set(['off', 'deepgram']),
   flowcastQuality: new Set(['balanced', 'high']),
   flowcastVisibility: new Set(['private', 'unlisted']),
-  flowcastStorageMode: new Set(['onedrive', 'cloud']),
+  flowcastStorageMode: new Set(['local', 'onedrive']),
+  flowcastCameraSize: new Set(['small', 'medium', 'large']),
 }
 
 export function validateChoiceSetting(

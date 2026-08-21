@@ -33,12 +33,19 @@ export interface AppSettings {
   flowcastCaptureMic: boolean
   flowcastCaptureSystemAudio: boolean
   flowcastCursor: boolean
+  flowcastClickHighlight: boolean
+  flowcastCameraEnabled: boolean
+  flowcastCameraSize: 'small' | 'medium' | 'large'
+  // Normalized center point inside the selected capture target.
+  flowcastCameraX: number
+  flowcastCameraY: number
   flowcastQuality: 'balanced' | 'high'
   flowcastVisibility: 'private' | 'unlisted'
-  // OneDrive is the internal-test path and never contacts the Flowcast API.
-  // Cloud remains available behind the production profile/server gates.
-  flowcastStorageMode: 'onedrive' | 'cloud'
-  // Empty means auto-detect OneDrive and use "Speakflow Flowcast" below it.
+  // Local is the active product path and never contacts the Flowcast API.
+  // Cloud remains dormant behind the production profile/server gates.
+  flowcastStorageMode: 'local' | 'cloud'
+  // Empty means Flowcast has not been activated on this computer yet. The
+  // user must choose a folder before the enabled setting can become true.
   flowcastExportDirectory: string
   // NOTE: streamingTranscription was removed with the segment-on-pause
   // streaming feature (Fast Batch, 2026-07). Old deployed dashboards still
@@ -66,9 +73,14 @@ const defaults: AppSettings = {
   flowcastCaptureMic: true,
   flowcastCaptureSystemAudio: true,
   flowcastCursor: true,
+  flowcastClickHighlight: true,
+  flowcastCameraEnabled: false,
+  flowcastCameraSize: 'small',
+  flowcastCameraX: 0.14,
+  flowcastCameraY: 0.82,
   flowcastQuality: 'balanced',
   flowcastVisibility: 'private',
-  flowcastStorageMode: 'onedrive',
+  flowcastStorageMode: 'local',
   flowcastExportDirectory: '',
 }
 
@@ -98,6 +110,16 @@ const F11_MIGRATION_KEY = 'migratedF11Default' as const
 const flexStore = store as unknown as {
   get(key: string): unknown
   set(key: string, value: unknown): void
+}
+
+// Revision 18 renames the local destination from the implementation-specific
+// "OneDrive" label to what it always was technically: an arbitrary local
+// folder. Existing installations keep their selected path.
+if (flexStore.get('flowcastStorageMode') !== 'local') {
+  store.set('flowcastStorageMode', 'local')
+}
+if (store.get('flowcastEnabled') && !store.get('flowcastExportDirectory').trim()) {
+  store.set('flowcastEnabled', false)
 }
 
 // Product migration: Deepgram is the canonical speech-to-text provider.

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; media-src 'self' blob:" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Flowcast camera</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+    body { -webkit-app-region: drag; cursor: move; user-select: none; }
+    .bubble {
+      width: 100%; height: 100%; overflow: hidden; border-radius: 50%;
+      border: 3px solid rgba(255,255,255,.94); background: #171920;
+      box-shadow: 0 12px 36px rgba(0,0,0,.38);
+    }
+    video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); opacity: 0; }
+    body[data-ready="true"] video { opacity: 1; }
+  </style>
+</head>
+<body data-ready="false">
+  <div class="bubble"><video autoplay muted playsinline></video></div>
+  <script src="flowcast-camera.js"></script>
+</body>
+</html>

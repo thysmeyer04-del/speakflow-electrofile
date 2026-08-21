@@ -19,7 +19,15 @@ import path from 'node:path'
 import { app } from 'electron'
 import log from 'electron-log/main'
 
-import type { Caps, Command, Event, StartCommand } from './types'
+import type {
+  CameraSize,
+  Caps,
+  Command,
+  Event,
+  InkColor,
+  OverlayPoint,
+  StartCommand,
+} from './types'
 import { FLOWCAST_PROTOCOL_VERSION } from './types'
 
 const START_TIMEOUT_MS = 8_000
@@ -138,6 +146,29 @@ export class Sidecar {
     if (event.ev !== 'paused' || event.paused !== paused) {
       throw new Error(`the recorder did not confirm ${paused ? 'pause' : 'resume'}`)
     }
+  }
+
+  setCameraLayout(visible: boolean, x: number, y: number, size: CameraSize): void {
+    this.send({ cmd: 'camera_layout', visible, x, y, size })
+  }
+
+  setCameraFrame(jpeg: Uint8Array): void {
+    if (jpeg.byteLength === 0 || jpeg.byteLength > 500_000) return
+    // Camera frames are disposable. If the native decoder is briefly slower
+    // than the renderer, keep the newest future frame instead of growing the
+    // stdin queue with stale JPEGs.
+    if (!this.child || this.child.stdin.destroyed || this.child.stdin.writableEnded
+      || this.child.stdin.writableNeedDrain) return
+    this.send({ cmd: 'camera_frame', data: Buffer.from(jpeg).toString('base64') })
+  }
+
+  addStroke(color: InkColor, width: number, points: OverlayPoint[]): void {
+    if (points.length < 2 || points.length > 512) return
+    this.send({ cmd: 'draw_stroke', color, width, points })
+  }
+
+  clearInk(): void {
+    this.send({ cmd: 'clear_ink' })
   }
 
   /** Resolves once the file has been finalised and is playable. */

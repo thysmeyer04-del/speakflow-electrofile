@@ -9,6 +9,7 @@ import {
   detectOneDriveRoot,
   exportFinalizedRecording,
   resolveLocalExportDirectory,
+  validateLocalExportDirectory,
 } from './local-export'
 
 test('OneDrive detection prefers the business sync root and ignores relative paths', () => {
@@ -21,15 +22,23 @@ test('OneDrive detection prefers the business sync root and ignores relative pat
   const exists = (candidate: string): boolean => existing.has(path.normalize(candidate))
 
   assert.equal(detectOneDriveRoot(environment, exists), path.normalize('C:\\Business'))
-  assert.equal(
-    resolveLocalExportDirectory(undefined, environment, exists),
-    path.join(path.normalize('C:\\Business'), DEFAULT_EXPORT_FOLDER_NAME),
-  )
+  assert.equal(resolveLocalExportDirectory(undefined, environment, exists), null)
 })
 
 test('an explicitly selected absolute folder overrides OneDrive auto-detection', () => {
   const selected = path.resolve('chosen-flowcast-folder')
   assert.equal(resolveLocalExportDirectory(selected, {}, () => false), selected)
+})
+
+test('the selected local folder is created and verified as writable', async () => {
+  const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'speakflow-flowcast-folder-'))
+  try {
+    const selected = path.join(root, 'new destination')
+    assert.equal(await validateLocalExportDirectory(selected), path.normalize(selected))
+    assert.equal((await fs.promises.readdir(selected)).length, 0)
+  } finally {
+    await fs.promises.rm(root, { recursive: true, force: true })
+  }
 })
 
 test('a finalized MP4 is exported under its final name with no partial files left behind', async () => {
@@ -63,7 +72,7 @@ test('a finalized MP4 is exported under its final name with no partial files lef
   }
 })
 
-test('OneDrive mode bypasses cloud admission and exports only after the recorder stops', () => {
+test('local mode bypasses cloud admission and exports only after the recorder stops', () => {
   const controller = fs.readFileSync(
     path.join(process.cwd(), 'src', 'main', 'flowcast', 'controller.ts'),
     'utf8',

@@ -65,12 +65,17 @@ declare global {
         state: string
         elapsedMs: number
         enabled: boolean
-        storageMode: 'onedrive' | 'cloud'
+        storageMode: 'local' | 'cloud'
         exportDirectory: string | null
         lastSavedFile: string | null
       }>
       probe: () => Promise<{ ok: boolean; caps: unknown }>
-      start: () => Promise<{ ok: boolean; error?: string }>
+      start: (options?: {
+        source?: { kind: 'monitor' | 'window'; index: number }
+        cameraEnabled?: boolean
+        cameraSize?: 'small' | 'medium' | 'large'
+        clickHighlight?: boolean
+      }) => Promise<{ ok: boolean; error?: string }>
       pause: () => Promise<{ ok: boolean; error?: string }>
       resume: () => Promise<{ ok: boolean; error?: string }>
       stop: () => Promise<{
@@ -82,10 +87,9 @@ declare global {
       chooseExportDirectory: () => Promise<{ ok: boolean; directory?: string; error?: string }>
       openExportDirectory: () => Promise<{ ok: boolean; error?: string }>
       openLastRecording: () => Promise<{ ok: boolean; error?: string }>
-      playLastRecording: () => Promise<{ ok: boolean; error?: string }>
       onState: (cb: (payload: unknown) => void) => () => void
       onDone: (cb: (result: {
-        storageMode: 'onedrive' | 'cloud'
+        storageMode: 'local' | 'cloud'
         location: string
       }) => void) => () => void
       onError: (cb: (message: string) => void) => () => void
@@ -128,6 +132,8 @@ declare global {
         | 'flowcastCaptureMic'
         | 'flowcastCaptureSystemAudio'
         | 'flowcastCursor'
+        | 'flowcastClickHighlight'
+        | 'flowcastCameraEnabled'
         | 'streamingTranscription',
       value: boolean,
     ) => Promise<{ ok: boolean; error?: string }>
@@ -138,7 +144,8 @@ declare global {
         | 'streamingEngine'
         | 'flowcastQuality'
         | 'flowcastVisibility'
-        | 'flowcastStorageMode',
+        | 'flowcastStorageMode'
+        | 'flowcastCameraSize',
       value: string,
     ) => Promise<{ ok: boolean; error?: string }>
     getSettings: () => Promise<Record<string, unknown>>

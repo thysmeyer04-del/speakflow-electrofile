@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped only on a breaking change. Electron refuses to talk to a version it
 /// does not know.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 // ── Commands (Electron -> recorder) ─────────────────────────────────────────
 
@@ -45,6 +45,9 @@ pub enum Command {
         video: VideoOpts,
         #[serde(default)]
         audio: AudioOpts,
+        /// Add a short ripple around primary mouse clicks.
+        #[serde(default)]
+        click_highlight: bool,
         /// Show the mouse pointer in the recording.
         #[serde(default = "default_true")]
         cursor: bool,
@@ -66,6 +69,39 @@ pub enum Command {
 
     /// Stop and delete the output file.
     Abort { id: u64 },
+
+    /// Update the optional circular camera overlay. Coordinates are normalized
+    /// to the selected capture target and are validated again by the recorder.
+    CameraLayout {
+        #[serde(rename = "id")]
+        _id: u64,
+        visible: bool,
+        x: f32,
+        y: f32,
+        size: CameraSize,
+    },
+
+    /// A bounded square JPEG from Electron's permission-isolated camera page.
+    CameraFrame {
+        #[serde(rename = "id")]
+        _id: u64,
+        data: String,
+    },
+
+    /// Add one completed temporary ink stroke.
+    DrawStroke {
+        #[serde(rename = "id")]
+        _id: u64,
+        color: InkColor,
+        width: u8,
+        points: Vec<OverlayPoint>,
+    },
+
+    /// Remove all temporary ink immediately.
+    ClearInk {
+        #[serde(rename = "id")]
+        _id: u64,
+    },
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -77,12 +113,38 @@ pub enum Source {
         #[serde(default)]
         index: Option<usize>,
     },
+    /// A position in the capturable-window list returned by `probe`.
+    Window { index: usize },
 }
 
 impl Default for Source {
     fn default() -> Self {
         Source::Monitor { index: None }
     }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraSize {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum InkColor {
+    Red,
+    Yellow,
+    Green,
+    Blue,
+    White,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct OverlayPoint {
+    pub x: f32,
+    pub y: f32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -216,6 +278,7 @@ pub struct Caps {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub h264_error: Option<String>,
     pub monitors: Vec<MonitorInfo>,
+    pub windows: Vec<WindowInfo>,
     pub microphones: Vec<DeviceInfo>,
 }
 
@@ -226,6 +289,19 @@ pub struct MonitorInfo {
     pub device_name: String,
     pub width: u32,
     pub height: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WindowInfo {
+    pub index: usize,
+    pub title: String,
+    pub process_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Debug, Serialize)]

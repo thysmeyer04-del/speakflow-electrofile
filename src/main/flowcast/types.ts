@@ -1,7 +1,11 @@
 // The other half of the wire protocol. These MUST stay in step with
 // flowcast/recorder/src/protocol.rs — if you change one, change the other.
 
-export const FLOWCAST_PROTOCOL_VERSION = 1
+export const FLOWCAST_PROTOCOL_VERSION = 2
+
+export type CameraSize = 'small' | 'medium' | 'large'
+export type InkColor = 'red' | 'yellow' | 'green' | 'blue' | 'white'
+export interface OverlayPoint { x: number; y: number }
 
 // ── Commands we send ────────────────────────────────────────────────────────
 
@@ -10,9 +14,10 @@ export interface StartCommand {
   session: string
   /** Must already exist. The recorder writes `recording.mp4` inside it. */
   out_dir: string
-  source: { kind: 'monitor'; index?: number }
+  source: { kind: 'monitor'; index?: number } | { kind: 'window'; index: number }
   video: { width: number; height: number; fps: number; bitrate: number }
   audio: { mic: boolean; system: boolean; bitrate: number }
+  click_highlight: boolean
   cursor: boolean
   /** So the recorder exits if Electron disappears without closing its input. */
   parent_pid: number
@@ -25,6 +30,10 @@ export type Command =
   | { cmd: 'resume' }
   | { cmd: 'stop' }
   | { cmd: 'abort' }
+  | { cmd: 'camera_layout'; visible: boolean; x: number; y: number; size: CameraSize }
+  | { cmd: 'camera_frame'; data: string }
+  | { cmd: 'draw_stroke'; color: InkColor; width: number; points: OverlayPoint[] }
+  | { cmd: 'clear_ink' }
 
 // ── Events we receive ───────────────────────────────────────────────────────
 
@@ -34,6 +43,18 @@ export interface MonitorInfo {
   device_name: string
   width: number
   height: number
+  x: number
+  y: number
+}
+
+export interface WindowInfo {
+  index: number
+  title: string
+  process_name: string
+  width: number
+  height: number
+  x: number
+  y: number
 }
 
 export interface DeviceInfo {
@@ -49,6 +70,7 @@ export interface Caps {
   h264_available: boolean
   h264_error?: string
   monitors: MonitorInfo[]
+  windows: WindowInfo[]
   microphones: DeviceInfo[]
 }
 
@@ -103,9 +125,9 @@ export interface SessionManifest {
   /** Supabase subject that created the recording. Recovery must never upload
    *  this file while a different account is active. */
   ownerId: string
-  /** Cloud is the production multipart path. OneDrive is the internal-test
-   *  path that exports only a completed, validated MP4 to a local sync folder. */
-  destination?: 'cloud' | 'onedrive'
+  /** Cloud is the dormant multipart path. Local exports only a completed,
+   *  validated MP4 to the selected folder. `onedrive` is a legacy value. */
+  destination?: 'cloud' | 'local' | 'onedrive'
   state: 'recording' | 'stopped' | 'uploading' | 'done' | 'failed'
   createdAtUnixMs: number
   file: string
@@ -119,9 +141,9 @@ export interface SessionManifest {
   createRequestId?: string
   shareId?: string
   shareUrl?: string
-  /** Present after a local test recording has been copied successfully. */
+  /** Present after a local recording has been copied successfully. */
   localExportPath?: string
-  /** The user-selected local sync folder, used only to resume a local export
+  /** The user-selected folder, used only to resume a local export
    *  after a crash. It is never sent to the server. */
   localExportDirectory?: string
   uploadId?: string
