@@ -4,9 +4,8 @@
 // local-whisper-worker.ts): onnxruntime inference can hard-crash at the
 // native level, and in-process that killed the whole app mid-dictation.
 // Here a worker crash only rejects the in-flight requests — callers fall
-// back to cloud — and after MAX_CRASHES the app auto-reverts the
-// transcriptionMode setting to 'cloud' so a machine that can't run the
-// model never degrades the dictation experience.
+// back to cloud when permitted. Repeated crashes pause the local worker
+// until restart; the user's selected mode is never silently changed.
 //
 // The model downloads from HuggingFace on first use and is cached under
 // userData/models, after which transcription is fully offline.
