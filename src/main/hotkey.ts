@@ -1,5 +1,5 @@
 import { getDictationPreferences } from './dictation-review'
-import { getAuthContext } from './ipc'
+import { getPreferenceOwner } from './ipc'
 import { watchKeyRelease, cancelHold, holdAvailable } from './hold-to-talk'
 import { globalShortcut, BrowserWindow } from 'electron'
 import log from 'electron-log/main'
@@ -118,7 +118,7 @@ function tryRegisterCandidate(acc: string): string | null {
   try {
     const ok = globalShortcut.register(acc, () => {
       log.info(`[timing] hotkey fired at ${Date.now()}`)
-      if (getDictationPreferences(getAuthContext()?.ownerId ?? null).hotkeyMode === 'hold' && holdAvailable(acc)) {
+      if (getDictationPreferences(getPreferenceOwner()).hotkeyMode === 'hold' && holdAvailable(acc)) {
         if (holdPending || getRecordingState() !== 'idle') return
         holdPending = true
         const started = startRecording().catch(error => { log.warn('[hold] recording did not start', error) })

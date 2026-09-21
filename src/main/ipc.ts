@@ -647,3 +647,6 @@ export function setupIPC({
     trayCallback?.(s === 'recording')
   })
 }
+
+/** Account identity survives token refresh but is cleared on sign-out. */
+export function getPreferenceOwner(): string | null { return contextOwner }
