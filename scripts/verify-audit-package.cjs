@@ -13,7 +13,7 @@ function walk(directory) {
     const file = path.join(directory, entry.name)
     if (entry.isDirectory()) walk(file)
     else if (!file.endsWith('.map') && !file.endsWith('.ts')) {
-      const relative = path.relative(process.cwd(), file).split(path.sep).join('/')
+      const relative = path.relative(process.cwd(), file)
       assert.ok(fs.readFileSync(file).equals(asar.extractFile(archive, relative)), `stale packaged file: ${relative}`)
       checked++
     }
