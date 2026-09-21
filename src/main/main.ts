@@ -19,6 +19,7 @@ import {
   setTrayUpdatePending,
 } from './tray'
 import { registerHotkey, unregisterHotkey, reassertHotkey } from './hotkey'
+import { registerRecoveryShortcut, unregisterRecoveryShortcut } from './recovery'
 import { initCommandsStore, getCommands } from './commands-store'
 import {
   registerCommandHotkeys,
@@ -671,6 +672,7 @@ app.whenReady().then(async () => {
   registerHotkey(getSettings().hotkey)
   initCommandsStore()
   registerCommandHotkeys(getCommands())
+  registerRecoveryShortcut()
   // onPendingChange keeps the tray entry in sync without updater.ts importing
   // tray.ts (tray already imports updater — one direction only, no cycle).
   setupAutoUpdater(mainWindow, { onPendingChange: setTrayUpdatePending })
@@ -714,6 +716,7 @@ app.on('before-quit', (event) => {
   }
   unregisterHotkey()
   unregisterAllCommandHotkeys()
+  unregisterRecoveryShortcut()
   event.preventDefault()
   Promise.all([
     shutdownRecording().catch((err) => log.warn('Shutdown recording failed', err)),
