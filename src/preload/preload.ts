@@ -87,6 +87,7 @@ const ALLOWED_CHOICE_SETTINGS: Record<string, Set<string>> = {
 }
 
 contextBridge.exposeInMainWorld('electronAPI', {
+  dictationProduct: (request: unknown) => privilegedInvoke('dictation:product', request),
   // ── Recording state listeners (main → renderer) ────────────────────────────
   onRecordingStarted: (cb: () => void) => on<void>('recording-started', cb),
   onRecordingStopped: (cb: () => void) => on<void>('recording-stopped', cb),

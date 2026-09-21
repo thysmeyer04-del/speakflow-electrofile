@@ -27,6 +27,7 @@ const logStub = new Proxy(function () {}, {
 })
 
 const electronStub = {
+  safeStorage: { isEncryptionAvailable: () => true, encryptString: s => Buffer.from(s), decryptString: b => b.toString() },
   app: {
     getPath: () => os.tmpdir(),
     getVersion: () => '0.0.0-test',

@@ -1,6 +1,6 @@
 {
   "name": "speakflow-desktop",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Speakflow — voice-to-text desktop app powered by Deepgram Nova-3",
   "main": "dist/main/main.js",
   "author": {
@@ -17,7 +17,7 @@
     "test": "npm run build:test && node --require ./scripts/test-bootstrap.cjs --test \"dist-test/**/*.test.js\"",
     "build:assets": "node scripts/copy-assets.mjs",
     "build:flowcast": "node scripts/build-flowcast.mjs",
-    "build": "npm run clean && npm run build:flowcast && npm run build:ts && npm run build:assets",
+    "build": "npm run clean && npm run build:hold && npm run build:flowcast && npm run build:ts && npm run build:assets",
     "dev:ts": "tsc -p tsconfig.json -w --preserveWatchOutput",
     "dev:electron": "wait-on dist/main/main.js && cross-env NODE_ENV=development node scripts/launch-electron.mjs",
     "dev": "npm run clean && npm run build:assets && concurrently -k -n tsc,electron -c blue,green \"npm:dev:ts\" \"npm:dev:electron\"",
@@ -26,7 +26,8 @@
     "dist:win": "npm run build && electron-builder --win",
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:linux": "npm run build && electron-builder --linux",
-    "dist": "npm run build && electron-builder"
+    "dist": "npm run build && electron-builder",
+    "build:hold": "node scripts/build-hold-key.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

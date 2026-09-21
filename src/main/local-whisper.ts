@@ -16,7 +16,6 @@ import type { UtilityProcess } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import log from 'electron-log/main'
-import { setSetting } from './settings'
 
 const MAX_CRASHES = 2
 const LOAD_TIMEOUT_MS = 15 * 60_000 // generous: covers the one-off download
@@ -67,13 +66,8 @@ function handleWorkerExit(code: number): void {
   workerReady = null
   crashCount++
   if (crashCount >= MAX_CRASHES) {
-    log.error('[local-whisper] repeated worker crashes — reverting transcriptionMode to cloud')
-    broadcastStatus('Local Whisper keeps failing on this machine — switched back to cloud.')
-    try {
-      setSetting('transcriptionMode', 'cloud')
-    } catch (err) {
-      log.warn('[local-whisper] failed to revert transcriptionMode', err)
-    }
+    log.error('[local-whisper] repeated worker crashes; local mode paused until restart')
+    broadcastStatus('Local speech recognition failed. Restart Speakflow or choose Cloud in settings. Your mode was not changed.')
   }
 }
 
