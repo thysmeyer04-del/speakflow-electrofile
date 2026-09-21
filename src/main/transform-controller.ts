@@ -45,7 +45,7 @@ export function handleCommandHotkey(commandId: string): Promise<void> {
 
 export function abortInFlightTransform(): void { currentAbort?.abort() }
 
-async function captureSelection(target: WindowSnapshot, signal: AbortSignal): Promise<string | null> {
+export async function captureSelection(target: WindowSnapshot, signal: AbortSignal): Promise<string | null> {
   return withClipboard(async () => {
     if (signal.aborted) return null
     const restore = snapshotClipboard()
@@ -93,6 +93,11 @@ async function doRunTransform(commandId: string, signal: AbortSignal): Promise<v
   const selected = await captureSelection(target, signal)
   if (signal.aborted || getRecordingState() !== 'idle') return
   if (!sameTarget(target, await captureFocusTarget())) throw new Error('Focus changed. Select the text again and retry.')
+  if (cmd.id === 'seed-voice-edit') {
+    if (!selected?.trim()) throw new Error('Select the text you want to edit, then use Voice Edit.')
+    await startCommandRecording(cmd.id, { selected, target })
+    return
+  }
   if (!selected?.trim()) {
     await startCommandRecording(cmd.id)
     return

@@ -81,6 +81,7 @@ function buildDeepgramListenUrl(language?: string): string {
 }
 
 interface TranscribeOptions {
+  offlineOnly?: boolean
   language?: string
   // 16 kHz mono PCM from the recorder — enables the on-device Whisper path.
   pcm?: Float32Array | null
@@ -157,10 +158,12 @@ export async function transcribeAudio(
       log.info(`[timing] transcription path=local took ${Date.now() - t0}ms`)
       return text
     } catch (err) {
+      if (opts.offlineOnly) throw err
       log.warn('[transcribe] local whisper failed — falling back to cloud', err)
     }
   }
 
+  if (opts.offlineOnly) throw new Error('Offline transcription requires a downloaded local model and microphone audio. No cloud fallback was used.')
   const t0 = Date.now()
   try {
     const text = await transcribeViaCloud(audio, opts)

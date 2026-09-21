@@ -78,6 +78,15 @@ test('transform lifecycle protects selection, cancellation, and command hotkeys'
     assert.equal(pastes, before)
     title = 'Editor'
   })
+  await t.test('Voice Edit captures selection and starts instruction recording without pasting', async () => {
+    const before = pastes
+    let context: {selected: string} | undefined
+    recorder.startCommandRecording = async (id: string, selected?: {selected: string}) => { started = id; context = selected }
+    await handleCommandHotkey('seed-voice-edit')
+    assert.equal(started, 'seed-voice-edit')
+    assert.equal(context?.selected, selection)
+    assert.equal(pastes, before)
+  })
   await t.test('no selection starts dictation and matching shortcut stops it', async () => {
     selection = ''
     await handleCommandHotkey('seed-email')

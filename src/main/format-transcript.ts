@@ -21,6 +21,9 @@ let currentFormatAbort: AbortController | null = null
 
 interface FormatOptions {
   stripDisfluencies: boolean
+  cleanup?: "clean" | "rewrite"
+  style?: "preserve" | "professional" | "casual"
+  deadlineMs?: number
   // Personal-dictionary words — appended to the system prompt as preferred
   // spellings so "krisjan" becomes the user's "Christiaan", etc.
   dictionaryWords?: string[]
@@ -208,8 +211,12 @@ export function sanityCheck(
   // least 75% of content words (3+ letters) in the formatted output also
   // appear in the raw input. A genuine reformat only rearranges whitespace and
   // punctuation — it introduces very few new words.
-  const rawWords = new Set(raw.toLowerCase().match(/\b[a-z]{3,}\b/g) ?? [])
-  const fmtWords = formatted.toLowerCase().match(/\b[a-z]{3,}\b/g) ?? []
+  // Present-tense agreement fixes are not new content ("we is" -> "we are").
+  // Do not equate past/future forms: tense remains meaningful.
+  const agreement: Record<string, string> = { am: 'present-be', is: 'present-be', are: 'present-be', has: 'present-have', have: 'present-have', does: 'present-do', do: 'present-do' }
+  const contentWords = (text: string) => (text.toLowerCase().match(/\b[a-z]{2,}\b/g) ?? []).map(word => agreement[word] ?? word).filter(word => word.length >= 3)
+  const rawWords = new Set(contentWords(raw))
+  const fmtWords = contentWords(formatted)
   if (fmtWords.length > 0) {
     const overlap = fmtWords.filter((w) => rawWords.has(w)).length / fmtWords.length
     if (overlap < 0.75) return false
@@ -1277,7 +1284,12 @@ Preferred spellings — if the transcript contains a similar-sounding word, use 
 
 Return only the reformatted text.`
 
-  return base + dictionaryNote + contextNote + tail
+  const preference = options.cleanup === 'rewrite' ? '\nThe user explicitly chose Rewrite: you may repair sentence structure and reduce repetition, but preserve every distinct idea, fact, negation and uncertainty. Do not summarize away details.' : ''
+  const style = options.style && options.style !== 'preserve' ? '\nWriting style: ' + options.style + '. Adjust punctuation and formality only; never change certainty or commitments.' : ''
+  const modeBase = options.cleanup === 'rewrite'
+    ? base.replace('No paraphrasing, synonyms, reordering, condensing, summarising or invented content.', 'No summarising away details or invented content.').replace('Keep the same sentences and vocabulary wherever possible; fix grammar only when the intended meaning is unambiguous.', 'Improve sentence flow without changing the intended meaning.')
+    : base
+  return modeBase + dictionaryNote + contextNote + preference + style + tail
 }
 
 /** Strip code fences and matched outer quotes the model sometimes adds. */
@@ -1310,7 +1322,7 @@ export async function formatTranscript(
   const controller = new AbortController()
   // Polishing is optional. A slow writer must not hold an already recognized
   // dictation for the transform client's 30-second request timeout.
-  const timeout = setTimeout(() => controller.abort(), 2_500)
+  const timeout = setTimeout(() => controller.abort(), options.deadlineMs ?? 2_500)
   const onAbort = () => controller.abort()
   if (signal) {
     if (signal.aborted) controller.abort()

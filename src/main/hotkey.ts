@@ -1,11 +1,15 @@
+import { getDictationPreferences } from './dictation-review'
+import { getPreferenceOwner } from './ipc'
+import { watchKeyRelease, cancelHold, holdAvailable } from './hold-to-talk'
 import { globalShortcut, BrowserWindow } from 'electron'
 import log from 'electron-log/main'
-import { toggleRecording } from './recording-controller'
+import { startRecording, stopRecording, getRecordingState, toggleRecording } from './recording-controller'
 
 // Default fallback in case the user's preferred accelerator (e.g. Ctrl+Meta)
 // fails to register — modifier-only / OS-reserved combos are unreliable.
 const SAFE_FALLBACK = 'Control+Shift+Space'
 
+let holdPending = false
 let currentAccelerator: string | null = null
 // The accelerator the user actually wants (e.g. F11). The watchdog keeps
 // trying to (re)claim THIS even if we're temporarily parked on the fallback.
@@ -114,7 +118,12 @@ function tryRegisterCandidate(acc: string): string | null {
   try {
     const ok = globalShortcut.register(acc, () => {
       log.info(`[timing] hotkey fired at ${Date.now()}`)
-      void toggleRecording()
+      if (getDictationPreferences(getPreferenceOwner()).hotkeyMode === 'hold' && holdAvailable(acc)) {
+        if (holdPending || getRecordingState() !== 'idle') return
+        holdPending = true
+        const started = startRecording().catch(error => { log.warn('[hold] recording did not start', error) })
+        watchKeyRelease(acc, () => { holdPending = false; void started.then(() => { if (getRecordingState() === 'recording') return stopRecording() }).catch(() => undefined) })
+      } else { void toggleRecording() }
     })
     if (!ok) {
       log.warn(`globalShortcut.register("${acc}") returned false — OS or another app likely holds this key`)
@@ -127,6 +136,8 @@ function tryRegisterCandidate(acc: string): string | null {
 }
 
 export function unregisterHotkey(): void {
+  holdPending = false
+  cancelHold()
   stopWatchdog()
   preferredAccelerator = null
   if (currentAccelerator) {

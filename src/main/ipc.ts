@@ -1,3 +1,6 @@
+import { getDictationReview, saveDictationPreferences, rememberCorrection, forgetCorrection, clearDictationReviews } from './dictation-review'
+import { validatePreferences } from './dictation-preferences'
+import { holdAvailable } from './hold-to-talk'
 import { ipcMain, app, BrowserWindow, dialog, shell, IpcMainEvent, IpcMainInvokeEvent } from 'electron'
 import fs from 'node:fs'
 import log from 'electron-log/main'
@@ -232,6 +235,28 @@ export function setupIPC({
   })
 
   gatedHandle('settings:get', () => getSettings())
+  gatedHandle<Record<string, unknown>, unknown>('dictation:product', async (_event, raw) => {
+    const owner = getAuthContext()?.ownerId
+    if (!owner) return { ok: false, error: 'Sign in to access your dictation settings' }
+    if (!raw || typeof raw !== 'object') return { ok: false, error: 'Invalid request' }
+    try {
+      if (raw.action === 'get') return { ok: true, ...getDictationReview(owner), holdAvailable: holdAvailable(getSettings().hotkey) }
+      if (raw.action === 'preferences') {
+        const preferences = validatePreferences(raw.value)
+        if (!preferences) throw new Error('Invalid preferences')
+        if (preferences.hotkeyMode === 'hold' && !holdAvailable(getSettings().hotkey)) throw new Error('Hold-to-talk needs a supported Windows shortcut and the latest desktop build')
+        saveDictationPreferences(owner, preferences)
+      } else if (raw.action === 'correction' && typeof raw.from === 'string' && typeof raw.to === 'string') {
+        rememberCorrection(owner, raw.from, raw.to)
+      } else if (raw.action === 'forget' && typeof raw.from === 'string') {
+        forgetCorrection(owner, raw.from)
+      } else if (raw.action === 'delete' && (raw.id === undefined || typeof raw.id === 'string')) {
+        abortInFlightRecording('local-review-cleared')
+        clearDictationReviews(owner, raw.id as string | undefined)
+      } else throw new Error('Invalid action')
+      return { ok: true }
+    } catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'Could not save' } }
+  })
 
   gatedHandle<string, { ok: boolean; error?: string; activeHotkey?: string }>(
     'settings:update-hotkey',
@@ -550,6 +575,7 @@ export function setupIPC({
       }
       try {
         await purgeOwnerOutbox(cachedAuthOwner, rawGeneration)
+        clearDictationReviews(cachedAuthOwner)
         return { ok: true }
       } catch (error) {
         log.warn('[outbox] local history purge failed', error)
@@ -621,3 +647,6 @@ export function setupIPC({
     trayCallback?.(s === 'recording')
   })
 }
+
+/** Account identity survives token refresh but is cleared on sign-out. */
+export function getPreferenceOwner(): string | null { return contextOwner }

@@ -55,9 +55,11 @@ export interface Command {
 interface CommandsStoreSchema {
   commands: Command[]
   migratedPolish?: boolean
+  migratedVoiceEdit?: boolean
 }
 
 const DEFAULTS: Command[] = [
+  { id: 'seed-voice-edit', name: 'Voice Edit', description: 'Select text, press the shortcut, speak an edit, then press again', prompt: 'Apply the spoken editing instruction to the selected text. Output only the edited text. Preserve factual details and meaning.', hotkeyNumber: 4, order: 3, isSeeded: true },
   {
     id: 'seed-email',
     name: 'Email',
@@ -167,6 +169,13 @@ export function initCommandsStore(): void {
     store.set('commands', DEFAULTS)
     log.info(`[commands] seeded ${DEFAULTS.length} default commands on first run`)
     return
+  }
+  if (!store.get('migratedVoiceEdit')) {
+    if (existing.length > 0 && !existing.some(cmd => cmd.id === 'seed-voice-edit' || cmd.hotkeyNumber === 4)) {
+      existing.push({ ...DEFAULTS.find(cmd => cmd.id === 'seed-voice-edit')! })
+      store.set('commands', existing)
+    }
+    store.set('migratedVoiceEdit', true)
   }
   // Older installations had only Email and Prompt Engineer. Introduce Polish
   // once without occupying a user's custom slot or resurrecting a deletion.

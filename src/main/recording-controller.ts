@@ -1,3 +1,5 @@
+import { getDictationPreferences, getCorrections, saveDictationReview } from './dictation-review'
+import { applyCorrections, offlineCleanup } from './dictation-preferences'
 // Single source of truth for the recording state machine.
 //
 // Serializes ALL start/stop operations through one async queue so that two
@@ -27,10 +29,10 @@ import { syncToKnowledgeBase } from './supabase'
 import { getAuthToken, getAuthContext, ensureAuthToken, type AuthContext } from './ipc'
 import { releaseMedia, tryAcquireMedia } from './media-owner'
 import { getDeletionGeneration } from './event-outbox'
-import { injectText, captureFocusTarget, WindowSnapshot } from './inject'
+import { injectText, captureFocusTarget, sameTarget, rememberOutput, WindowSnapshot } from './inject'
 import { getSettings } from './settings'
 import { playSound } from './sound'
-import { abortInFlightTransform } from './transform-controller'
+import { captureSelection, abortInFlightTransform } from './transform-controller'
 import {
   formatTranscript,
   shouldFormat,
@@ -72,6 +74,7 @@ let recordingAbort = new AbortController()
 // Set when the recording was started by a command hotkey (Ctrl+Shift+N with
 // nothing highlighted): the transcript is run through that command's LLM
 // prompt instead of being pasted verbatim.
+let pendingVoiceEdit: { selected: string; target: WindowSnapshot } | null = null
 let pendingCommandId: string | null = null
 // Wall-clock moment the recorder ACKed 'recording-started' — used to report
 // the actual audio duration (not processing time) in the completion payload.
@@ -254,7 +257,7 @@ function beginAsrStream(mySession: number, t0: number): void {
 
 /** Start a dictation whose transcript will be transformed by `commandId`'s
  *  prompt (e.g. spoken rough notes → composed email) before pasting. */
-export function startCommandRecording(commandId: string): Promise<void> {
+export function startCommandRecording(commandId: string, voiceEdit?: { selected: string; target: WindowSnapshot }): Promise<void> {
   return enqueue(async () => {
     if (state !== 'idle') {
       broadcast('recording-busy', state)
@@ -266,7 +269,7 @@ export function startCommandRecording(commandId: string): Promise<void> {
     // Only arm the command if the recorder actually started (doStart resets
     // pendingCommandId, so set it after). getRecordingState() rather than a
     // direct read: TS narrows `state` to 'idle' across the await otherwise.
-    if (getRecordingState() === 'recording') pendingCommandId = commandId
+    if (getRecordingState() === 'recording') { pendingCommandId = commandId; pendingVoiceEdit = voiceEdit ?? null }
   })
 }
 
@@ -332,6 +335,7 @@ onRecorderCrash((reason) => {
     recordingAuthContext = null
     recordingGenerationPromise = Promise.resolve(0)
     pendingCommandId = null
+  pendingVoiceEdit = null
     setState('idle')
   })
 })
@@ -732,6 +736,8 @@ async function processAudio(
     // Claim the pending command before routing: command dictations must keep
     // the classic transcribe→transform pipeline (their formatting IS the
     // command prompt), so they never take the /dictate path.
+    const voiceEdit = pendingVoiceEdit
+    pendingVoiceEdit = null
     const commandId = pendingCommandId
     pendingCommandId = null
     const command = commandId ? getCommand(commandId) : undefined
@@ -786,6 +792,11 @@ async function processAudio(
       }
     }
 
+    const preferences = getDictationPreferences(operationAuth?.ownerId ?? null)
+    const learnedCorrections = getCorrections(operationAuth?.ownerId ?? null)
+    const style = preferences[detectContextCategory(targetSnapshot?.processName, targetSnapshot?.title)]
+    const cleanEnabled = liveSettings.enableSmartFormatting && preferences.cleanup !== 'verbatim'
+    const customizedFormat = learnedCorrections.length > 0 || preferences.cleanup === 'rewrite' || style !== 'preserve' || preferences.cleanupEngine === 'offline' || preferences.speed === 'fast'
     let rawText: string | null = null
     let serverFormatted: string | undefined
     let usageEventId: string | null = null
@@ -810,7 +821,7 @@ async function processAudio(
           authToken: operationAuth?.token ?? '',
           deletionGeneration: stats.deletionGeneration,
           language: lang,
-          format: !command && liveSettings.enableSmartFormatting,
+          format: !command && cleanEnabled && !customizedFormat,
           stripDisfluencies: liveSettings.stripDisfluencies,
           appName: targetSnapshot?.processName ?? undefined,
           windowTitle: targetSnapshot?.title ?? undefined,
@@ -845,6 +856,7 @@ async function processAudio(
       // file then transcribe.ts stat+read it back, wasting ~30-50 ms.
       const tTranscribe = Date.now()
       rawText = await transcribeAudio(buffer, {
+        offlineOnly: preferences.cleanupEngine === 'offline' && transcriptionMode === 'local',
         language: lang,
         pcm,
         speechMs: stats.speechMs,
@@ -884,6 +896,7 @@ async function processAudio(
     // paths (stream/dictate/legacy/local) plus command dictations. Applied to
     // BOTH texts so the sanityCheck word-overlap comparison below stays
     // apples-to-apples — correcting only one side would skew it.
+    const recognizedOriginal = rawText
     if (rawText) {
       rawText = applyPronunciationAliases(rawText)
       if (serverFormatted) serverFormatted = applyPronunciationAliases(serverFormatted)
@@ -897,14 +910,16 @@ async function processAudio(
         broadcast('transcription-error', 'No speech detected — try speaking louder or closer to the mic')
       }
     } else {
-      let rawTrimmed = collapseRepetitions(rawText.trim())
+      const originalTranscript = (recognizedOriginal ?? rawText).trim()
+      let rawTrimmed = preferences.cleanup === 'verbatim' ? originalTranscript : collapseRepetitions(rawText.trim())
+      rawTrimmed = applyCorrections(rawTrimmed, learnedCorrections)
       // Instant filler removal (um/uh/ah) on EVERY clip — the LLM pass
       // skips short dictations, so this is what keeps a 10-word sentence
       // clean. English-only: "um" is a real word in other languages. Applied
       // to the RAW text on the dictate path too: it feeds the sanity check,
       // the word count, and the fallback text if the server formatting is
       // rejected below.
-      if (liveSettings.stripDisfluencies && language.startsWith('en')) {
+      if (preferences.cleanup !== 'verbatim' && liveSettings.stripDisfluencies && language.startsWith('en')) {
         rawTrimmed = stripFillerWords(rawTrimmed)
       }
 
@@ -918,17 +933,19 @@ async function processAudio(
         broadcast('transcription-error', 'No speech detected — try speaking louder or closer to the mic')
         return
       }
-      let trimmed = rawTrimmed
+      let trimmed = voiceEdit?.selected ?? rawTrimmed
 
       // Command dictation (Ctrl+Shift+N with nothing highlighted): run the
       // transcript through the command's prompt — e.g. spoken rough notes
       // become a composed email. Fail-open to the raw transcript.
-      if (command) {
+      if (command && preferences.cleanupEngine === 'offline') {
+        broadcast('transcription-error', 'AI rewrite commands need cloud cleanup. The original text was kept.')
+      } else if (command) {
         broadcast('transform-starting')
         try {
           const transformed = await transformText(
             commandPrompt(command),
-            rawTrimmed,
+            voiceEdit ? JSON.stringify({ selectedText: voiceEdit.selected, spokenInstruction: rawTrimmed }) : rawTrimmed,
             command.model,
             recordingAbort.signal,
           )
@@ -936,7 +953,7 @@ async function processAudio(
             log.info('[recording] command result discarded — session invalidated')
             return
           }
-          trimmed = preserveTransform(command.id, rawTrimmed, transformed, getDictionaryWords())
+          trimmed = preserveTransform(voiceEdit ? 'seed-email' : command.id, voiceEdit?.selected ?? rawTrimmed, transformed, getDictionaryWords())
           if (trimmed !== transformed) {
             broadcast('transcription-error', 'The rewrite changed protected details. Your original dictation was kept.')
           }
@@ -965,8 +982,8 @@ async function processAudio(
         trimmed = decision.text
       } else if (
         !command &&
-        path !== 'dictate' &&
-        liveSettings.enableSmartFormatting &&
+        (path !== 'dictate' || customizedFormat) &&
+        cleanEnabled &&
         shouldFormat(rawTrimmed)
       ) {
         // Legacy/local path only. On the dictate path a server "skip" is
@@ -976,7 +993,12 @@ async function processAudio(
         // lose their dictation here.
         const tFormat = Date.now()
         try {
-          const formatted = await formatTranscript(rawTrimmed, {
+          const formatted = preferences.cleanupEngine === 'offline'
+            ? offlineCleanup(rawTrimmed)
+            : await formatTranscript(rawTrimmed, {
+            cleanup: preferences.cleanup === 'rewrite' ? 'rewrite' : 'clean',
+            style,
+            deadlineMs: preferences.speed === 'fast' ? 1200 : 2500,
             stripDisfluencies: liveSettings.stripDisfluencies,
             dictionaryWords: getDictionaryWords(),
             appName: targetSnapshot?.processName ?? null,
@@ -1003,6 +1025,14 @@ async function processAudio(
         }
       }
 
+      if (voiceEdit) {
+        if (!sameTarget(voiceEdit.target, await captureFocusTarget()) || await captureSelection(voiceEdit.target, recordingAbort.signal) !== voiceEdit.selected) {
+          rememberOutput(trimmed)
+          broadcast('transcription-error', 'Selection changed. The edit was not pasted. Use Paste last output to recover it.')
+          return
+        }
+      }
+
       // Snippet expansion — replace standalone trigger phrases with their
       // expansions ("my address" → the full address). After formatting so
       // the LLM never sees/rewrites the expansion; before inject so the
@@ -1014,6 +1044,8 @@ async function processAudio(
       // "..." are meaningful and stay. Deterministic (no LLM), messaging
       // category only, so emails and documents keep their full stops.
       if (
+        preferences.cleanup !== 'verbatim' &&
+        style !== 'professional' &&
         trimmed.length < 200 &&
         !trimmed.includes('\n') &&
         /[^.!?]\.$/.test(trimmed) &&
@@ -1028,7 +1060,7 @@ async function processAudio(
       try {
         const signal = recordingAbort.signal
         if (mySession !== sessionId || signal.aborted) return
-        injectResult = await injectText(trimmed, targetSnapshot, { signal })
+        injectResult = await injectText(trimmed, voiceEdit?.target ?? targetSnapshot, { signal, requireSameTarget: !!voiceEdit })
       } catch (injectErr) {
         log.error('[recording] injection threw', injectErr)
         injectResult = { ok: false, method: 'clipboard' as const, error: 'inject-threw' }
@@ -1039,6 +1071,11 @@ async function processAudio(
       if (mySession !== sessionId) {
         log.info('[recording] post-inject broadcast skipped — session invalidated')
         return
+      }
+      if (operationAuth) {
+        try { saveDictationReview(operationAuth.ownerId, { original: voiceEdit?.selected ?? originalTranscript, output: trimmed,
+          app: targetSnapshot?.processName ?? null, pasted: ok, totalMs: endedAt - stats.stopStartedAt,
+          formatMs: formatMs ?? 0, mode: preferences.cleanup }) } catch { log.warn('[review] could not save local comparison') }
       }
       let persisted = false
       let clientEventId = usageEventId

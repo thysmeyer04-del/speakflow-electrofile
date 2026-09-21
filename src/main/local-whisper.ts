@@ -4,9 +4,8 @@
 // local-whisper-worker.ts): onnxruntime inference can hard-crash at the
 // native level, and in-process that killed the whole app mid-dictation.
 // Here a worker crash only rejects the in-flight requests — callers fall
-// back to cloud — and after MAX_CRASHES the app auto-reverts the
-// transcriptionMode setting to 'cloud' so a machine that can't run the
-// model never degrades the dictation experience.
+// back to cloud when permitted. Repeated crashes pause the local worker
+// until restart; the user's selected mode is never silently changed.
 //
 // The model downloads from HuggingFace on first use and is cached under
 // userData/models, after which transcription is fully offline.
@@ -16,7 +15,6 @@ import type { UtilityProcess } from 'electron'
 import path from 'path'
 import fs from 'fs'
 import log from 'electron-log/main'
-import { setSetting } from './settings'
 
 const MAX_CRASHES = 2
 const LOAD_TIMEOUT_MS = 15 * 60_000 // generous: covers the one-off download
@@ -67,13 +65,8 @@ function handleWorkerExit(code: number): void {
   workerReady = null
   crashCount++
   if (crashCount >= MAX_CRASHES) {
-    log.error('[local-whisper] repeated worker crashes — reverting transcriptionMode to cloud')
-    broadcastStatus('Local Whisper keeps failing on this machine — switched back to cloud.')
-    try {
-      setSetting('transcriptionMode', 'cloud')
-    } catch (err) {
-      log.warn('[local-whisper] failed to revert transcriptionMode', err)
-    }
+    log.error('[local-whisper] repeated worker crashes; local mode paused until restart')
+    broadcastStatus('Local speech recognition failed. Restart Speakflow or choose Cloud in settings. Your mode was not changed.')
   }
 }
 
