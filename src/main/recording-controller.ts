@@ -794,6 +794,7 @@ async function processAudio(
 
     const preferences = getDictationPreferences(operationAuth?.ownerId ?? null)
     const learnedCorrections = getCorrections(operationAuth?.ownerId ?? null)
+    const protectedDictionary = [...getDictionaryWords(), ...learnedCorrections.map(c => c.to)]
     const style = preferences[detectContextCategory(targetSnapshot?.processName, targetSnapshot?.title)]
     const cleanEnabled = liveSettings.enableSmartFormatting && preferences.cleanup !== 'verbatim'
     const customizedFormat = learnedCorrections.length > 0 || preferences.cleanup === 'rewrite' || style !== 'preserve' || preferences.cleanupEngine === 'offline' || preferences.speed === 'fast'
@@ -825,7 +826,7 @@ async function processAudio(
           stripDisfluencies: liveSettings.stripDisfluencies,
           appName: targetSnapshot?.processName ?? undefined,
           windowTitle: targetSnapshot?.title ?? undefined,
-          dictionary: getDictionaryWords(),
+          dictionary: protectedDictionary,
           speechMs: stats.speechMs,
         })
         const rtt = Date.now() - tDictate
@@ -953,7 +954,7 @@ async function processAudio(
             log.info('[recording] command result discarded — session invalidated')
             return
           }
-          trimmed = preserveTransform(voiceEdit ? 'seed-email' : command.id, voiceEdit?.selected ?? rawTrimmed, transformed, getDictionaryWords())
+          trimmed = preserveTransform(voiceEdit ? 'seed-email' : command.id, voiceEdit?.selected ?? rawTrimmed, transformed, protectedDictionary)
           if (trimmed !== transformed) {
             broadcast('transcription-error', 'The rewrite changed protected details. Your original dictation was kept.')
           }
@@ -977,7 +978,7 @@ async function processAudio(
           'server-formatted',
           rawTrimmed,
           serverFormatted,
-          getDictionaryWords(),
+          protectedDictionary,
         )
         trimmed = decision.text
       } else if (
@@ -1000,7 +1001,7 @@ async function processAudio(
             style,
             deadlineMs: preferences.speed === 'fast' ? 1200 : 2500,
             stripDisfluencies: liveSettings.stripDisfluencies,
-            dictionaryWords: getDictionaryWords(),
+            dictionaryWords: protectedDictionary,
             appName: targetSnapshot?.processName ?? null,
             windowTitle: targetSnapshot?.title ?? null,
           })
@@ -1016,7 +1017,7 @@ async function processAudio(
             'local-format',
             rawTrimmed,
             formatted,
-            getDictionaryWords(),
+            protectedDictionary,
           )
           trimmed = decision.text
         } catch (err) {
