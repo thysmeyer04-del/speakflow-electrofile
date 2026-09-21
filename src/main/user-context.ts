@@ -41,6 +41,7 @@ let pronunciations: Pronunciation[] = []
 // Compiled once per refresh, not per dictation: [regex, spelling] pairs.
 let aliasMatchers: Array<{ re: RegExp; spelling: string; spellingRe: RegExp }> = []
 let refreshInFlight = false
+let contextGeneration = 0
 
 export function getDictionaryWords(): string[] {
   return dictionaryWords
@@ -91,6 +92,7 @@ export function getWhisperPrompt(): string {
 
 /** Clear caches (sign-out) so one user's words never leak into another's session. */
 export function clearUserContext(): void {
+  contextGeneration++
   dictionaryWords = []
   snippets = []
   pronunciations = []
@@ -119,6 +121,7 @@ export async function refreshUserContext(): Promise<void> {
   if (!base) return // dev without a proxy — nothing to fetch from
 
   refreshInFlight = true
+  const generation = contextGeneration
   try {
     const res = await fetch(base.replace(/\/+$/, '') + '/user-context', {
       headers: { Authorization: `Bearer ${token}` },
@@ -133,6 +136,7 @@ export async function refreshUserContext(): Promise<void> {
       snippets?: unknown
       pronunciations?: unknown
     }
+    if (generation !== contextGeneration || token !== getAuthToken()) return
 
     if (Array.isArray(data.dictionary)) {
       dictionaryWords = data.dictionary
@@ -177,6 +181,9 @@ export async function refreshUserContext(): Promise<void> {
     log.warn('[user-context] refresh threw (ignored)', err)
   } finally {
     refreshInFlight = false
+    if (getAuthToken() && (generation !== contextGeneration || token !== getAuthToken())) {
+      void refreshUserContext()
+    }
   }
 }
 
@@ -242,19 +249,20 @@ export function applyPronunciationAliases(text: string): string {
  *  Only triggers that are 2+ words or ≥5 chars qualify — a 3-letter trigger
  *  like "sig" would false-positive inside ordinary dictation too easily. */
 export function expandSnippets(text: string): string {
-  if (snippets.length === 0 || !text) return text
-  let out = text
-  for (const { trigger, expansion } of snippets) {
-    const isMultiWord = /\s/.test(trigger)
-    if (!isMultiWord && trigger.length < 5) continue
-    try {
-      const re = new RegExp(`\\b${escapeRegExp(trigger).replace(/\s+/g, '\\s+')}\\b`, 'gi')
-      out = out.replace(re, expansion)
-    } catch {
-      // A pathological trigger that still breaks RegExp — skip it.
-    }
-  }
-  return out
+  return expandSnippetEntries(text, snippets)
+}
+
+export function expandSnippetEntries(text: string, entries: readonly Snippet[]): string {
+  const valid = entries.filter(({ trigger }) => trigger.trim().length > 0 && (/\s/.test(trigger) || trigger.length >= 5))
+    .slice().sort((a, b) => b.trigger.length - a.trigger.length)
+  if (!text || !valid.length) return text
+  // One replacement pass prevents expansions triggering other snippets.
+  // A callback keeps dollar signs ($&, $1, $$) literal in saved text.
+  const pattern = valid.map(({ trigger }) => escapeRegExp(trigger).replace(/\s+/g, '\\s+')).join('|')
+  const re = new RegExp(`(?<![\\p{L}\\p{N}_])(?:${pattern})(?![\\p{L}\\p{N}_])`, 'giu')
+  const normalize = (value: string) => value.toLowerCase().replace(/\s+/g, ' ')
+  const lookup = new Map(valid.map(({ trigger, expansion }) => [normalize(trigger), expansion]))
+  return text.replace(re, (match) => lookup.get(normalize(match)) ?? match)
 }
 
 // Periodic refresh so dashboard edits show up without an app restart. The

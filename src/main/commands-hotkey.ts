@@ -59,6 +59,7 @@ export interface HotkeyRegistrationResult {
 
 function tryRegisterCommand(cmd: Command): HotkeyRegistrationResult {
   const acc = accelFor(cmd.hotkeyNumber)
+  const previous = registered.get(cmd.id)
   let alreadyRegistered = false
   try {
     alreadyRegistered = globalShortcut.isRegistered(acc)
@@ -67,6 +68,7 @@ function tryRegisterCommand(cmd: Command): HotkeyRegistrationResult {
     return { commandId: cmd.id, accelerator: acc, ok: false, error: 'invalid-accelerator' }
   }
   if (alreadyRegistered) {
+    if (previous === acc) return { commandId: cmd.id, accelerator: acc, ok: true }
     log.warn(`[commands-hotkey] ${acc} already held by another app — skipping`)
     return { commandId: cmd.id, accelerator: acc, ok: false, error: 'already-registered' }
   }
@@ -82,6 +84,7 @@ function tryRegisterCommand(cmd: Command): HotkeyRegistrationResult {
       return { commandId: cmd.id, accelerator: acc, ok: false, error: 'register-returned-false' }
     }
     registered.set(cmd.id, acc)
+    if (previous && previous !== acc) globalShortcut.unregister(previous)
     log.info(`[commands-hotkey] registered ${acc} → ${cmd.name}`)
     return { commandId: cmd.id, accelerator: acc, ok: true }
   } catch (err) {
@@ -94,7 +97,7 @@ function tryRegisterCommand(cmd: Command): HotkeyRegistrationResult {
  *  retrying those can never succeed). */
 function missingCommands(): Command[] {
   return desiredCommands.filter(
-    (cmd) => !registered.has(cmd.id) && cmd.hotkeyNumber >= 1 && cmd.hotkeyNumber <= 9,
+    (cmd) => registered.get(cmd.id) !== accelFor(cmd.hotkeyNumber) && cmd.hotkeyNumber >= 1 && cmd.hotkeyNumber <= 9,
   )
 }
 
@@ -118,7 +121,9 @@ function watchdogTick(): void {
         )
       })
       if (ok) {
+        const previous = registered.get(cmd.id)
         registered.set(cmd.id, acc)
+        if (previous && previous !== acc) globalShortcut.unregister(previous)
         log.info(`[commands-hotkey] watchdog reclaimed ${acc} → ${cmd.name}`)
       }
     } catch {
@@ -153,8 +158,14 @@ export function reassertCommandHotkeys(): void {
 export function registerCommandHotkeys(
   commands: Command[],
 ): HotkeyRegistrationResult[] {
-  // Always unregister first — clears any stale bindings.
-  unregisterAllCommandHotkeys()
+  // Keep working bindings while probing replacements. A blocked new shortcut
+  // must not disable the command's old shortcut or unrelated commands.
+  for (const [id, acc] of registered) {
+    if (!commands.some((command) => command.id === id)) {
+      globalShortcut.unregister(acc)
+      registered.delete(id)
+    }
+  }
   desiredCommands = commands
 
   const results = commands.map(tryRegisterCommand)

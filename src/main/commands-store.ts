@@ -54,6 +54,7 @@ export interface Command {
 
 interface CommandsStoreSchema {
   commands: Command[]
+  migratedPolish?: boolean
 }
 
 const DEFAULTS: Command[] = [
@@ -166,6 +167,15 @@ export function initCommandsStore(): void {
     store.set('commands', DEFAULTS)
     log.info(`[commands] seeded ${DEFAULTS.length} default commands on first run`)
     return
+  }
+  // Older installations had only Email and Prompt Engineer. Introduce Polish
+  // once without occupying a user's custom slot or resurrecting a deletion.
+  if (!store.get('migratedPolish')) {
+    if (existing.length > 0 && !existing.some((cmd) => cmd.id === 'seed-polish' || cmd.hotkeyNumber === 3)) {
+      existing.push({ ...DEFAULTS.find((cmd) => cmd.id === 'seed-polish')! })
+      store.set('commands', existing)
+    }
+    store.set('migratedPolish', true)
   }
 
   // Seed-prompt upgrade: replace a stored seeded prompt with the current

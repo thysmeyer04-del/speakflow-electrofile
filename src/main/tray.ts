@@ -7,6 +7,8 @@ import { toggleRecording } from './recording-controller'
 import { installPendingUpdate, checkForUpdatesNow, getPendingUpdateVersion } from './updater'
 import type { FlowcastController, FlowcastState } from './flowcast/controller'
 import { getSettings } from './settings'
+import { copyLastOutput } from './inject'
+import { recoverLastOutput, RECOVERY_SHORTCUT } from './recovery'
 
 let tray: Tray | null = null
 // Rebuilding the context menu needs the window reference captured at setup.
@@ -70,6 +72,8 @@ export function setupTray(mainWindow: BrowserWindow, flowcast: FlowcastControlle
           ]
         : []),
       { label: 'Open Speakflow', click: showWindow },
+      { label: `Paste last output (${RECOVERY_SHORTCUT})`, click: () => { void recoverLastOutput() } },
+      { label: 'Copy last output', click: () => { copyLastOutput() } },
       { type: 'separator' as const },
       {
         label: 'Start / Stop Recording',

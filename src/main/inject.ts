@@ -1,5 +1,6 @@
 import { clipboard } from 'electron'
 import log from 'electron-log/main'
+import { withClipboard, snapshotClipboard, clipboardStillContains } from './clipboard-transaction'
 
 // Type aliases — nut-js is loaded lazily.
 type NutKeyboard = typeof import('@nut-tree-fork/nut-js')['keyboard']
@@ -61,14 +62,11 @@ const CLIPBOARD_SETTLE_MS = envMs('SPEAKFLOW_INJECT_CLIPBOARD_SETTLE_MS', 20)
 // Hold time between Ctrl+V key-down and key-up. 15 ms (was 30) — apps read
 // the paste on WM_KEYDOWN; the hold only needs to outlive input coalescing.
 const KEY_GAP_MS = envMs('SPEAKFLOW_INJECT_KEY_GAP_MS', 15)
-// How long OUR text must stay on the clipboard after Ctrl+V before we
-// restore the user's previous clipboard — the target app reads the clipboard
-// when ITS message loop processes the paste, typically 10-80 ms after
-// key-up. 120 ms gives ~3× headroom over typical Windows write-back latency
-// (was 260 ms once — overly conservative). Since the fast-path restructure
-// this settle runs DETACHED (see injectViaClipboard) and no longer adds to
-// perceived stop→paste latency at all.
-const PASTE_SETTLE_MS = envMs('SPEAKFLOW_INJECT_PASTE_SETTLE_MS', 120)
+// Keep sequential clipboard operations apart while the target consumes Ctrl+V.
+// This tail does not delay dispatch acknowledgement. We leave dictated text
+// on the clipboard by default: an unconditional timed restore caused delayed
+// editors to paste OLD clipboard content. Explicit restoration is opt-in.
+const PASTE_SETTLE_MS = envMs('SPEAKFLOW_INJECT_PASTE_SETTLE_MS', 500)
 // Keystroke typing is DISABLED by default (limit 0): nut-js types character
 // by character, which users see as stuttery "very fast typing" for short
 // dictations while long ones paste atomically — inconsistent and slower than
@@ -86,16 +84,42 @@ const KEYSTROKE_LIMIT = envMs('SPEAKFLOW_INJECT_KEYSTROKE_MAX', 0)
 const MODIFIER_RELEASE_SETTLE_MS = 60
 
 // Process-wide mutex — clipboard injection cannot interleave.
-let injectionInFlight: Promise<unknown> = Promise.resolve()
+let lastOutput = ''
+export function rememberOutput(text: string): void { lastOutput = text }
+export function clearLastOutput(): void { lastOutput = '' }
+export function copyLastOutput(): boolean {
+  if (!lastOutput) return false
+  clipboard.writeText(lastOutput)
+  return true
+}
+export async function pasteLastOutput(): Promise<InjectionResult> {
+  return injectText(lastOutput, await captureFocusTarget())
+}
 
 export interface WindowSnapshot {
+  id?: number | string
   title: string
   region: string | null // serialized region as a fingerprint; null when unavailable
   processName: string | null
   pid: number | null
 }
 
+export function sameTarget(a: WindowSnapshot | null, b: WindowSnapshot | null): boolean {
+  if (!a || !b) return false
+  if (a.id !== undefined && b.id !== undefined) return a.id === b.id && a.title === b.title
+  return a.title === b.title && a.region === b.region && a.pid === b.pid && a.processName === b.processName
+}
+
+export interface InjectionOptions {
+  requireSameTarget?: boolean
+  signal?: AbortSignal
+  // Off by default: a delayed native editor may not read the clipboard until
+  // long after Ctrl+V. Keeping our text avoids pasting old clipboard content.
+  restoreClipboard?: boolean
+}
+
 export interface InjectionResult {
+  // Confirms input submission, not that an arbitrary external editor accepted it.
   ok: boolean
   method: 'keystroke' | 'clipboard' | 'clipboard-only'
   error?: string
@@ -150,6 +174,8 @@ export async function captureFocusTarget(): Promise<WindowSnapshot | null> {
   if (!loadNut() || !nutGetActiveWindow) return null
   try {
     const w = (await nutGetActiveWindow()) as unknown as {
+      id?: number | string
+      windowHandle?: number
       title: Promise<string> | string
       region: Promise<unknown> | unknown
       processName?: Promise<string> | string
@@ -183,6 +209,9 @@ export async function captureFocusTarget(): Promise<WindowSnapshot | null> {
     if (!hasStrongId && !hasTitleRegion) return null
 
     return {
+      // nut-js 4.x exposes the native handle on its runtime Window object.
+      // Keep the title/region fallback for providers without that member.
+      id: w.id ?? w.windowHandle,
       title: t,
       region: fingerprint,
       processName: processName ? String(processName) : null,
@@ -212,6 +241,7 @@ interface InjectMarks {
 export async function injectText(
   text: string,
   expectedTarget: WindowSnapshot | null,
+  options: InjectionOptions = {},
 ): Promise<InjectionResult> {
   // Callers should never pass empty text — this is a defensive guard. Return
   // a non-success result so the caller can't misread it as a successful paste.
@@ -224,9 +254,14 @@ export async function injectText(
     rejectOuter = rej
   })
 
-  injectionInFlight = injectionInFlight.then(async () => {
+  void withClipboard(async () => {
     try {
-      const { result, settleTail } = await doInject(text, expectedTarget)
+      if (options.signal?.aborted) {
+        resolveOuter({ ok: false, method: 'clipboard-only', error: 'cancelled' })
+        return
+      }
+      lastOutput = text
+      const { result, settleTail } = await doInject(text, expectedTarget, options)
       // Fast path: resolve the caller the moment the paste outcome is known —
       // for the clipboard path that is right after Ctrl+V key-up, ~120 ms
       // earlier than waiting for settle+restore. RACE RATIONALE for keeping
@@ -252,6 +287,7 @@ export async function injectText(
 async function doInject(
   text: string,
   expectedTarget: WindowSnapshot | null,
+  options: InjectionOptions,
 ): Promise<InjectOutcome> {
   const nutReady = loadNut()
   if (!nutReady) {
@@ -295,10 +331,17 @@ async function doInject(
     clipboard.writeText(text)
     return { result: { ok: false, method: 'clipboard-only', error: 'self-window-focused' } }
   }
-  if (!current && !expectedTarget) {
+  if (!current) {
     log.warn('Refusing to paste — could not identify any target window.')
     clipboard.writeText(text)
     return { result: { ok: false, method: 'clipboard-only', error: 'no-target' } }
+  }
+  if (options.signal?.aborted) {
+    return { result: { ok: false, method: 'clipboard-only', error: 'cancelled' } }
+  }
+  if (options.requireSameTarget && !sameTarget(expectedTarget, current)) {
+    clipboard.writeText(text)
+    return { result: { ok: false, method: 'clipboard-only', error: 'focus-changed' } }
   }
   if (current && expectedTarget && current.title !== expectedTarget.title) {
     log.info(
@@ -321,28 +364,35 @@ async function doInject(
     }
   }
 
-  return injectViaClipboard(text, { captureMs, modifiersMs })
+  return injectViaClipboard(text, { captureMs, modifiersMs }, current, options)
 }
 
-async function injectViaClipboard(text: string, marks: InjectMarks): Promise<InjectOutcome> {
+async function injectViaClipboard(text: string, marks: InjectMarks, target: WindowSnapshot, options: InjectionOptions): Promise<InjectOutcome> {
   // Snapshot previous clipboard so we can restore it after paste settles.
   // readImage() can be slow (5-50 ms) when the user has a large screenshot —
   // only call it when no text-ish format is present, since text/html/rtf
   // take precedence on restore anyway.
-  const formats = clipboard.availableFormats()
-  const hasTextish = formats.some(
-    (f) => f.startsWith('text/') || f === 'public.utf8-plain-text',
-  )
-  const previousText = clipboard.readText()
-  const previousHtml = clipboard.readHTML?.() ?? ''
-  const previousRtf =
-    (clipboard as unknown as { readRTF?: () => string }).readRTF?.() ?? ''
-  const previousImage = hasTextish ? null : clipboard.readImage()
+  const restore = snapshotClipboard()
 
   const tClipboard = Date.now()
   clipboard.writeText(text)
   await sleep(CLIPBOARD_SETTLE_MS)
   const clipboardMs = Date.now() - tClipboard
+
+  if (options.signal?.aborted) {
+    if (clipboardStillContains(text)) restore()
+    return { result: { ok: false, method: 'clipboard-only', error: 'cancelled' } }
+  }
+  if (!sameTarget(target, await captureFocusTarget())) {
+    return { result: { ok: false, method: 'clipboard-only', error: 'focus-changed' } }
+  }
+  if (options.signal?.aborted) {
+    if (clipboardStillContains(text)) restore()
+    return { result: { ok: false, method: 'clipboard-only', error: 'cancelled' } }
+  }
+  if (!clipboardStillContains(text)) {
+    return { result: { ok: false, method: 'clipboard-only', error: 'clipboard-changed' } }
+  }
 
   const tPaste = Date.now()
   let pasteOk = false
@@ -356,6 +406,9 @@ async function injectViaClipboard(text: string, marks: InjectMarks): Promise<Inj
       pasteOk = true
     } catch (err) {
       log.error('Paste keystroke failed', err)
+    } finally {
+      // A partial native failure must not leave Ctrl/Cmd held down.
+      try { await nutKeyboard.releaseKey(nutKey.V, process.platform === 'darwin' ? nutKey.LeftSuper : nutKey.LeftControl) } catch { /* best effort */ }
     }
   }
   const pasteMs = Date.now() - tPaste
@@ -375,15 +428,7 @@ async function injectViaClipboard(text: string, marks: InjectMarks): Promise<Inj
     // Restore as best we can. Compose multi-format when applicable so
     // RTF/HTML clipboards survive.
     try {
-      const compose: { text?: string; html?: string; rtf?: string } = {}
-      if (previousText) compose.text = previousText
-      if (previousHtml) compose.html = previousHtml
-      if (previousRtf) compose.rtf = previousRtf
-      if (Object.keys(compose).length > 0) {
-        clipboard.write(compose)
-      } else if (previousImage && !previousImage.isEmpty()) {
-        clipboard.writeImage(previousImage)
-      }
+      if (options.restoreClipboard && pasteOk && clipboardStillContains(text)) restore()
     } catch (err) {
       log.warn('Clipboard restore failed', err)
     }

@@ -6,6 +6,8 @@ node_modules/
 # Build output
 dist/
 dist-electron/
+dist-electron-audit/
+audit-native-paste.json
 dist-test/
 out/
 release/

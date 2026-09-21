@@ -20,7 +20,8 @@ import {
   registerCommandHotkeys,
   getRegisteredCommandHotkeys,
 } from './commands-hotkey'
-import { runTransform } from './transform-controller'
+import { runTransform, abortInFlightTransform } from './transform-controller'
+import { clearLastOutput } from './inject'
 import { runWisprMigration, isWisprMigrationRunning } from './migrate-wispr'
 import {
   assertTrustedSender,
@@ -48,6 +49,9 @@ interface SetupArgs {
 let cachedAuthToken: string | null = null
 let cachedTokenExpiresAt = 0
 let cachedAuthOwner: string | null = null
+// Survives token expiry so refreshing the SAME owner's JWT does not abort
+// an ongoing dictation. Cleared on explicit logout, not on token rotation.
+let contextOwner: string | null = null
 
 export interface AuthContext {
   token: string
@@ -348,9 +352,16 @@ export function setupIPC({
         clearAsrToken()
         return { ok: false, error: result.reason }
       }
+      if (contextOwner && contextOwner !== (result.subject ?? null)) {
+        clearUserContext()
+        clearLastOutput()
+        abortInFlightTransform()
+        abortInFlightRecording('auth-owner-changed')
+      }
       cachedAuthToken = (raw as string).trim()
       cachedTokenExpiresAt = result.expiresAt ?? 0
       cachedAuthOwner = result.subject ?? null
+      contextOwner = cachedAuthOwner
       if (cachedAuthOwner && getSettings().flowcastEnabled) {
         void flowcast
           .recoverAbandonedSessions()
@@ -407,12 +418,15 @@ export function setupIPC({
     },
   )
   gatedOn('auth:clear-token', () => {
+    contextOwner = null
     clearAuthTokenCache()
     // The signed-out user's streaming grant must die with their JWT.
     clearAsrToken()
     // Drop the signed-out user's dictionary/snippets so they can't leak
     // into another account's session.
     clearUserContext()
+    clearLastOutput()
+    abortInFlightTransform()
     // Also abort any recording/transcription in flight so a sign-out can't
     // leave a stale request continuing with the just-cleared token.
     // (This also aborts a live ASR socket via the controller's teardown.)

@@ -100,12 +100,12 @@ const FORCE_CUE = new RegExp(
 // "um"). English-gated by the caller: "um" is a real word in e.g. German.
 // Deliberately short list of unambiguous vocal fillers — anything contextual
 // ("like", "you know") is left to the LLM pass, which can read intent.
-const FILLER_RE = /(?:^|(?<=\s))(?:u+m+|u+h+m?|erm+|hm+|mhm+|a+h+h*)(?=[\s,.!?]|$)[,.]?\s*/gi
+const FILLER_RE = /(?:^|(?<=\s))(?:u+m+|u+h+m?|erm+|hm+|mhm+|a+h+h*)(?=[\s,.!?]|$)[,.]?[^\S\r\n]*/gi
 
 export function stripFillerWords(text: string): string {
   let out = text.replace(FILLER_RE, '')
-  out = out.replace(/\s{2,}/g, ' ')          // collapse doubled spaces
-  out = out.replace(/\s+([,.!?;:])/g, '$1')  // no space before punctuation
+  out = out.replace(/[^\S\r\n]{2,}/g, ' ') // preserve paragraphs and list breaks
+  out = out.replace(/[^\S\r\n]+([,.!?;:])/g, '$1')
   out = out.replace(/([,.!?])\1+/g, '$1')    // ",," / ".." from adjacent fillers
   out = out.replace(/^[,.;:\s]+/, '')        // orphaned leading punctuation
   // Re-capitalize sentence starts that lost their leading filler.
@@ -1316,9 +1316,13 @@ export async function formatTranscript(
   signal?: AbortSignal,
 ): Promise<string> {
   const controller = new AbortController()
+  // Polishing is optional. A slow writer must not hold an already recognized
+  // dictation for the transform client's 30-second request timeout.
+  const timeout = setTimeout(() => controller.abort(), 2_500)
+  const onAbort = () => controller.abort()
   if (signal) {
     if (signal.aborted) controller.abort()
-    else signal.addEventListener('abort', () => controller.abort(), { once: true })
+    else signal.addEventListener('abort', onAbort, { once: true })
   }
   currentFormatAbort = controller
 
@@ -1346,6 +1350,8 @@ export async function formatTranscript(
     log.info(`[format] ok in ${Date.now() - t0}ms (${rawText.length} -> ${unwrapped.length} chars)`)
     return unwrapped
   } finally {
+    clearTimeout(timeout)
+    signal?.removeEventListener('abort', onAbort)
     if (currentFormatAbort === controller) currentFormatAbort = null
   }
 }

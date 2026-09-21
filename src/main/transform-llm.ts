@@ -33,9 +33,10 @@ export async function transformText(
   // own timeout. AbortSignal.any() is Node 20+, so do this manually.
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+  const onAbort = () => controller.abort()
   if (signal) {
     if (signal.aborted) controller.abort()
-    else signal.addEventListener('abort', () => controller.abort(), { once: true })
+    else signal.addEventListener('abort', onAbort, { once: true })
   }
 
   try {
@@ -53,6 +54,7 @@ export async function transformText(
     )
   } finally {
     clearTimeout(timer)
+    signal?.removeEventListener('abort', onAbort)
   }
 }
 
@@ -129,7 +131,7 @@ async function transformViaGroq(
           { role: 'user', content: userText },
         ],
         temperature,
-        max_tokens: 2048,
+        max_tokens: 4096,
       }),
       signal,
     })
@@ -147,7 +149,10 @@ async function transformViaGroq(
   }
 
   const data = (await response.json()) as {
-    choices?: Array<{ message?: { content?: string } }>
+    choices?: Array<{ message?: { content?: string }; finish_reason?: string }>
+  }
+  if (data.choices?.[0]?.finish_reason !== 'stop') {
+    throw new Error('The rewrite was cut short. Your original text has been kept; try a shorter selection.')
   }
   const text = data.choices?.[0]?.message?.content?.trim() ?? ''
   if (!text) {

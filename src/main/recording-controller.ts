@@ -39,8 +39,9 @@ import {
   abortInFlightFormat,
   detectContextCategory,
 } from './format-transcript'
-import { getCommand, toneInstruction } from './commands-store'
+import { getCommand } from './commands-store'
 import { transformText } from './transform-llm'
+import { preserveTransform, commandPrompt } from './transform-preservation'
 import {
   getDictionaryWords,
   expandSnippets,
@@ -67,6 +68,7 @@ let focusTarget: WindowSnapshot | null = null
 // Monotonic session id — increments on every start AND on every crash so a
 // stale async path can detect "this isn't my session" and bail out.
 let sessionId = 0
+let recordingAbort = new AbortController()
 // Set when the recording was started by a command hotkey (Ctrl+Shift+N with
 // nothing highlighted): the transcript is run through that command's LLM
 // prompt instead of being pasted verbatim.
@@ -319,6 +321,7 @@ onRecorderCrash((reason) => {
   if (state === 'idle') return
   log.error(`[recording] recorder crash: ${reason}`)
   sessionId++ // invalidate any in-flight session
+  recordingAbort.abort()
   // The PCM source just died with the renderer — close the Deepgram socket
   // now instead of letting it idle out on the server's timeout.
   teardownAsrStream('recorder-crash')
@@ -409,6 +412,8 @@ async function doStart(forCommand = false): Promise<void> {
   // socket from an abnormal path must never receive a new session's audio.
   teardownAsrStream('superseded-by-new-start')
   const mySession = ++sessionId
+  recordingAbort.abort()
+  recordingAbort = new AbortController()
   recordingAuthContext = getAuthContext()
   recordingGenerationPromise = recordingAuthContext
     ? getDeletionGeneration(recordingAuthContext.ownerId)
@@ -922,15 +927,19 @@ async function processAudio(
         broadcast('transform-starting')
         try {
           const transformed = await transformText(
-            command.prompt + toneInstruction(command.tone),
+            commandPrompt(command),
             rawTrimmed,
             command.model,
+            recordingAbort.signal,
           )
           if (mySession !== sessionId) {
             log.info('[recording] command result discarded — session invalidated')
             return
           }
-          trimmed = transformed
+          trimmed = preserveTransform(command.id, rawTrimmed, transformed, getDictionaryWords())
+          if (trimmed !== transformed) {
+            broadcast('transcription-error', 'The rewrite changed protected details. Your original dictation was kept.')
+          }
         } catch (err) {
           log.warn(`[recording] command "${command.name}" failed — pasting raw transcript`, err)
           if (mySession !== sessionId) return
@@ -1017,7 +1026,9 @@ async function processAudio(
       const tInject = Date.now()
       let injectResult
       try {
-        injectResult = await injectText(trimmed, targetSnapshot)
+        const signal = recordingAbort.signal
+        if (mySession !== sessionId || signal.aborted) return
+        injectResult = await injectText(trimmed, targetSnapshot, { signal })
       } catch (injectErr) {
         log.error('[recording] injection threw', injectErr)
         injectResult = { ok: false, method: 'clipboard' as const, error: 'inject-threw' }
@@ -1132,6 +1143,7 @@ export function abortInFlightRecording(reason: string): void {
   if (state === 'idle') return
   log.info(`[recording] abort requested: ${reason}`)
   sessionId++
+  recordingAbort.abort()
   abortInFlightFormat()
   // Sign-out must kill the live audio socket immediately: the grant token
   // belongs to the departing identity and mic audio must stop leaving the
@@ -1176,6 +1188,8 @@ function humanizeInjectError(reason: string): string {
   if (reason === 'paste-failed') {
     return 'Paste failed. The text is on your clipboard — press Ctrl+V manually.'
   }
+  if (reason === 'focus-changed') return 'Focus changed before paste. Your text is on the clipboard; select your field and paste.'
+  if (reason === 'clipboard-changed') return 'Your clipboard changed before paste. Use Paste last output from the tray to recover your dictation.'
   return 'Could not paste the transcribed text.'
 }
 
@@ -1184,6 +1198,7 @@ export async function shutdownRecording(): Promise<void> {
   if (state === 'idle') return
   log.info('[recording] shutdown requested while ' + state)
   sessionId++ // invalidate any in-flight session
+  recordingAbort.abort()
   abortInFlightFormat()
   teardownAsrStream('shutdown')
   try {
